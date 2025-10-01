@@ -76,6 +76,15 @@ async def get_buildings_to_cache(
     return buildings
 
 
+def slugify(text: str) -> str:
+    """Convert text to URL-friendly slug"""
+    import re
+    text = text.lower().strip()
+    text = re.sub(r'[^\w\s-]', '', text)
+    text = re.sub(r'[-\s]+', '-', text)
+    return text[:50]
+
+
 async def cache_building_images(
     session,
     building: Dict,
@@ -94,10 +103,16 @@ async def cache_building_images(
     """
     cached_count = 0
 
+    # Create readable path
+    address_part = building['address'].split(',')[0].strip()
+    slug = slugify(address_part)
+    building_path = f"reference/buildings/{slug}"
+
     logger.info(f"Caching images for building {building['id'][:8]}...")
     logger.info(f"  Address: {building['address']}")
     logger.info(f"  Location: ({building['latitude']:.6f}, {building['longitude']:.6f})")
     logger.info(f"  Style: {building['style']}")
+    logger.info(f"  Path: {building_path}/")
 
     for heading in headings:
         try:
@@ -113,8 +128,8 @@ async def cache_building_images(
                 logger.warning(f"  ⚠️  No Street View available for heading {heading}°")
                 continue
 
-            # Generate storage key
-            key = f"reference/{building['id']}/heading_{heading}.jpg"
+            # Generate storage key with readable format
+            key = f"{building_path}/{heading}deg.jpg"
 
             # Upload to R2
             url = await upload_image(
@@ -135,8 +150,38 @@ async def cache_building_images(
             logger.error(f"  ❌ Failed to cache heading {heading}°: {e}")
             continue
 
+    # Create metadata.json
     if cached_count > 0:
-        logger.info(f"✅ Successfully cached {cached_count}/{len(headings)} images for building {building['id'][:8]}")
+        import json
+        metadata = {
+            'id': building['id'],
+            'address': building['address'],
+            'location': {
+                'latitude': building['latitude'],
+                'longitude': building['longitude']
+            },
+            'style': building['style'],
+            'architect': building['architect'],
+            'images': {
+                f'{h}deg': f"{building_path}/{h}deg.jpg"
+                for h in headings
+            }
+        }
+
+        metadata_json = json.dumps(metadata, indent=2)
+        from utils.storage import s3_client
+        from models.config import get_settings
+        settings = get_settings()
+
+        s3_client.put_object(
+            Bucket=settings.r2_bucket,
+            Key=f"{building_path}/metadata.json",
+            Body=metadata_json.encode('utf-8'),
+            ContentType='application/json',
+            ACL='public-read'
+        )
+
+        logger.info(f"✅ Successfully cached {cached_count}/{len(headings)} images + metadata for {building['id'][:8]}")
 
     return cached_count
 

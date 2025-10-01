@@ -1,0 +1,41 @@
+# Fly.io configuration for NYC Scan Backend
+
+app = "nyc-scan"
+primary_region = "ewr"  # Newark (closest to NYC)
+
+[build]
+  dockerfile = "backend/Dockerfile"
+
+[env]
+  ENV = "production"
+  DEBUG = "false"
+  CONFIDENCE_THRESHOLD = "0.7"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0  # Scale to zero when idle
+  processes = ["app"]
+
+[[http_service.checks]]
+  interval = "30s"
+  timeout = "5s"
+  grace_period = "10s"
+  method = "GET"
+  path = "/health"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 512  # Start with 512MB (can scale up if needed)
+
+# Secrets (set with: flyctl secrets set KEY=VALUE)
+# DATABASE_URL
+# GOOGLE_MAPS_API_KEY
+# R2_ACCOUNT_ID
+# R2_ACCESS_KEY_ID
+# R2_SECRET_ACCESS_KEY
+# R2_BUCKET
+# R2_PUBLIC_URL
