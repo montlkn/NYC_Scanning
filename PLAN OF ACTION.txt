@@ -1,0 +1,1361 @@
+# 3-Week Build Plan: Point-and-Scan MVP
+
+## Tech Stack
+
+**Backend:**
+- Python 3.11+
+- FastAPI
+- SQLAlchemy + GeoAlchemy2
+- PostgreSQL 15 + PostGIS 3.3
+- Redis 7 (caching)
+- OpenCLIP (image matching)
+
+- Perplexity API (optional LLM bios)
+
+**Storage:**
+- Cloudflare R2 (S3-compatible, cheaper)
+
+**Mobile:**
+- React Native + Expo SDK 50
+- expo-camera
+- expo-location
+- expo-sensors
+
+**Deployment:**
+- Backend: Railway.app or Fly.io
+- Database: Supabase or Railway
+- Redis: Upstash (free tier)
+
+---
+
+## Week 1: Backend Foundation
+
+### Day 1: Environment Setup
+
+**Action Items:**
+1. Create GitHub repo with structure:
+```
+nyc-scan/
+├── backend/
+│   ├── main.py
+│   ├── requirements.txt
+│   ├── .env.example
+│   ├── routers/
+│   ├── services/
+│   ├── models/
+│   └── scripts/
+└── mobile/
+    └── (will init Day 12)
+```
+
+2. Install dependencies:
+```bash
+cd backend
+python -m venv venv
+source venv/bin/activate
+
+# requirements.txt:
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+sqlalchemy==2.0.25
+geoalchemy2==0.14.3
+psycopg2-binary==2.9.9
+redis==5.0.1
+httpx==0.26.0
+pillow==10.2.0
+open-clip-torch==2.24.0
+python-multipart==0.0.6
+python-dotenv==1.0.0
+pydantic==2.5.3
+pydantic-settings==2.1.0
+```
+
+3. Set up PostgreSQL + PostGIS:
+```bash
+# Using Supabase (easiest):
+# 1. Create project at supabase.com
+# 2. In SQL Editor, run:
+CREATE EXTENSION IF NOT EXISTS postgis;
+
+# Or local Docker:
+docker run -d \
+  --name nyc-postgis \
+  -e POSTGRES_PASSWORD=postgres \
+  -p 5432:5432 \
+  postgis/postgis:15-3.3
+```
+
+4. Configure `.env`:
+```
+DATABASE_URL=postgresql://user:pass@host:5432/nyc_buildings
+REDIS_URL=redis://default:xxx@host:6379
+GOOGLE_MAPS_API_KEY=your_key_here
+R2_ACCOUNT_ID=xxx
+R2_ACCESS_KEY_ID=xxx
+R2_SECRET_ACCESS_KEY=xxx
+R2_BUCKET=building-images
+```
+
+**✅ Checkpoint:** Database connects, FastAPI runs on `localhost:8000`
+
+---
+
+### Day 2-3: Database Schema & Models
+
+**Action Items:**
+
+1. Create database models:
+```python
+# models/database.py
+from sqlalchemy import Column, String, Integer, Float, Boolean, ARRAY, Text, TIMESTAMP
+from sqlalchemy.ext.declarative import declarative_base
+from geoalchemy2 import Geometry
+
+Base = declarative_base()
+
+class Building(Base):
+    __tablename__ = 'buildings'
+    
+    bbl = Column(String(10), primary_key=True)
+    bin = Column(String(7))
+    address = Column(Text, nullable=False)
+    borough = Column(String(20))
+    
+    # Geometry
+    latitude = Column(Float)
+    longitude = Column(Float)
+    geom = Column(Geometry('POINT', srid=4326), index=True)
+    
+    # Physical
+    year_built = Column(Integer)
+    num_floors = Column(Integer)
+    height_ft = Column(Float)
+    building_class = Column(String(10))
+    
+    # Landmark data
+    is_landmark = Column(Boolean, default=False)
+    architect = Column(Text)
+    style_primary = Column(Text)
+    materials = Column(ARRAY(Text))
+    
+    # Scores from your system
+    final_score = Column(Float, index=True)
+    historical_score = Column(Float)
+    visual_score = Column(Float)
+    
+    # Generated content
+    description = Column(Text)
+    description_sources = Column(ARRAY(Text))
+    
+    updated_at = Column(TIMESTAMP)
+
+class ReferenceImage(Base):
+    __tablename__ = 'reference_images'
+    
+    id = Column(Integer, primary_key=True)
+    bbl = Column(String(10), index=True)
+    image_url = Column(Text, nullable=False)
+    source = Column(String(20))  # 'street_view', 'mapillary', 'user'
+    compass_bearing = Column(Float)
+    quality_score = Column(Float)
+    created_at = Column(TIMESTAMP)
+
+class Scan(Base):
+    __tablename__ = 'scans'
+    
+    id = Column(String(36), primary_key=True)
+    user_photo_url = Column(Text)
+    confirmed_bbl = Column(String(10), index=True)
+    
+    gps_lat = Column(Float)
+    gps_lng = Column(Float)
+    compass_bearing = Column(Float)
+    phone_pitch = Column(Float)
+    
+    candidate_bbls = Column(ARRAY(Text))
+    top_confidence = Column(Float)
+    
+    created_at = Column(TIMESTAMP)
+```
+
+2. Create migration script:
+```python
+# scripts/init_db.py
+from sqlalchemy import create_engine
+from models.database import Base
+
+engine = create_engine(DATABASE_URL)
+Base.metadata.create_all(engine)
+
+# Create spatial index
+engine.execute("""
+    CREATE INDEX IF NOT EXISTS idx_buildings_geom 
+    ON buildings USING GIST(geom);
+    
+    CREATE INDEX IF NOT EXISTS idx_buildings_score 
+    ON buildings(final_score DESC NULLS LAST);
+""")
+```
+
+**✅ Checkpoint:** Tables created, spatial index working
+
+---
+
+### Day 4-5: Data Ingestion
+
+**Action Items:**
+
+1. Load PLUTO data:
+```python
+# scripts/ingest_pluto.py
+import geopandas as gpd
+from sqlalchemy.orm import Session
+
+# Download PLUTO (or use pre-downloaded file)
+url = "https://data.cityofnewyork.us/api/geospatial/64uk-42ks?method=export&format=GeoJSON"
+print("📥 Loading PLUTO...")
+gdf = gpd.read_file(url)
+
+# Filter to buildings only
+gdf = gdf[gdf['bldgclass'].notna()]
+print(f"✅ {len(gdf)} parcels with buildings")
+
+# Transform
+gdf = gdf.to_crs("EPSG:4326")
+gdf['centroid'] = gdf.geometry.centroid
+gdf['latitude'] = gdf.centroid.y
+gdf['longitude'] = gdf.centroid.x
+
+# Bulk insert
+for idx, row in gdf.iterrows():
+    building = Building(
+        bbl=row['bbl'],
+        address=row['address'],
+        borough=row['borough'],
+        latitude=row['latitude'],
+        longitude=row['longitude'],
+        year_built=row.get('yearbuilt'),
+        num_floors=row.get('numfloors'),
+        building_class=row.get('bldgclass')
+    )
+    session.add(building)
+    
+    if idx % 1000 == 0:
+        session.commit()
+        print(f"  Inserted {idx} buildings...")
+
+session.commit()
+print("✅ PLUTO data loaded")
+```
+
+2. Load your landmark data:
+```python
+# scripts/enrich_landmarks.py
+import pandas as pd
+
+df = pd.read_csv('walk_optimized_landmarks.csv')
+print(f"📥 Loading {len(df)} landmark buildings...")
+
+for _, row in df.iterrows():
+    session.query(Building).filter_by(bbl=row['bbl']).update({
+        'is_landmark': True,
+        'architect': row.get('arch_build'),
+        'style_primary': row.get('style_prim'),
+        'materials': row.get('materials', '').split(','),
+        'final_score': row.get('final_score'),
+        'historical_score': row.get('historical_score'),
+        'visual_score': row.get('visual_score')
+    })
+
+session.commit()
+print("✅ Landmarks enriched")
+```
+
+**✅ Checkpoint:** Database has 1.25M buildings, top 5K scored
+
+---
+
+### Day 6-7: Geospatial Service
+
+**Action Items:**
+
+1. Implement cone-of-vision logic:
+```python
+# services/geospatial.py
+import math
+from sqlalchemy import select, func, text
+from geoalchemy2 import Geography
+
+def create_view_cone_wkt(lat: float, lng: float, bearing: float, 
+                         distance: float = 100, cone_angle: float = 60) -> str:
+    """Generate WKT polygon for user's view cone"""
+    
+    def destination_point(lat, lng, bearing, dist):
+        R = 6371000  # Earth radius
+        lat_rad = math.radians(lat)
+        lng_rad = math.radians(lng)
+        brng_rad = math.radians(bearing)
+        
+        lat2 = math.asin(
+            math.sin(lat_rad) * math.cos(dist/R) +
+            math.cos(lat_rad) * math.sin(dist/R) * math.cos(brng_rad)
+        )
+        lng2 = lng_rad + math.atan2(
+            math.sin(brng_rad) * math.sin(dist/R) * math.cos(lat_rad),
+            math.cos(dist/R) - math.sin(lat_rad) * math.sin(lat2)
+        )
+        
+        return (math.degrees(lat2), math.degrees(lng2))
+    
+    # Start at user location
+    points = [f"{lng} {lat}"]
+    
+    # Generate cone arc
+    left_bearing = bearing - cone_angle / 2
+    right_bearing = bearing + cone_angle / 2
+    
+    # Left edge
+    left_pt = destination_point(lat, lng, left_bearing, distance)
+    points.append(f"{left_pt[1]} {left_pt[0]}")
+    
+    # Arc (10 points)
+    for i in range(11):
+        angle = left_bearing + (cone_angle * i / 10)
+        pt = destination_point(lat, lng, angle, distance)
+        points.append(f"{pt[1]} {pt[0]}")
+    
+    # Right edge
+    right_pt = destination_point(lat, lng, right_bearing, distance)
+    points.append(f"{right_pt[1]} {right_pt[0]}")
+    
+    # Close polygon
+    points.append(f"{lng} {lat}")
+    
+    return f"POLYGON(({', '.join(points)}))"
+
+async def get_candidate_buildings(
+    session,
+    lat: float, 
+    lng: float, 
+    bearing: float,
+    pitch: float = 0,
+    max_distance: float = 100
+) -> list[dict]:
+    """Get buildings in user's view cone"""
+    
+    cone_wkt = create_view_cone_wkt(lat, lng, bearing, max_distance)
+    
+    # Build query
+    query = select(Building).where(
+        func.ST_Intersects(
+            Building.geom,
+            func.ST_GeomFromText(cone_wkt, 4326)
+        )
+    )
+    
+    # Prioritize tall buildings if looking up
+    if pitch > 15:
+        query = query.order_by(Building.num_floors.desc().nulls_last())
+    
+    # Prioritize landmarks
+    query = query.order_by(Building.final_score.desc().nulls_last())
+    
+    # Limit
+    query = query.limit(20)
+    
+    results = await session.execute(query)
+    buildings = results.scalars().all()
+    
+    # Calculate distances
+    candidates = []
+    for building in buildings:
+        dist_query = select(
+            func.ST_Distance(
+                func.ST_GeomFromText(f"POINT({lng} {lat})", 4326).cast(Geography),
+                Building.geom.cast(Geography)
+            )
+        ).where(Building.bbl == building.bbl)
+        
+        distance = (await session.execute(dist_query)).scalar()
+        
+        candidates.append({
+            'bbl': building.bbl,
+            'address': building.address,
+            'latitude': building.latitude,
+            'longitude': building.longitude,
+            'distance_meters': distance,
+            'num_floors': building.num_floors,
+            'is_landmark': building.is_landmark,
+            'final_score': building.final_score
+        })
+    
+    return sorted(candidates, key=lambda x: (
+        -(x['final_score'] or 0),
+        x['distance_meters']
+    ))[:20]
+```
+
+2. Test with Postman:
+```python
+# routers/debug.py (temporary testing endpoint)
+@router.post("/test-geospatial")
+async def test_geospatial(lat: float, lng: float, bearing: float):
+    candidates = await geospatial.get_candidate_buildings(
+        db, lat, lng, bearing
+    )
+    return {"count": len(candidates), "candidates": candidates}
+```
+
+**✅ Checkpoint:** Geospatial query returns 5-20 buildings in <200ms
+
+---
+
+## Week 2: Image Processing & Matching
+
+### Day 8-9: Reference Image Fetching
+
+**Action Items:**
+
+1. Set up R2 storage:
+```python
+# utils/storage.py
+import boto3
+from io import BytesIO
+
+s3 = boto3.client(
+    's3',
+    endpoint_url=f'https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com',
+    aws_access_key_id=R2_ACCESS_KEY_ID,
+    aws_secret_access_key=R2_SECRET_ACCESS_KEY
+)
+
+async def upload_image(image_bytes: bytes, key: str) -> str:
+    s3.put_object(
+        Bucket=R2_BUCKET,
+        Key=key,
+        Body=image_bytes,
+        ContentType='image/jpeg'
+    )
+    return f"https://pub-xxx.r2.dev/{key}"  # Your R2 public URL
+```
+
+2. Implement Street View fetcher:
+```python
+# services/reference_images.py
+import httpx
+from datetime import datetime
+
+async def fetch_street_view(lat: float, lng: float, bearing: float) -> bytes:
+    """Fetch image from Google Street View"""
+    url = (
+        f"https://maps.googleapis.com/maps/api/streetview?"
+        f"size=600x600&"
+        f"location={lat},{lng}&"
+        f"heading={bearing}&"
+        f"pitch=10&"
+        f"fov=60&"
+        f"key={GOOGLE_MAPS_API_KEY}"
+    )
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url)
+        if response.status_code == 200:
+            return response.content
+    return None
+
+async def get_or_fetch_reference_image(
+    session,
+    bbl: str,
+    lat: float,
+    lng: float,
+    user_bearing: float
+) -> str | None:
+    """Get cached reference image or fetch new one"""
+    
+    # Check cache (within 30° tolerance)
+    tolerance = 30
+    existing = await session.execute(
+        select(ReferenceImage)
+        .where(ReferenceImage.bbl == bbl)
+        .where(ReferenceImage.compass_bearing.between(
+            user_bearing - tolerance,
+            user_bearing + tolerance
+        ))
+        .order_by(ReferenceImage.quality_score.desc())
+        .limit(1)
+    )
+    
+    cached = existing.scalar()
+    if cached:
+        return cached.image_url
+    
+    # Fetch from Street View
+    facade_bearing = (user_bearing + 180) % 360
+    image_bytes = await fetch_street_view(lat, lng, facade_bearing)
+    
+    if not image_bytes:
+        return None
+    
+    # Upload to R2
+    key = f"reference/{bbl}/{int(facade_bearing)}.jpg"
+    image_url = await storage.upload_image(image_bytes, key)
+    
+    # Store in DB
+    ref_img = ReferenceImage(
+        bbl=bbl,
+        image_url=image_url,
+        source='street_view',
+        compass_bearing=facade_bearing,
+        quality_score=1.0,
+        created_at=datetime.utcnow()
+    )
+    session.add(ref_img)
+    await session.commit()
+    
+    return image_url
+
+async def get_reference_images_for_candidates(
+    session,
+    candidates: list[dict],
+    user_bearing: float
+) -> dict[str, str]:
+    """Fetch reference images for all candidates in parallel"""
+    
+    tasks = []
+    for candidate in candidates:
+        task = get_or_fetch_reference_image(
+            session,
+            candidate['bbl'],
+            candidate['latitude'],
+            candidate['longitude'],
+            user_bearing
+        )
+        tasks.append(task)
+    
+    results = await asyncio.gather(*tasks)
+    
+    return {
+        candidate['bbl']: url
+        for candidate, url in zip(candidates, results)
+        if url is not None
+    }
+```
+
+**✅ Checkpoint:** Can fetch/cache Street View images for buildings
+
+---
+
+### Day 10-11: CLIP Integration
+
+**Action Items:**
+
+1. Load CLIP model on startup:
+```python
+# services/image_matcher.py
+import open_clip
+import torch
+from PIL import Image
+from io import BytesIO
+import httpx
+
+# Load once at startup
+print("🔄 Loading CLIP model...")
+model, preprocess = open_clip.create_model_and_transforms(
+    'ViT-B-32',
+    pretrained='laion2b_s34b_b79k'
+)
+model.eval()
+if torch.cuda.is_available():
+    model = model.cuda()
+print("✅ CLIP model loaded")
+
+async def compare_images(
+    user_photo_url: str,
+    candidates: list[dict],
+    reference_images: dict[str, str]
+) -> list[dict]:
+    """Compare user photo to reference images using CLIP"""
+    
+    # Download user photo
+    async with httpx.AsyncClient() as client:
+        user_response = await client.get(user_photo_url)
+        user_img = Image.open(BytesIO(user_response.content)).convert('RGB')
+    
+    # Encode user photo
+    user_tensor = preprocess(user_img).unsqueeze(0)
+    if torch.cuda.is_available():
+        user_tensor = user_tensor.cuda()
+    
+    with torch.no_grad():
+        user_embedding = model.encode_image(user_tensor)
+        user_embedding = user_embedding / user_embedding.norm(dim=-1, keepdim=True)
+    
+    # Compare to each candidate
+    matches = []
+    
+    for candidate in candidates:
+        bbl = candidate['bbl']
+        if bbl not in reference_images:
+            continue
+        
+        # Download reference image
+        async with httpx.AsyncClient() as client:
+            ref_response = await client.get(reference_images[bbl])
+            ref_img = Image.open(BytesIO(ref_response.content)).convert('RGB')
+        
+        # Encode reference
+        ref_tensor = preprocess(ref_img).unsqueeze(0)
+        if torch.cuda.is_available():
+            ref_tensor = ref_tensor.cuda()
+        
+        with torch.no_grad():
+            ref_embedding = model.encode_image(ref_tensor)
+            ref_embedding = ref_embedding / ref_embedding.norm(dim=-1, keepdim=True)
+        
+        # Cosine similarity
+        similarity = (user_embedding @ ref_embedding.T).item()
+        
+        # Apply boosters
+        boosted_score = similarity
+        if candidate.get('is_landmark'):
+            boosted_score *= 1.05
+        if candidate.get('distance_meters', 100) < 30:
+            boosted_score *= 1.1
+        
+        # Normalize to 0-1
+        confidence = (boosted_score + 1) / 2
+        
+        matches.append({
+            'bbl': bbl,
+            'address': candidate['address'],
+            'confidence': confidence,
+            'thumbnail_url': reference_images[bbl],
+            'raw_similarity': similarity
+        })
+    
+    return sorted(matches, key=lambda x: x['confidence'], reverse=True)
+```
+
+**✅ Checkpoint:** CLIP comparison works, returns sorted matches
+
+---
+
+### Day 12: Main Scan Endpoint
+
+**Action Items:**
+
+1. Complete scan flow:
+```python
+# routers/scan.py
+from fastapi import APIRouter, UploadFile, File, Form
+import uuid
+from datetime import datetime
+
+router = APIRouter()
+
+@router.post("/scan")
+async def scan_building(
+    photo: UploadFile = File(...),
+    gps_lat: float = Form(...),
+    gps_lng: float = Form(...),
+    compass_bearing: float = Form(...),
+    phone_pitch: float = Form(0)
+):
+    start = datetime.now()
+    scan_id = str(uuid.uuid4())
+    
+    # 1. Upload user photo
+    photo_bytes = await photo.read()
+    user_photo_url = await storage.upload_image(
+        photo_bytes,
+        f"scans/{scan_id}.jpg"
+    )
+    
+    # 2. Geospatial filtering
+    candidates = await geospatial.get_candidate_buildings(
+        db, gps_lat, gps_lng, compass_bearing, phone_pitch
+    )
+    
+    if len(candidates) == 0:
+        return {"error": "No buildings found in view"}
+    
+    # 3. Get reference images
+    ref_images = await reference_images.get_reference_images_for_candidates(
+        db, candidates, compass_bearing
+    )
+    
+    # 4. CLIP comparison
+    matches = await image_matcher.compare_images(
+        user_photo_url, candidates, ref_images
+    )
+    
+    # 5. Store scan
+    scan = Scan(
+        id=scan_id,
+        user_photo_url=user_photo_url,
+        gps_lat=gps_lat,
+        gps_lng=gps_lng,
+        compass_bearing=compass_bearing,
+        phone_pitch=phone_pitch,
+        candidate_bbls=[m['bbl'] for m in matches[:5]],
+        top_confidence=matches[0]['confidence'] if matches else 0,
+        created_at=datetime.utcnow()
+    )
+    db.add(scan)
+    await db.commit()
+    
+    # 6. Return results
+    duration_ms = int((datetime.now() - start).total_seconds() * 1000)
+    
+    return {
+        'scan_id': scan_id,
+        'matches': matches[:3],
+        'processing_time_ms': duration_ms,
+        'show_picker': matches[0]['confidence'] < 0.75 if matches else True
+    }
+
+@router.post("/scans/{scan_id}/confirm")
+async def confirm_building(scan_id: str, confirmed_bbl: str):
+    """User confirms which building they scanned"""
+    await db.execute(
+        update(Scan)
+        .where(Scan.id == scan_id)
+        .values(confirmed_bbl=confirmed_bbl)
+    )
+    await db.commit()
+    
+    return {"status": "confirmed"}
+```
+
+**✅ Checkpoint:** Full scan endpoint works end-to-end
+
+---
+
+### Day 13-14: Pre-cache Top Buildings
+
+**Action Items:**
+
+1. Create pre-cache script:
+```python
+# scripts/precache_landmarks.py
+
+async def precache_top_buildings():
+    # Get top 5000 by score
+    results = await db.execute(
+        select(Building)
+        .where(Building.final_score > 40)
+        .order_by(Building.final_score.desc())
+        .limit(5000)
+    )
+    buildings = results.scalars().all()
+    
+    print(f"📸 Pre-caching images for {len(buildings)} buildings...")
+    
+    total_cost = 0
+    cached = 0
+    
+    for idx, building in enumerate(buildings):
+        # 4 cardinal directions
+        for bearing in [0, 90, 180, 270]:
+            try:
+                image_url = await reference_images.get_or_fetch_reference_image(
+                    db,
+                    building.bbl,
+                    building.latitude,
+                    building.longitude,
+                    bearing
+                )
+                if image_url:
+                    cached += 1
+                    total_cost += 0.007
+            except Exception as e:
+                print(f"  ❌ Failed {building.bbl} @ {bearing}°: {e}")
+        
+        if (idx + 1) % 100 == 0:
+            print(f"  Progress: {idx + 1}/{len(buildings)} buildings")
+            print(f"  Cached: {cached} images, Cost: ${total_cost:.2f}")
+    
+    print(f"✅ Pre-caching complete!")
+    print(f"   Total images: {cached}")
+    print(f"   Total cost: ${total_cost:.2f}")
+
+if __name__ == "__main__":
+    asyncio.run(precache_top_buildings())
+```
+
+2. Run overnight:
+```bash
+python scripts/precache_landmarks.py
+# Expected: ~20K images, ~$140 (if no Mapillary fallback)
+```
+
+**Cost optimization:** Implement Mapillary fallback first to cut costs 60-70%.
+
+**✅ Checkpoint:** Top 5K buildings have cached reference images
+
+---
+
+## Week 3: Mobile App & Polish
+
+### Day 15-16: React Native App Setup
+
+**Action Items:**
+
+1. Initialize Expo app:
+```bash
+cd mobile
+npx create-expo-app nyc-scan --template blank-typescript
+cd nyc-scan
+
+# Install dependencies
+npx expo install expo-camera expo-location expo-sensors
+npm install @react-navigation/native @react-navigation/native-stack
+npm install axios
+```
+
+2. Configure permissions (`app.json`):
+```json
+{
+  "expo": {
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow NYC Scan to use camera for building recognition"
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Allow NYC Scan to access your location for building identification"
+        }
+      ]
+    ]
+  }
+}
+```
+
+3. Create navigation:
+```typescript
+// App.tsx
+import { NavigationContainer } from '@react-navigation/native';
+import { createNativeStackNavigator } from '@react-navigation/native-stack';
+
+const Stack = createNativeStackNavigator();
+
+export default function App() {
+  return (
+    <NavigationContainer>
+      <Stack.Navigator>
+        <Stack.Screen name="Scan" component={ScanScreen} />
+        <Stack.Screen name="Results" component={ResultsScreen} />
+        <Stack.Screen name="BuildingDetail" component={BuildingDetailScreen} />
+      </Stack.Navigator>
+    </NavigationContainer>
+  );
+}
+```
+
+**✅ Checkpoint:** App runs on device with navigation
+
+---
+
+### Day 17-18: Camera Screen
+
+**Action Items:**
+
+```typescript
+// screens/ScanScreen.tsx
+import { Camera, CameraType } from 'expo-camera';
+import * as Location from 'expo-location';
+import { Magnetometer } from 'expo-sensors';
+import { useState, useEffect, useRef } from 'react';
+
+export default function ScanScreen({ navigation }) {
+  const [hasPermission, setHasPermission] = useState(false);
+  const [bearing, setBearing] = useState(0);
+  const [isScanning, setIsScanning] = useState(false);
+  const cameraRef = useRef(null);
+
+  useEffect(() => {
+    (async () => {
+      const { status: cameraStatus } = await Camera.requestCameraPermissionsAsync();
+      const { status: locationStatus } = await Location.requestForegroundPermissionsAsync();
+      setHasPermission(cameraStatus === 'granted' && locationStatus === 'granted');
+    })();
+
+    // Subscribe to compass
+    const subscription = Magnetometer.addListener(data => {
+      let angle = Math.atan2(data.y, data.x) * (180 / Math.PI);
+      angle = (angle + 360) % 360;
+      setBearing(Math.round(angle));
+    });
+    Magnetometer.setUpdateInterval(100);
+
+    return () => subscription.remove();
+  }, []);
+
+  const handleScan = async () => {
+    if (!cameraRef.current || isScanning) return;
+    
+    setIsScanning(true);
+
+    try {
+      // Capture photo
+      const photo = await cameraRef.current.takePictureAsync({
+        quality: 0.8,
+      });
+
+      // Get location
+      const location = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.High,
+      });
+
+      // Upload to backend
+      const formData = new FormData();
+      formData.append('photo', {
+        uri: photo.uri,
+        type: 'image/jpeg',
+        name: 'scan.jpg',
+      } as any);
+      formData.append('gps_lat', location.coords.latitude.toString());
+      formData.append('gps_lng', location.coords.longitude.toString());
+      formData.append('compass_bearing', bearing.toString());
+      formData.append('phone_pitch', '0');
+
+      const response = await fetch('YOUR_API_URL/api/scan', {
+        method: 'POST',
+        body: formData,
+      });
+
+      const result = await response.json();
+
+      // Navigate to results
+      navigation.navigate('Results', {
+        matches: result.matches,
+        scanId: result.scan_id,
+        showPicker: result.show_picker,
+      });
+    } catch (error) {
+      alert('Scan failed: ' + error.message);
+    } finally {
+      setIsScanning(false);
+    }
+  };
+
+  if (!hasPermission) {
+    return <Text>Requesting permissions...</Text>;
+  }
+
+  return (
+    <View style={{ flex: 1 }}>
+      <Camera
+        ref={cameraRef}
+        style={{ flex: 1 }}
+        type={CameraType.back}
+      >
+        <View style={styles.overlay}>
+          {/* Compass indicator */}
+          <View style={styles.compass}>
+            <Text style={styles.compassText}>{bearing}°</Text>
+          </View>
+
+          {/* Crosshair */}
+          <View style={styles.crosshair}>
+            <View style={styles.crosshairH} />
+            <View style={styles.crosshairV} />
+          </View>
+
+          {/* Scan button */}
+          <TouchableOpacity
+            style={styles.scanButton}
+            onPress={handleScan}
+            disabled={isScanning}
+          >
+            {isScanning ? (
+              <ActivityIndicator color="#fff" />
+            ) : (
+              <Text style={styles.scanText}>SCAN</Text>
+            )}
+          </TouchableOpacity>
+        </View>
+      </Camera>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  overlay: {
+    flex: 1,
+    justifyContent: 'space-between',
+    padding: 20,
+  },
+  compass: {
+    alignSelf: 'center',
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    borderRadius: 20,
+    marginTop: 50,
+  },
+  compassText: {
+    color: '#fff',
+    fontSize: 18,
+    fontWeight: '600',
+  },
+  crosshair: {
+    position: 'absolute',
+    top: '50%',
+    left: '50%',
+    width: 40,
+    height: 40,
+    marginLeft: -20,
+    marginTop: -20,
+  },
+  crosshairH: {
+    position: 'absolute',
+    width: 40,
+    height: 2,
+    backgroundColor: '#fff',
+    top: 19,
+  },
+  crosshairV: {
+    position: 'absolute',
+    width: 2,
+    height: 40,
+    backgroundColor: '#fff',
+    left: 19,
+  },
+  scanButton: {
+    alignSelf: 'center',
+    backgroundColor: '#007AFF',
+    width: 70,
+    height: 70,
+    borderRadius: 35,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 30,
+  },
+  scanText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+});
+```
+
+**✅ Checkpoint:** Can take photo, see compass, upload to backend
+
+---
+
+### Day 19: Results Screen
+
+**Action Items:**
+
+```typescript
+// screens/ResultsScreen.tsx
+export default function ResultsScreen({ route, navigation }) {
+  const { matches, scanId, showPicker } = route.params;
+
+  const confirmBuilding = async (bbl: string) => {
+    // Confirm with backend
+    await fetch(`YOUR_API_URL/api/scans/${scanId}/confirm`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirmed_bbl: bbl }),
+    });
+
+    // Navigate to detail
+    navigation.navigate('BuildingDetail', { bbl });
+  };
+
+  return (
+    <ScrollView style={styles.container}>
+      <Text style={styles.title}>
+        {showPicker ? 'Is this your building?' : 'Found it!'}
+      </Text>
+
+      {matches.map((match) => (
+        <TouchableOpacity
+          key={match.bbl}
+          style={styles.card}
+          onPress={() => confirmBuilding(match.bbl)}
+        >
+          <Image
+            source={{ uri: match.thumbnail_url }}
+            style={styles.thumbnail}
+          />
+          <View style={styles.info}>
+            <Text style={styles.address}>{match.address}</Text>
+            <Text style={styles.confidence}>
+              {Math.round(match.confidence * 100)}% match
+            </Text>
+          </View>
+        </TouchableOpacity>
+      ))}
+
+      <Button
+        title="None of these"
+        onPress={() => navigation.goBack()}
+      />
+    </ScrollView>
+  );
+}
+```
+
+**✅ Checkpoint:** Can select building from matches
+
+---
+
+### Day 20: Building Detail Screen
+
+**Action Items:**
+
+```typescript
+// screens/BuildingDetailScreen.tsx
+export default function BuildingDetailScreen({ route }) {
+  const { bbl } = route.params;
+  const [building, setBuilding] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    fetchBuilding();
+  }, []);
+
+  const fetchBuilding = async () => {
+    const response = await fetch(`YOUR_API_URL/api/buildings/${bbl}`);
+    const data = await response.json();
+    setBuilding(data);
+    setLoading(false);
+  };
+
+  if (loading) return <ActivityIndicator />;
+  if (!building) return <Text>Building not found</Text>;
+
+  return (
+    <ScrollView style={styles.container}>
+      <Text style={styles.title}>{building.address}</Text>
+
+      {building.is_landmark && (
+        <View style={styles.badge}>
+          <Text style={styles.badgeText}>NYC Landmark</Text>
+        </View>
+      )}
+
+      <View style={styles.section}>
+        <Text style={styles.sectionTitle}>Details</Text>
+        {building.year_built && (
+          <InfoRow label="Built" value={building.year_built} />
+        )}
+        {building.architect && (
+          <InfoRow label="Architect" value={building.architect} />
+        )}
+        {building.style_primary && (
+          <InfoRow label="Style" value={building.style_primary} />
+        )}
+        {building.num_floors && (
+          <InfoRow label="Floors" value={building.num_floors} />
+        )}
+      </View>
+
+      {building.materials?.length > 0 && (
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>Materials</Text>
+          <View style={styles.chips}>
+            {building.materials.map(m => (
+              <View key={m} style={styles.chip}>
+                <Text>{m}</Text>
+              </View>
+            ))}
+          </View>
+        </View>
+      )}
+
+      {building.description && (
+        <View style={styles.section}>
+          <Text style={styles.sectionTitle}>About</Text>
+          <Text style={styles.description}>{building.description}</Text>
+        </View>
+      )}
+    </ScrollView>
+  );
+}
+
+function InfoRow({ label, value }) {
+  return (
+    <View style={styles.row}>
+      <Text style={styles.label}>{label}</Text>
+      <Text style={styles.value}>{value}</Text>
+    </View>
+  );
+}
+```
+
+**✅ Checkpoint:** Full user flow works end-to-end
+
+---
+
+### Day 21: Polish & Deploy
+
+**Action Items:**
+
+1. **Add building info endpoint:**
+```python
+# routers/buildings.py
+@router.get("/buildings/{bbl}")
+async def get_building_detail(bbl: str):
+    building = await db.execute(
+        select(Building).where(Building.bbl == bbl)
+    )
+    building = building.scalar()
+    
+    if not building:
+        raise HTTPException(404)
+    
+    return {
+        'bbl': building.bbl,
+        'address': building.address,
+        'year_built': building.year_built,
+        'architect': building.architect,
+        'style_primary': building.style_primary,
+        'materials': building.materials,
+        'num_floors': building.num_floors,
+        'is_landmark': building.is_landmark,
+        'description': building.description,
+    }
+```
+
+2. **Deploy backend:**
+```bash
+# Railway deployment
+railway login
+railway init
+railway up
+
+# Or Fly.io
+fly launch
+fly deploy
+```
+
+3. **Update mobile app with prod API URL**
+
+4. **Test on real device in NYC**
+
+**✅ Final Checkpoint:** App works on device, can scan real buildings
+
+---
+
+## Post-Launch: LLM Bio Generation
+
+**Add when ready:**
+
+```python
+# services/bio_generator.py
+from openai import OpenAI
+
+client = OpenAI(api_key=PERPLEXITY_API_KEY, base_url="https://api.perplexity.ai")
+
+async def generate_building_bio(building: Building) -> dict:
+    """Generate bio using Perplexity's web search"""
+    
+    query = f"{building.address} NYC architecture history"
+    
+    response = client.chat.completions.create(
+        model="llama-3.1-sonar-large-128k-online",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are an architecture historian. Provide a 2-3 paragraph bio about this building with citations."
+            },
+            {
+                "role": "user",
+                "content": query
+            }
+        ]
+    )
+    
+    bio = response.choices[0].message.content
+    sources = response.citations if hasattr(response, 'citations') else []
+    
+    # Store in DB
+    await db.execute(
+        update(Building)
+        .where(Building.bbl == building.bbl)
+        .values(
+            description=bio,
+            description_sources=sources
+        )
+    )
+    
+    return {'description': bio, 'sources': sources}
+```
+
+---
+
+## Daily Checklist Summary
+
+**Week 1:** Backend foundation
+- ✅ Day 1: Setup
+- ✅ Day 2-3: Database schema
+- ✅ Day 4-5: Data ingestion  
+- ✅ Day 6-7: Geospatial service
+
+**Week 2:** Image processing
+- ✅ Day 8-9: Reference images
+- ✅ Day 10-11: CLIP integration
+- ✅ Day 12: Scan endpoint
+- ✅ Day 13-14: Pre-cache
+
+**Week 3:** Mobile app
+- ✅ Day 15-16: App setup
+- ✅ Day 17-18: Camera screen
+- ✅ Day 19: Results screen
+- ✅ Day 20: Detail screen
+- ✅ Day 21: Deploy
+
+**Total Cost:**
+- Pre-cache: ~$140
+- Hosting: $5-20/mo
+- Per scan: ~$0.02
+
+This is aggressive but achievable if you code full-time. Good luck! 🚀
+
+## Required Assets to Start
+
+**Data Files (already have):**
+- ✅ `walk_optimized_landmarks.csv` (3,712 buildings with scores)
+- ✅ `Master_Architect.txt` (architect lists)
+- ✅ Style/material taxonomies
+
+**NYC Open Data (download once):**
+- NYC PLUTO dataset (GeoJSON, ~2GB)
+  - https://data.cityofnewyork.us/City-Government/MapPLUTO/gw7u-xunb
+- NYC Landmarks shapefile (optional, you have CSV)
+
+**API Keys:**
+- Google Maps API key (enable Street View Static API)
+  - https://console.cloud.google.com/
+  - Free tier: none, but $200 credit for new accounts
+- Cloudflare R2 account (storage)
+  - https://cloudflare.com/products/r2/
+  - Free: 10GB storage
+- OpenAI/Perplexity API key (optional, for bios later)
+
+**Services (free tiers available):**
+- Supabase account (PostgreSQL + PostGIS)
+- Upstash account (Redis)
+- Railway or Fly.io account (backend hosting)
+- Expo account (mobile app deployment)
+
+**Development Environment:**
+- Python 3.11+
+- Node.js 18+
+- Git
+- iOS device (for testing camera/GPS) or Android
+
+**Costs to Budget:**
+- Google Street View pre-cache: $140
+- Backend hosting: $5-20/month
+- Domain (optional): $10/year
+
+**That's it.** Everything else is code you'll write following the plan.
