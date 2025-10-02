@@ -36,9 +36,8 @@ if sentry_dsn:
         integrations=[FastApiIntegration()],
         traces_sample_rate=0.1,  # 10% of transactions for performance monitoring
         environment="production" if os.getenv("RENDER") else "development",
-        release=f"nyc-scan@1.0.0",
+        release="nyc-scan@1.0.0",
         send_default_pii=True,  # Include request headers and user data
-        enable_logs=True,  # Enable sending logs to Sentry
     )
     logger.info("✅ Sentry initialized for error tracking")
 else:
