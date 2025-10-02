@@ -58,10 +58,8 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing database connection...")
     await init_db()
 
-    # Initialize CLIP model on startup
-    logger.info("Loading CLIP model...")
-    init_clip_model()
-    logger.info("✅ CLIP model loaded successfully")
+    # CLIP model will lazy-load on first scan request to save memory
+    logger.info("⏳ CLIP model will load on first scan request (lazy loading)")
 
     yield
 

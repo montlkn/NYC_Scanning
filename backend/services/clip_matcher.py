@@ -68,12 +68,16 @@ def init_clip_model():
 def get_clip_model() -> Tuple:
     """
     Get the initialized CLIP model and preprocessor
+    Lazy-loads the model if not already initialized
 
     Returns:
         Tuple of (model, preprocess, device)
     """
+    global _clip_model
+
     if _clip_model is None:
-        raise RuntimeError("CLIP model not initialized. Call init_clip_model() first.")
+        logger.info("Lazy-loading CLIP model on first request...")
+        init_clip_model()
 
     return _clip_model, _clip_preprocess, _clip_device
 
