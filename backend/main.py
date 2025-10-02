@@ -9,6 +9,10 @@ from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 import time
 import logging
+import os
+
+import sentry_sdk
+from sentry_sdk.integrations.fastapi import FastApiIntegration
 
 from models.config import get_settings
 from models.session import init_db, close_db
@@ -23,6 +27,22 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 settings = get_settings()
+
+# Initialize Sentry for error tracking
+sentry_dsn = os.getenv("SENTRY_DSN", "https://108d23e36bba68c9b84944a310d977bc@o4510116323393536.ingest.us.sentry.io/4510116333355008")
+if sentry_dsn:
+    sentry_sdk.init(
+        dsn=sentry_dsn,
+        integrations=[FastApiIntegration()],
+        traces_sample_rate=0.1,  # 10% of transactions for performance monitoring
+        environment="production" if os.getenv("RENDER") else "development",
+        release=f"nyc-scan@1.0.0",
+        send_default_pii=True,  # Include request headers and user data
+        enable_logs=True,  # Enable sending logs to Sentry
+    )
+    logger.info("✅ Sentry initialized for error tracking")
+else:
+    logger.warning("⚠️  SENTRY_DSN not set, error tracking disabled")
 
 
 @asynccontextmanager

@@ -14,9 +14,9 @@ greenlet==3.0.3
 # Supabase
 supabase>=2.3.0
 
-# Geospatial
-geopandas==0.14.3
-shapely==2.0.3
+# Geospatial (PostGIS handles this on DB side)
+# geopandas==0.14.3  # Not needed - using PostGIS
+shapely==2.0.3  # Keep for WKT parsing if needed
 
 # Image Processing & ML
 pillow==10.2.0
@@ -43,3 +43,6 @@ pydantic-settings==2.1.0
 
 # Utilities
 aiofiles==23.2.1
+
+# Error Tracking
+sentry-sdk[fastapi]==1.40.0

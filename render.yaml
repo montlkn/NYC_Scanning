@@ -1,0 +1,41 @@
+services:
+  - type: web
+    name: nyc-scan-api
+    runtime: python
+    region: oregon  # Change to 'virginia' if closer to NYC
+    plan: free  # Free tier (spins down after 15min idle)
+    branch: main
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: DATABASE_URL
+        sync: false  # Set manually in Render dashboard
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: GOOGLE_MAPS_API_KEY
+        sync: false
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET
+        value: building-images
+      - key: R2_PUBLIC_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: CLIP_DEVICE
+        value: cpu
+      - key: PORT
+        value: 8000
+    healthCheckPath: /health
+    autoDeploy: true

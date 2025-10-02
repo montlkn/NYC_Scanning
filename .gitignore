@@ -31,6 +31,12 @@ logs/
 *.db
 *.sqlite
 
+# Data files (CSVs too large for git)
+backend/data/*.csv
+backend/data/*.json
+backend/data/*.geojson
+!backend/data/.gitkeep
+
 # Model files (too large for git)
 *.pt
 *.pth

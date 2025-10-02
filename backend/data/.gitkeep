@@ -1,0 +1,5 @@
+# Data folder for CSV files
+# Files in this directory are gitignored
+# Place your CSVs here:
+# - pluto.csv
+# - landmarks.csv
