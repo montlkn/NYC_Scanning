@@ -151,10 +151,13 @@ if settings.debug:
 if __name__ == "__main__":
     import uvicorn
 
+    # Never use reload in production - it doubles memory usage
+    use_reload = settings.debug and not os.getenv("RENDER")
+
     uvicorn.run(
         "main:app",
         host=settings.api_host,
         port=settings.api_port,
-        reload=settings.debug,
+        reload=use_reload,
         log_level="info" if settings.debug else "warning"
     )
