@@ -143,7 +143,7 @@ async def get_candidate_buildings(
     # Always prioritize landmarks
     query = query.order_by(
         Building.is_landmark.desc(),
-        Building.final_score.desc().nulls_last()
+        Building.walk_score.desc().nulls_last()
     )
 
     # Limit results
