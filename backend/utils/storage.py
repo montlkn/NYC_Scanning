@@ -2,6 +2,7 @@
 Cloudflare R2 storage utilities for image uploads
 """
 
+import asyncio
 import boto3
 from botocore.client import Config
 from io import BytesIO
