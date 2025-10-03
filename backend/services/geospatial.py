@@ -257,8 +257,8 @@ def calculate_relevance_score(candidate: Dict[str, Any]) -> float:
         score += 0.5
 
     # Final score bonus (normalized 0-1)
-    if candidate['final_score']:
-        score += min(candidate['final_score'] / 100, 1.0)
+    if candidate.get('walk_score'):
+        score += min(candidate['walk_score'] / 100, 1.0)
 
     return score
 
