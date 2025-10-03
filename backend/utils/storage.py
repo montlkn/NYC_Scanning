@@ -46,8 +46,9 @@ async def upload_image(
         Public URL of uploaded image
     """
     try:
-        # Upload main image
-        s3_client.put_object(
+        # Upload main image in thread pool (boto3 is synchronous)
+        await asyncio.to_thread(
+            s3_client.put_object,
             Bucket=settings.r2_bucket,
             Key=key,
             Body=image_bytes,
@@ -64,7 +65,8 @@ async def upload_image(
             thumbnail_key = key.replace('.jpg', '_thumb.jpg')
             thumbnail_bytes = create_thumbnail_bytes(image_bytes)
             if thumbnail_bytes:
-                s3_client.put_object(
+                await asyncio.to_thread(
+                    s3_client.put_object,
                     Bucket=settings.r2_bucket,
                     Key=thumbnail_key,
                     Body=thumbnail_bytes,
@@ -77,7 +79,7 @@ async def upload_image(
         return image_url
 
     except Exception as e:
-        logger.error(f"Failed to upload image to R2: {e}")
+        logger.error(f"Failed to upload image to R2: {e}", exc_info=True)
         raise
 
 
@@ -149,7 +151,8 @@ async def delete_image(key: str) -> bool:
         True if successful, False otherwise
     """
     try:
-        s3_client.delete_object(
+        await asyncio.to_thread(
+            s3_client.delete_object,
             Bucket=settings.r2_bucket,
             Key=key
         )

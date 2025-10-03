@@ -33,35 +33,25 @@ class Building(Base):
     geom = Column(Geometry('POINT', srid=4326), index=True)
 
     # Physical characteristics
-    year_built = Column(Integer)
-    num_floors = Column(Integer)
-    height_ft = Column(Float)
-    building_class = Column(String(10))
-    lot_area = Column(Float)
-    building_area = Column(Float)
+    year_built = Column(Integer, nullable=True)
+    num_floors = Column(Integer, nullable=True)
+    building_class = Column(String(10), nullable=True)
+    land_use = Column(String(10), nullable=True)
 
     # Landmark data
-    is_landmark = Column(Boolean, default=False, index=True)
-    landmark_name = Column(Text)
-    architect = Column(Text)
-    style_primary = Column(Text)
-    style_secondary = Column(Text)
-    materials = Column(ARRAY(Text))
+    is_landmark = Column(Boolean, default=False, index=True, nullable=True)
+    landmark_name = Column(Text, nullable=True)
+    architect = Column(Text, nullable=True)
+    architectural_style = Column(Text, nullable=True)  # Note: called architectural_style in DB
+    short_bio = Column(Text, nullable=True)
 
-    # Scoring from existing system
-    final_score = Column(Float, index=True)
-    historical_score = Column(Float)
-    visual_score = Column(Float)
-    cultural_score = Column(Float)
-
-    # Generated content (for future LLM integration)
-    description = Column(Text)
-    description_sources = Column(ARRAY(Text))
-    short_bio = Column(Text)
+    # Walk optimization
+    is_walk_optimized = Column(Boolean, default=False, nullable=True)
+    walk_score = Column(Float, nullable=True)
 
     # Image matching metadata
-    scan_enabled = Column(Boolean, default=True)
-    has_reference_images = Column(Boolean, default=False)
+    scan_enabled = Column(Boolean, default=True, nullable=True)
+    has_reference_images = Column(Boolean, default=False, nullable=True)
 
     # Timestamps
     created_at = Column(TIMESTAMP, default=datetime.utcnow)

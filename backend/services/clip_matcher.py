@@ -222,7 +222,7 @@ async def compare_images(
             'is_landmark': candidate.get('is_landmark', False),
             'landmark_name': candidate.get('landmark_name'),
             'architect': candidate.get('architect'),
-            'style_primary': candidate.get('style_primary'),
+            'architectural_style': candidate.get('architectural_style'),
             'year_built': candidate.get('year_built'),
         })
 

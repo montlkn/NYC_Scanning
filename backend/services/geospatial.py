@@ -191,13 +191,12 @@ async def get_candidate_buildings(
             'bearing_to_building': round(building_bearing, 1),
             'bearing_difference': round(bearing_diff, 1),
             'num_floors': building.num_floors,
-            'height_ft': building.height_ft,
             'year_built': building.year_built,
             'is_landmark': building.is_landmark,
             'landmark_name': building.landmark_name,
             'architect': building.architect,
-            'style_primary': building.style_primary,
-            'final_score': building.final_score,
+            'architectural_style': building.architectural_style,
+            'walk_score': building.walk_score,
             'has_reference_images': building.has_reference_images,
         })
 
