@@ -93,15 +93,23 @@ async def download_image(url: str) -> Optional[Image.Image]:
         PIL Image or None if failed
     """
     try:
+        logger.debug(f"Downloading image from: {url}")
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(url)
             response.raise_for_status()
 
             img = Image.open(BytesIO(response.content)).convert('RGB')
+            logger.debug(f"Successfully downloaded image from {url}")
             return img
 
+    except httpx.TimeoutException as e:
+        logger.error(f"Timeout downloading image from {url}: {e}")
+        return None
+    except httpx.HTTPError as e:
+        logger.error(f"HTTP error downloading image from {url}: {e}")
+        return None
     except Exception as e:
-        logger.error(f"Failed to download image from {url}: {e}")
+        logger.error(f"Failed to download image from {url}: {type(e).__name__}: {e}", exc_info=True)
         return None
 
 
