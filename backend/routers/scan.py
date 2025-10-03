@@ -11,6 +11,7 @@ import logging
 import time
 
 from models.database import Scan
+from models.session import get_db
 from services import geospatial, reference_images, clip_matcher
 from utils.storage import upload_image
 from models.config import get_settings
@@ -18,14 +19,6 @@ from models.config import get_settings
 logger = logging.getLogger(__name__)
 settings = get_settings()
 router = APIRouter()
-
-
-# TODO: Add database session dependency
-# For now, we'll use a placeholder
-async def get_db():
-    # This should return an async database session
-    # Will be implemented with proper async SQLAlchemy setup
-    pass
 
 
 @router.post("/scan")
@@ -42,7 +35,7 @@ async def scan_building(
     movement_type: str = Form(None, description="Movement type: stationary/walking/running"),
     gps_accuracy: float = Form(None, description="GPS accuracy in meters"),
     user_id: str = Form(None, description="Optional user ID for tracking"),
-    # db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Main scan endpoint - identifies building from photo + GPS + compass
@@ -81,22 +74,9 @@ async def scan_building(
 
         # === STEP 2: Geospatial filtering ===
         geo_start = time.time()
-        # TODO: Use real database session
-        # candidates = await geospatial.get_candidate_buildings(
-        #     db, gps_lat, gps_lng, compass_bearing, phone_pitch
-        # )
-        # For now, return mock data
-        candidates = [
-            {
-                'bbl': '1000010001',
-                'address': '1 Wall Street',
-                'latitude': 40.7074,
-                'longitude': -74.0113,
-                'distance_meters': 25.5,
-                'is_landmark': True,
-                'final_score': 85.0
-            }
-        ]
+        candidates = await geospatial.get_candidate_buildings(
+            db, gps_lat, gps_lng, compass_bearing, phone_pitch
+        )
         geo_time_ms = int((time.time() - geo_start) * 1000)
         logger.info(f"[{scan_id}] Found {len(candidates)} candidates in {geo_time_ms}ms")
 
@@ -114,12 +94,9 @@ async def scan_building(
 
         # === STEP 3: Get reference images ===
         ref_start = time.time()
-        # TODO: Use real database session
-        # reference_imgs = await reference_images.get_reference_images_for_candidates(
-        #     db, candidates, compass_bearing
-        # )
-        # For now, return empty dict
-        reference_imgs = {}
+        reference_imgs = await reference_images.get_reference_images_for_candidates(
+            db, candidates, compass_bearing
+        )
         ref_time_ms = int((time.time() - ref_start) * 1000)
         logger.info(f"[{scan_id}] Fetched {len(reference_imgs)} reference images in {ref_time_ms}ms")
 
@@ -138,11 +115,9 @@ async def scan_building(
 
         # === STEP 4: CLIP comparison ===
         clip_start = time.time()
-        # matches = await clip_matcher.compare_images(
-        #     user_photo_url, candidates, reference_imgs
-        # )
-        # For now, return mock matches
-        matches = []
+        matches = await clip_matcher.compare_images(
+            user_photo_url, candidates, reference_imgs
+        )
         clip_time_ms = int((time.time() - clip_start) * 1000)
         logger.info(f"[{scan_id}] CLIP comparison completed in {clip_time_ms}ms")
 

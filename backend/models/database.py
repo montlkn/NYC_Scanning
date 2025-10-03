@@ -17,9 +17,9 @@ Base = declarative_base()
 
 class Building(Base):
     """
-    Main buildings table - extends existing Supabase buildings table
+    Main buildings table - uses buildings_full_merge_scanning (860k NYC buildings + landmark data)
     """
-    __tablename__ = 'buildings'
+    __tablename__ = 'buildings_full_merge_scanning'
 
     # Primary identifiers
     bbl = Column(String(10), primary_key=True)
