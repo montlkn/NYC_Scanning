@@ -197,7 +197,6 @@ async def get_candidate_buildings(
             'architect': building.architect,
             'architectural_style': building.architectural_style,
             'walk_score': building.walk_score,
-            'has_reference_images': building.has_reference_images,
         })
 
     # Sort by combined relevance score

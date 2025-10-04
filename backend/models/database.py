@@ -51,11 +51,9 @@ class Building(Base):
 
     # Image matching metadata
     scan_enabled = Column(Boolean, default=True, nullable=True)
-    has_reference_images = Column(Boolean, default=False, nullable=True)
 
     # Timestamps
-    created_at = Column(TIMESTAMP, default=datetime.utcnow)
-    updated_at = Column(TIMESTAMP, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(TIMESTAMP, default=datetime.utcnow, nullable=True)
 
 
 class ReferenceImage(Base):
