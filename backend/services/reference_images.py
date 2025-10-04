@@ -180,7 +180,7 @@ async def get_reference_images_for_candidates(
     Returns:
         Dictionary mapping BBL to image URL
     """
-    logger.info(f"Fetching reference images for {len(candidates)} candidates")
+    logger.info(f"📥 Fetching reference images for {len(candidates)} candidates @ bearing {user_bearing}°")
 
     # Create tasks for parallel fetching
     tasks = []
@@ -198,8 +198,14 @@ async def get_reference_images_for_candidates(
     semaphore = asyncio.Semaphore(5)  # Max 5 concurrent fetches
 
     async def fetch_with_limit(bbl: str, task):
-        async with semaphore:
-            return bbl, await task
+        try:
+            async with semaphore:
+                result = await task
+                logger.debug(f"✅ Fetched for BBL {bbl}: {result is not None}")
+                return bbl, result
+        except Exception as e:
+            logger.error(f"❌ Error fetching BBL {bbl}: {type(e).__name__}: {e}", exc_info=True)
+            return bbl, None
 
     results = await asyncio.gather(*[
         fetch_with_limit(bbl, task) for bbl, task in tasks
@@ -209,14 +215,17 @@ async def get_reference_images_for_candidates(
     reference_images = {}
     for result in results:
         if isinstance(result, Exception):
-            logger.error(f"Error fetching reference image: {result}")
+            logger.error(f"❌ Exception in gather: {type(result).__name__}: {result}")
             continue
 
         bbl, url = result
         if url:
             reference_images[bbl] = url
+            logger.info(f"✅ Added reference image for BBL {bbl}")
+        else:
+            logger.warning(f"⚠️ No reference image available for BBL {bbl}")
 
-    logger.info(f"Successfully fetched {len(reference_images)} reference images")
+    logger.info(f"✅ Successfully fetched {len(reference_images)}/{len(candidates)} reference images")
     return reference_images
 
 
