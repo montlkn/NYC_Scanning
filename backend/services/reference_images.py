@@ -101,7 +101,7 @@ async def get_or_fetch_reference_image(
 
     query = (
         select(ReferenceImage)
-        .where(ReferenceImage.bbl == bbl)
+        .where(ReferenceImage.BBL == bbl)  # Note: BBL is uppercase in DB
         .where(ReferenceImage.compass_bearing.between(
             user_bearing - tolerance,
             user_bearing + tolerance
@@ -114,7 +114,7 @@ async def get_or_fetch_reference_image(
     cached_image = result.scalar_one_or_none()
 
     if cached_image:
-        logger.info(f"Cache hit for BBL {bbl} @ bearing {user_bearing}°")
+        logger.info(f"✅ Cache hit for BBL {bbl} @ bearing {user_bearing}°")
         return cached_image.image_url
 
     # Cache miss - fetch from Street View
@@ -141,14 +141,14 @@ async def get_or_fetch_reference_image(
 
         # Store in database
         ref_image = ReferenceImage(
-            bbl=bbl,
+            BBL=bbl,  # Note: BBL is uppercase in DB
             image_url=image_url,
             thumbnail_url=f"{settings.r2_public_url}/reference/{bbl}/{int(facade_bearing)}_thumb.jpg",
             source='street_view',
             compass_bearing=facade_bearing,
             capture_lat=lat,
             capture_lng=lng,
-            distance_from_building=0.0,  # Approximate
+            distance_from_building=0.0,
             quality_score=1.0,
             created_at=datetime.utcnow()
         )
@@ -156,7 +156,7 @@ async def get_or_fetch_reference_image(
         session.add(ref_image)
         await session.commit()
 
-        logger.info(f"Stored reference image for BBL {bbl}")
+        logger.info(f"✅ Stored reference image for BBL {bbl}")
         return image_url
 
     except Exception as e:
@@ -236,7 +236,7 @@ async def get_all_reference_images_for_building(
     """
     query = (
         select(ReferenceImage)
-        .where(ReferenceImage.bbl == bbl)
+        .where(ReferenceImage.BBL == bbl)  # Note: BBL is uppercase in DB
         .order_by(ReferenceImage.compass_bearing)
     )
 

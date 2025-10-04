@@ -64,7 +64,7 @@ class ReferenceImage(Base):
     __tablename__ = 'reference_images'
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    bbl = Column(String(10), ForeignKey('buildings.bbl'), index=True, nullable=False)
+    BBL = Column('BBL', String(10), index=True, nullable=False)  # Note: uppercase column name
 
     # Image storage
     image_url = Column(Text, nullable=False)
