@@ -135,8 +135,8 @@ async def scan_building(
         #     compass_bearing=compass_bearing,
         #     phone_pitch=phone_pitch,
         #     phone_roll=phone_roll,
-        #     candidate_bbls=[m['bbl'] for m in matches[:5]],
-        #     top_match_bbl=matches[0]['bbl'] if matches else None,
+        #     candidate_bins=[m['bin'] for m in matches[:5]],  # Now using BIN instead of BBL
+        #     top_match_bin=matches[0]['bin'] if matches else None,  # Now using BIN instead of BBL
         #     top_confidence=matches[0]['confidence'] if matches else 0,
         #     processing_time_ms=total_time_ms,
         #     num_candidates=len(candidates),
@@ -200,26 +200,27 @@ async def scan_building(
 @router.post("/scans/{scan_id}/confirm")
 async def confirm_building(
     scan_id: str,
-    confirmed_bbl: str = Form(..., description="BBL of confirmed building"),
+    confirmed_bin: str = Form(..., description="BIN of confirmed building"),
     confirmation_time_ms: int = Form(None, description="Time taken to confirm (ms)"),
     # db: AsyncSession = Depends(get_db)
 ):
     """
     User confirms which building they scanned
     Used for accuracy tracking and model improvement
+    Now uses BIN (Building Identification Number) instead of BBL
     """
     try:
-        logger.info(f"[{scan_id}] User confirmed BBL: {confirmed_bbl}")
+        logger.info(f"[{scan_id}] User confirmed BIN: {confirmed_bin}")
 
         # TODO: Update scan record
         # result = await db.execute(
         #     update(Scan)
         #     .where(Scan.id == scan_id)
         #     .values(
-        #         confirmed_bbl=confirmed_bbl,
+        #         confirmed_bin=confirmed_bin,  # Now using BIN instead of BBL
         #         confirmed_at=datetime.utcnow(),
         #         confirmation_time_ms=confirmation_time_ms,
-        #         was_correct=(Scan.top_match_bbl == confirmed_bbl)
+        #         was_correct=(Scan.top_match_bin == confirmed_bin)  # Now using BIN instead of BBL
         #     )
         # )
         # await db.commit()
@@ -227,7 +228,7 @@ async def confirm_building(
         return {
             'status': 'confirmed',
             'scan_id': scan_id,
-            'confirmed_bbl': confirmed_bbl
+            'confirmed_bin': confirmed_bin
         }
 
     except Exception as e:

@@ -24,12 +24,13 @@ async def scan_building(
     embedding_str = '[' + ','.join(map(str, user_embedding.tolist())) + ']'
     
     # 2. Radius query (100m)
+    # Note: If Phase 1 database has BIN column, add it to SELECT
     candidates = db.execute(text("""
-        SELECT id, bbl, des_addres, build_nme, 
+        SELECT id, bbl, des_addres, build_nme,
                ST_Y(center) as lat, ST_X(center) as lng
         FROM buildings
-        WHERE ST_DWithin(center::geography, 
-                        ST_MakePoint(:lng, :lat)::geography, 
+        WHERE ST_DWithin(center::geography,
+                        ST_MakePoint(:lng, :lat)::geography,
                         100)
         AND tier = 1
     """), {'lng': lng, 'lat': lat}).fetchall()

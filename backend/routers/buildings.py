@@ -20,20 +20,21 @@ async def get_db():
     pass
 
 
-@router.get("/buildings/{bbl}")
+@router.get("/buildings/{bin}")
 async def get_building_detail(
-    bbl: str,
+    bin: str,
     # db: AsyncSession = Depends(get_db)
 ):
     """
-    Get detailed information about a building by BBL
+    Get detailed information about a building by BIN (Building Identification Number)
 
     Returns building metadata, landmark status, architectural details
+    Now uses BIN instead of BBL as the primary identifier
     """
     try:
         # TODO: Query database
         # result = await db.execute(
-        #     select(Building).where(Building.bbl == bbl)
+        #     select(Building).where(Building.bin == bin)
         # )
         # building = result.scalar_one_or_none()
         #
@@ -42,7 +43,7 @@ async def get_building_detail(
 
         # Mock data for now
         return {
-            'bbl': bbl,
+            'bin': bin,
             'address': '1 Wall Street, New York, NY',
             'borough': 'Manhattan',
             'latitude': 40.7074,
@@ -68,25 +69,26 @@ async def get_building_detail(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Failed to get building {bbl}: {e}")
+        logger.error(f"Failed to get building {bin}: {e}")
         raise HTTPException(status_code=500, detail="Failed to get building details")
 
 
-@router.get("/buildings/{bbl}/images")
+@router.get("/buildings/{bin}/images")
 async def get_building_images(
-    bbl: str,
+    bin: str,
     # db: AsyncSession = Depends(get_db)
 ):
     """
-    Get all reference images for a building
+    Get all reference images for a building by BIN
+    Now uses BIN instead of BBL as the primary identifier
     """
     try:
         # TODO: Query database
-        # images = await reference_images.get_all_reference_images_for_building(db, bbl)
+        # images = await reference_images.get_all_reference_images_for_building(db, bin)
 
         # Mock data
         return {
-            'bbl': bbl,
+            'bin': bin,
             'images': [],
             'count': 0
         }
