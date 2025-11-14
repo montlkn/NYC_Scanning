@@ -1,255 +1,346 @@
-# NYC Scan - Point-and-Identify Building Recognition System
+# NYC Scan Backend
 
-AI-powered building identification system for NYC architecture using computer vision, geospatial filtering, and multi-sensor fusion.
+Point-and-scan building identification system using computer vision, GPS, and compass data.
 
-## 🏗️ Architecture
+## Architecture Overview
 
-**Backend**: FastAPI + PostgreSQL/PostGIS + OpenCLIP
-**Storage**: Cloudflare R2 (S3-compatible)
-**Database**: Supabase (PostgreSQL + PostGIS 3.3)
-**Vision**: OpenCLIP ViT-B-32 for image similarity
-**Mobile**: React Native + Expo (separate repo)
+### Tech Stack
+- **Framework**: FastAPI (async Python web framework)
+- **Database**: PostgreSQL + PostGIS (via Supabase)
+- **Caching**: Redis (Upstash)
+- **Storage**: Cloudflare R2 (S3-compatible)
+- **ML Model**: OpenCLIP (ViT-B-32 with LAION weights)
+- **Image Sources**: Google Street View Static API
 
-## 🎯 How It Works
+### Core Components
 
-1. **User points camera** at NYC building
-2. **Sensor fusion** combines GPS, barometer, compass, IMU → accurate 3D position
-3. **Cone-of-vision query** filters to buildings in view (PostGIS ST_Contains)
-4. **CLIP matching** compares user photo to cached Street View references
-5. **Top match** returned with confidence score
+1. **Geospatial Service** (`services/geospatial.py`)
+   - Cone-of-vision calculation using user's GPS + compass bearing
+   - PostGIS spatial queries for building filtering
+   - Distance and relevance scoring
 
-### Sensor Stack
-- **GPS** - Horizontal position (Kalman filtered)
-- **Barometer** - Altitude/floor detection (±1 floor accuracy)
-- **Magnetometer** - Compass bearing (0-360°)
-- **Accelerometer + Gyroscope** - Dead reckoning when GPS lost
-- **Kalman Filter** - Fuses all sensors for robust positioning
+2. **Reference Image Service** (`services/reference_images.py`)
+   - Fetch and cache Street View images
+   - Bearing-based image selection
+   - Parallel fetching for multiple candidates
 
-## 📁 Project Structure
+3. **CLIP Matcher** (`services/clip_matcher.py`)
+   - Image embedding generation
+   - Cosine similarity comparison
+   - Confidence scoring with landmark/proximity boosts
 
-```
-nyc_scan/
-├── backend/
-│   ├── main.py                    # FastAPI app entry
-│   ├── routers/                   # API endpoints
-│   │   ├── scan.py               # /scan endpoint (main flow)
-│   │   ├── buildings.py          # Building CRUD
-│   │   └── debug.py              # Development helpers
-│   ├── services/
-│   │   ├── geospatial.py         # PostGIS cone-of-vision
-│   │   ├── clip_matcher.py       # CLIP image comparison
-│   │   └── reference_images.py   # Street View fetching
-│   ├── models/
-│   │   ├── database.py           # SQLAlchemy models
-│   │   ├── session.py            # Async DB session
-│   │   └── config.py             # Settings (Pydantic)
-│   ├── utils/
-│   │   └── storage.py            # Cloudflare R2 uploads
-│   ├── scripts/
-│   │   ├── precache_buildings.py       # Cache Street View images
-│   │   └── reorganize_existing_r2.py   # Organize R2 storage
-│   └── requirements.txt
-└── README.md
-```
+4. **Storage Utilities** (`utils/storage.py`)
+   - Cloudflare R2 upload/download
+   - Thumbnail generation
+   - Public URL management
 
-## 🚀 Quick Start
+## Setup Instructions
 
-### Prerequisites
-- Python 3.11+
-- PostgreSQL with PostGIS extension
-- Google Maps API key (Street View Static API)
-- Cloudflare R2 account
-
-### 1. Install Dependencies
+### 1. Environment Setup
 
 ```bash
 cd backend
+
+# Create virtual environment
 python3 -m venv venv
-source venv/bin/activate
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Install dependencies
 pip install -r requirements.txt
 ```
 
-### 2. Configure Environment
+### 2. Environment Variables
 
-Create `backend/.env`:
-
-```bash
-# Database (Supabase)
-DATABASE_URL=postgresql://postgres.xxx:password@aws-0-us-east-1.pooler.supabase.com:5432/postgres
-
-# Google Maps
-GOOGLE_MAPS_API_KEY=AIzaSy...
-
-# Cloudflare R2
-R2_ACCOUNT_ID=xxx
-R2_ACCESS_KEY_ID=xxx
-R2_SECRET_ACCESS_KEY=xxx
-R2_BUCKET=building-images
-R2_PUBLIC_URL=https://pub-xxx.r2.dev
-
-# App
-ENV=development
-DEBUG=true
-CONFIDENCE_THRESHOLD=0.7
-```
-
-### 3. Run Backend
+Copy `.env.example` to `.env` and fill in your credentials:
 
 ```bash
-cd backend
-source venv/bin/activate
-python3 main.py
+cp .env.example .env
 ```
 
-API will be available at `http://localhost:8000`
+Required variables:
+- `SUPABASE_URL` - Your Supabase project URL
+- `SUPABASE_KEY` - Supabase anon key
+- `DATABASE_URL` - PostgreSQL connection string (from Supabase)
+- `GOOGLE_MAPS_API_KEY` - Google Maps API key with Street View Static API enabled
+- `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` - Cloudflare R2 credentials
+- `REDIS_URL` - Redis connection string (e.g., from Upstash)
 
-## 📊 Database Schema
+### 3. Database Setup
 
-**Buildings Table** (12,350 NYC buildings):
-- `id` (UUID) - Primary key
-- `des_addres` - Building address
-- `geom` (MULTIPOLYGON) - Building footprint
-- `style_prim` - Architectural style
-- `arch_build` - Architect name
-- `hist_dist` - Historic district
-
-## 🗄️ R2 Storage Structure
-
-```
-reference/
-└── buildings/
-    ├── 110-west-74th-street/
-    │   ├── 0deg.jpg
-    │   ├── 45deg.jpg
-    │   ├── ...
-    │   ├── 315deg.jpg
-    │   └── metadata.json
-    ├── 1-pierrepont-street/
-    └── ...
-
-scans/
-└── {scan_id}.jpg  # User photos (30-day expiration)
-```
-
-## 🔧 Key Scripts
-
-### Pre-cache Buildings
+The backend uses your existing Supabase `buildings` table. You'll need to add these new tables:
 
 ```bash
-python3 precache_buildings.py --limit 100 --delay 0.5
+# Run migrations (TODO: implement migration system)
+psql $DATABASE_URL < migrations/001_add_scan_tables.sql
 ```
 
-Fetches Street View images from 8 headings (0°, 45°, 90°, 135°, 180°, 225°, 270°, 315°) and uploads to R2.
+New tables needed:
+- `reference_images` - Cached Street View images
+- `scans` - User scan history
+- `scan_feedback` - User feedback
+- `cache_stats` - Cache performance metrics
 
-### Reorganize R2 Storage
+### 4. Enable PostGIS
+
+```sql
+CREATE EXTENSION IF NOT EXISTS postgis;
+```
+
+### 5. Download CLIP Model
+
+The CLIP model will auto-download on first run (~350MB). To pre-download:
+
+```python
+python -c "import open_clip; open_clip.create_model_and_transforms('ViT-B-32', pretrained='laion2b_s34b_b79k')"
+```
+
+## Running the Backend
+
+### Development Mode
 
 ```bash
-python3 reorganize_existing_r2.py --dry-run  # Preview changes
-python3 reorganize_existing_r2.py            # Apply changes
-python3 reorganize_existing_r2.py --delete-old  # Clean up old UUIDs
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Migrates from UUID-based paths to human-readable structure with metadata.
-
-## 🧪 Testing
+### Production Mode
 
 ```bash
-# Test geospatial queries
-python3 test_geospatial.py
-
-# Test Street View API
-python3 test_streetview.py
-
-# Test R2 storage
-python3 test_r2_storage.py
+uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
 ```
 
-## 📡 API Endpoints
+### Docker (Optional)
 
-### POST `/scan`
-
-Main building identification endpoint.
-
-**Request** (multipart/form-data):
-```json
-{
-  "photo": <file>,
-  "gps_lat": 40.7484,
-  "gps_lng": -73.9857,
-  "compass_bearing": 45.0,
-  "altitude": 10.5,
-  "floor": 3,
-  "confidence": 85,
-  "movement_type": "stationary"
-}
+```bash
+docker build -t nyc-scan-backend .
+docker run -p 8000:8000 --env-file .env nyc-scan-backend
 ```
 
-**Response**:
+## API Endpoints
+
+### Main Endpoints
+
+#### `POST /api/scan`
+Main scan endpoint - identifies building from photo + GPS + compass
+
+**Form Data:**
+- `photo` (file): Building photo
+- `gps_lat` (float): Latitude
+- `gps_lng` (float): Longitude
+- `compass_bearing` (float): Compass bearing (0-360°)
+- `phone_pitch` (float, optional): Phone pitch angle
+- `user_id` (string, optional): User ID for tracking
+
+**Response:**
 ```json
 {
   "scan_id": "uuid",
   "matches": [
     {
       "bbl": "1000010001",
-      "address": "Empire State Building",
-      "confidence": 0.92,
-      "distance_meters": 25.5
+      "address": "1 Wall Street",
+      "confidence": 0.87,
+      "thumbnail_url": "https://...",
+      "is_landmark": true
     }
   ],
-  "processing_time_ms": 450
+  "show_picker": false,
+  "processing_time_ms": 2450
 }
 ```
 
-## 🌍 Week 2 Progress (Completed)
+#### `POST /api/scans/{scan_id}/confirm`
+Confirm building identification
 
-- ✅ Database integration (Supabase PostgreSQL + PostGIS)
-- ✅ Geospatial cone-of-vision queries
-- ✅ Google Street View API integration
-- ✅ Cloudflare R2 storage setup
-- ✅ Pre-caching script (79 images cached)
-- ✅ **NEW**: Multi-sensor fusion (GPS + Barometer + IMU + Kalman filter)
-- ✅ **NEW**: R2 reorganization with readable paths + metadata
+**Form Data:**
+- `confirmed_bbl` (string): Confirmed building BBL
 
-## 📱 Mobile App Integration
+#### `GET /api/buildings/{bbl}`
+Get building details
 
-The mobile app uses full sensor fusion:
-
-```javascript
-import { PositionFusion, calculatePositionConfidence } from './utils/sensorFusion';
-
-const fusion = new PositionFusion();
-
-// GPS updates
-fusion.updateGPS(lat, lng, altitude, accuracy);
-
-// Barometer for floor detection
-const { floor } = fusion.updateBarometer(pressureHPa);
-
-// IMU for dead reckoning
-fusion.updateIMU(accelerometer, gyroscope);
-
-// Get position confidence (0-100)
-const confidence = calculatePositionConfidence({
-  hasGPS, gpsAccuracy, hasBarometer, hasIMU, timeSinceLastGPS
-});
+**Response:**
+```json
+{
+  "bbl": "1000010001",
+  "address": "1 Wall Street",
+  "year_built": 1930,
+  "architect": "Benjamin Wistar Morris",
+  "style_primary": "Art Deco",
+  "is_landmark": true,
+  ...
+}
 ```
 
-## 🚢 Next Steps (Week 3)
+### Debug Endpoints (Development Only)
 
-- [ ] Dockerize backend
-- [ ] Deploy to Fly.io
-- [ ] Connect mobile app to production API
-- [ ] End-to-end testing
-- [ ] Performance optimization
+- `GET /api/debug/test-geospatial` - Test cone-of-vision logic
+- `GET /api/debug/test-clip` - Test CLIP model loading
+- `GET /api/debug/test-bearing` - Test bearing calculations
+- `POST /api/debug/test-image-comparison` - Compare two images
+- `GET /api/debug/test-street-view` - Test Street View API
 
-## 📝 License
+## Data Ingestion
 
-MIT
+### Load Building Data
 
-## 🤝 Contributing
+```bash
+# TODO: Implement data ingestion scripts
+python scripts/ingest_pluto.py
+python scripts/enrich_landmarks.py
+```
 
-This is a learning project. Feel free to fork and experiment!
+### Pre-cache Reference Images
+
+Pre-cache Street View images for top landmarks:
+
+```bash
+python scripts/precache_landmarks.py --top-n 5000
+```
+
+**Cost estimation**: ~$140 for 5,000 buildings × 4 directions @ $0.007/image
+
+## Configuration
+
+Key settings in `models/config.py`:
+
+```python
+max_scan_distance_meters = 100  # Max distance for candidates
+cone_angle_degrees = 60         # View cone width
+confidence_threshold = 0.70     # Auto-select threshold
+landmark_boost_factor = 1.05    # Boost for landmarks
+proximity_boost_factor = 1.10   # Boost for nearby buildings
+```
+
+## Performance Targets
+
+- **Total scan time**: < 3 seconds
+- **Geospatial query**: < 200ms
+- **Reference image fetch**: < 800ms (5 candidates in parallel)
+- **CLIP comparison**: < 1500ms (5 candidates)
+
+## Monitoring & Analytics
+
+### Scan Metrics
+
+Track in `scans` table:
+- Processing times (geospatial, fetch, CLIP)
+- Candidate counts
+- Confidence scores
+- User confirmations
+- Match accuracy
+
+### Cache Metrics
+
+Track in `cache_stats` table:
+- Cache hit rate
+- Daily fetch counts
+- Cost tracking
+- Average fetch times
+
+## Deployment
+
+### Railway.app
+
+```bash
+railway login
+railway init
+railway up
+```
+
+### Fly.io
+
+```bash
+fly launch
+fly deploy
+```
+
+### Environment Variables
+
+Set in your deployment platform:
+```bash
+railway variables set SUPABASE_URL=...
+railway variables set GOOGLE_MAPS_API_KEY=...
+# etc.
+```
+
+## Troubleshooting
+
+### CLIP Model Not Loading
+- Check CUDA availability: `python -c "import torch; print(torch.cuda.is_available())"`
+- If no GPU, set `CLIP_DEVICE=cpu` in `.env`
+
+### Street View Images Not Fetching
+- Verify Google Maps API key has Street View Static API enabled
+- Check API quotas and billing
+- Test with `/api/debug/test-street-view`
+
+### Database Connection Issues
+- Verify `DATABASE_URL` format
+- Check Supabase connection pooler settings
+- Enable PostGIS extension
+
+### Geospatial Queries Slow
+- Ensure spatial indexes are created: `CREATE INDEX ON buildings USING GIST(geom)`
+- Check `EXPLAIN ANALYZE` on queries
+- Consider reducing `max_scan_distance` or `cone_angle`
+
+## Cost Estimates
+
+### Development (per month)
+- Database: Free (Supabase free tier)
+- Storage: Free (R2 10GB free)
+- Redis: Free (Upstash 10K commands/day)
+- Street View: Variable (~$50-100 for testing)
+
+### Production (per month)
+- Database: $25 (Supabase Pro)
+- Storage: $5 (R2 beyond free tier)
+- Redis: $10 (Upstash paid tier)
+- Backend hosting: $5-20 (Railway/Fly.io)
+- Street View: ~$0.02 per scan (on cache miss)
+
+### One-time Costs
+- Pre-cache 5K buildings: ~$140
+
+## Future Improvements
+
+1. **Mapillary Integration**: Reduce Street View costs by using free Mapillary images
+2. **Image Embeddings**: Pre-compute and store CLIP embeddings for faster matching
+3. **Model Fine-tuning**: Fine-tune CLIP on architectural images
+4. **Multi-scale Search**: Combine multiple distance ranges
+5. **Temporal Caching**: Update reference images seasonally
+6. **User Uploads**: Allow users to contribute reference images
+7. **LLM Descriptions**: Auto-generate building descriptions with Perplexity API
+
+## Roadmap
+
+**Q4 2024:**
+- ✅ Implement Phase 1 fast scanning
+- ✅ Dual-database architecture
+- ✅ Comprehensive documentation
+- 🚧 Import new final dataset
+- 🚧 Mobile app beta testing
+
+**Q1 2025:**
+- Expand to 5,000 tier 1 buildings
+- User authentication
+- iOS/Android app release
+- Model fine-tuning on NYC data
+
+**Q2 2025:**
+- Tier 2 buildings (50k total)
+- AR overlays
+- Historical photo matching
+- Community contributions
+
+**Q3 2025:**
+- Edge deployment (Cloudflare Workers)
+- 3D building models integration
+- Guided architecture tours
+- API for third-party developers
 
 ---
 
-**Built with ❤️ for NYC architecture enthusiasts**
+## Contributing
+
+This is part of the NYC Architecture App project. See main README for contribution guidelines.
+

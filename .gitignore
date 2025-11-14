@@ -36,6 +36,9 @@ backend/data/*.csv
 backend/data/*.json
 backend/data/*.geojson
 !backend/data/.gitkeep
+# Data files (CSVs too large for git)
+backend/data/final/full_dataset.csv
+backend/data/final/full_dataset.geojson
 
 # Model files (too large for git)
 *.pt
