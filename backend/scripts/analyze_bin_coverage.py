@@ -38,6 +38,9 @@ def analyze_bin_coverage(csv_path: str):
     sample_with_bin = []
     sample_without_bin = []
 
+    # Full list of buildings without BIN
+    buildings_without_bin = []
+
     # Track which column is BIN
     bin_column = None
     bbl_column = None
@@ -111,6 +114,14 @@ def analyze_bin_coverage(csv_path: str):
                 else:
                     rows_without_bin += 1
 
+                    # Track all buildings without BIN
+                    buildings_without_bin.append({
+                        'BBL': bbl_value,
+                        'BIN': bin_value,
+                        'Address': row.get('address', row.get('Address', ''))[:70],
+                        'Borough': row.get('borough', row.get('Borough', '')),
+                    })
+
                     # Sample
                     if len(sample_without_bin) < 5:
                         sample_without_bin.append({
@@ -148,7 +159,8 @@ def analyze_bin_coverage(csv_path: str):
             print("🏢 BBLs with Multiple Buildings:")
             print("-" * 80)
             for bbl, bins in list(multi_building_lots.items())[:10]:
-                print(f"  BBL {bbl}: {len(bins)} buildings (BINs: {', '.join(set(bins)[:5])})")
+                unique_bins = list(set(bins))[:5]  # Convert to list first
+                print(f"  BBL {bbl}: {len(bins)} buildings (BINs: {', '.join(unique_bins)})")
             if len(multi_building_lots) > 10:
                 print(f"  ... and {len(multi_building_lots) - 10} more")
             print()
@@ -172,6 +184,16 @@ def analyze_bin_coverage(csv_path: str):
         print("-" * 80)
         for sample in sample_without_bin:
             print(f"  BBL: {sample['BBL']:<12} BIN: {sample['BIN']:<10} {sample['Address']}")
+
+        # Full list of buildings without BIN
+        if buildings_without_bin:
+            print()
+            print("=" * 80)
+            print(f"📋 COMPLETE LIST OF {len(buildings_without_bin)} BUILDINGS WITHOUT BIN")
+            print("=" * 80)
+            for i, building in enumerate(buildings_without_bin, 1):
+                print(f"{i:3d}. BBL: {building['BBL']:<12} Borough: {building['Borough']:<15} Address: {building['Address']}")
+            print()
 
         print()
         print("=" * 80)
