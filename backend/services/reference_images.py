@@ -78,7 +78,7 @@ async def fetch_street_view(
 
 async def get_or_fetch_reference_image(
     session: AsyncSession,
-    bbl: str,
+    bin: str,
     lat: float,
     lng: float,
     user_bearing: float
@@ -88,7 +88,7 @@ async def get_or_fetch_reference_image(
 
     Args:
         session: Database session
-        bbl: Building BBL
+        bin: Building Identification Number (now primary key)
         lat: Building latitude
         lng: Building longitude
         user_bearing: User's compass bearing
@@ -101,7 +101,7 @@ async def get_or_fetch_reference_image(
 
     query = (
         select(ReferenceImage)
-        .where(ReferenceImage.BBL == bbl)  # Note: BBL is uppercase in DB
+        .where(ReferenceImage.bin == bin)  # Use BIN (primary key) instead of BBL
         .where(ReferenceImage.compass_bearing.between(
             user_bearing - tolerance,
             user_bearing + tolerance
@@ -114,11 +114,11 @@ async def get_or_fetch_reference_image(
     cached_image = result.scalar_one_or_none()
 
     if cached_image:
-        logger.info(f"✅ Cache hit for BBL {bbl} @ bearing {user_bearing}°")
+        logger.info(f"✅ Cache hit for BIN {bin} @ bearing {user_bearing}°")
         return cached_image.image_url
 
     # Cache miss - fetch from Street View
-    logger.info(f"Cache miss for BBL {bbl} @ bearing {user_bearing}° - fetching...")
+    logger.info(f"Cache miss for BIN {bin} @ bearing {user_bearing}° - fetching...")
 
     # Calculate facade bearing (opposite of user bearing for best view)
     facade_bearing = (user_bearing + 180) % 360
@@ -127,11 +127,11 @@ async def get_or_fetch_reference_image(
     image_bytes = await fetch_street_view(lat, lng, facade_bearing)
 
     if not image_bytes:
-        logger.warning(f"Failed to fetch Street View for BBL {bbl}")
+        logger.warning(f"Failed to fetch Street View for BIN {bin}")
         return None
 
-    # Upload to R2
-    key = f"reference/{bbl}/{int(facade_bearing)}.jpg"
+    # Upload to R2 - now using BIN instead of BBL for path
+    key = f"reference/{bin}/{int(facade_bearing)}.jpg"
     try:
         image_url = await upload_image(
             image_bytes,
@@ -141,9 +141,9 @@ async def get_or_fetch_reference_image(
 
         # Store in database
         ref_image = ReferenceImage(
-            BBL=bbl,  # Note: BBL is uppercase in DB
+            bin=bin,  # Use BIN (primary key) instead of BBL
             image_url=image_url,
-            thumbnail_url=f"{settings.r2_public_url}/reference/{bbl}/{int(facade_bearing)}_thumb.jpg",
+            thumbnail_url=f"{settings.r2_public_url}/reference/{bin}/{int(facade_bearing)}_thumb.jpg",
             source='street_view',
             compass_bearing=facade_bearing,
             capture_lat=lat,
@@ -156,7 +156,7 @@ async def get_or_fetch_reference_image(
         session.add(ref_image)
         await session.commit()
 
-        logger.info(f"✅ Stored reference image for BBL {bbl}")
+        logger.info(f"✅ Stored reference image for BIN {bin}")
         return image_url
 
     except Exception as e:
@@ -174,11 +174,11 @@ async def get_reference_images_for_candidates(
 
     Args:
         session: Database session
-        candidates: List of candidate building dicts
+        candidates: List of candidate building dicts (with 'bin' field)
         user_bearing: User's compass bearing
 
     Returns:
-        Dictionary mapping BBL to image URL
+        Dictionary mapping BIN to image URL
     """
     logger.info(f"📥 Fetching reference images for {len(candidates)} candidates @ bearing {user_bearing}°")
 
@@ -187,28 +187,28 @@ async def get_reference_images_for_candidates(
     for candidate in candidates:
         task = get_or_fetch_reference_image(
             session,
-            candidate['bbl'],
+            candidate['bin'],  # Use BIN (primary key) instead of BBL
             candidate['latitude'],
             candidate['longitude'],
             user_bearing
         )
-        tasks.append((candidate['bbl'], task))
+        tasks.append((candidate['bin'], task))
 
     # Execute in parallel with semaphore to limit concurrency
     semaphore = asyncio.Semaphore(5)  # Max 5 concurrent fetches
 
-    async def fetch_with_limit(bbl: str, task):
+    async def fetch_with_limit(bin: str, task):
         try:
             async with semaphore:
                 result = await task
-                logger.debug(f"✅ Fetched for BBL {bbl}: {result is not None}")
-                return bbl, result
+                logger.debug(f"✅ Fetched for BIN {bin}: {result is not None}")
+                return bin, result
         except Exception as e:
-            logger.error(f"❌ Error fetching BBL {bbl}: {type(e).__name__}: {e}", exc_info=True)
-            return bbl, None
+            logger.error(f"❌ Error fetching BIN {bin}: {type(e).__name__}: {e}", exc_info=True)
+            return bin, None
 
     results = await asyncio.gather(*[
-        fetch_with_limit(bbl, task) for bbl, task in tasks
+        fetch_with_limit(bin, task) for bin, task in tasks
     ], return_exceptions=True)
 
     # Build result dict
@@ -218,12 +218,12 @@ async def get_reference_images_for_candidates(
             logger.error(f"❌ Exception in gather: {type(result).__name__}: {result}")
             continue
 
-        bbl, url = result
+        bin, url = result
         if url:
-            reference_images[bbl] = url
-            logger.info(f"✅ Added reference image for BBL {bbl}")
+            reference_images[bin] = url
+            logger.info(f"✅ Added reference image for BIN {bin}")
         else:
-            logger.warning(f"⚠️ No reference image available for BBL {bbl}")
+            logger.warning(f"⚠️ No reference image available for BIN {bin}")
 
     logger.info(f"✅ Successfully fetched {len(reference_images)}/{len(candidates)} reference images")
     return reference_images
@@ -231,21 +231,21 @@ async def get_reference_images_for_candidates(
 
 async def get_all_reference_images_for_building(
     session: AsyncSession,
-    bbl: str
+    bin: str
 ) -> List[Dict]:
     """
     Get all cached reference images for a building
 
     Args:
         session: Database session
-        bbl: Building BBL
+        bin: Building Identification Number (primary key)
 
     Returns:
         List of reference image dicts
     """
     query = (
         select(ReferenceImage)
-        .where(ReferenceImage.BBL == bbl)  # Note: BBL is uppercase in DB
+        .where(ReferenceImage.bin == bin)  # Use BIN (primary key) instead of BBL
         .order_by(ReferenceImage.compass_bearing)
     )
 

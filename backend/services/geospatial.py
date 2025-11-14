@@ -119,6 +119,7 @@ async def get_candidate_buildings(
     logger.info(f"Searching for buildings at ({lat}, {lng}), bearing {bearing}°, pitch {pitch}°")
 
     # Build spatial query
+    # Filter out public spaces (bin == 'N/A') as they can't be scanned
     query = (
         select(Building)
         .where(
@@ -128,6 +129,7 @@ async def get_candidate_buildings(
             )
         )
         .where(Building.scan_enabled == True)
+        .where(Building.bin != 'N/A')  # Exclude public spaces
     )
 
     # Priority boosting based on pitch
@@ -166,7 +168,7 @@ async def get_candidate_buildings(
                 ST_GeomFromText(user_point_wkt, 4326).cast(Geography),
                 Building.geom.cast(Geography)
             )
-        ).where(Building.bbl == building.bbl)
+        ).where(Building.bin == building.bin)
 
         distance_result = await session.execute(dist_query)
         distance = distance_result.scalar()
@@ -181,8 +183,8 @@ async def get_candidate_buildings(
         bearing_diff = abs(((building_bearing - bearing + 180) % 360) - 180)
 
         candidates.append({
-            'bbl': building.bbl,
-            'bin': building.bin,
+            'bin': building.bin,  # Primary identifier - BIN is now primary key
+            'bbl': building.bbl,  # Secondary - can have multiple buildings per lot
             'address': building.address,
             'borough': building.borough,
             'latitude': building.latitude,
@@ -288,6 +290,7 @@ async def get_buildings_in_radius(
             ) <= radius_meters
         )
         .where(Building.scan_enabled == True)
+        .where(Building.bin != 'N/A')  # Exclude public spaces
         .order_by('distance')
         .limit(settings.max_candidates)
     )
@@ -298,7 +301,8 @@ async def get_buildings_in_radius(
     candidates = []
     for building, distance in rows:
         candidates.append({
-            'bbl': building.bbl,
+            'bin': building.bin,  # Primary identifier - BIN is now primary key
+            'bbl': building.bbl,  # Secondary - can have multiple buildings per lot
             'address': building.address,
             'latitude': building.latitude,
             'longitude': building.longitude,
