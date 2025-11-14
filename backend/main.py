@@ -16,8 +16,7 @@ from sentry_sdk.integrations.fastapi import FastApiIntegration
 
 from models.config import get_settings
 from models.session import init_db, close_db
-from routers import scan, buildings, debug
-from services.clip_matcher import init_clip_model
+from routers import scan, buildings, debug, scan_phase1
 
 # Configure logging
 logging.basicConfig(
@@ -142,6 +141,7 @@ async def health_check():
 # Include routers
 app.include_router(scan.router, prefix="/api", tags=["scan"])
 app.include_router(buildings.router, prefix="/api", tags=["buildings"])
+app.include_router(scan_phase1.router, prefix="/api/phase1", tags=["phase1"])
 
 # Debug endpoints (only in development)
 if settings.debug:

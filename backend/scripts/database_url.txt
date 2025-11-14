@@ -1,0 +1,1 @@
+export SCAN_DB_URL="postgresql://postgres:toChiw-cufta9-bekxew@db.cglsuoymdcchrxyzofjb.supabase.co:5432/postgres"
