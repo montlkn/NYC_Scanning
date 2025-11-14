@@ -18,12 +18,14 @@ Base = declarative_base()
 class Building(Base):
     """
     Main buildings table - uses buildings_full_merge_scanning (860k NYC buildings + landmark data)
+    Now uses BIN (Building Identification Number) as primary key instead of BBL.
+    This allows proper handling of multiple buildings on the same lot (BBL).
     """
     __tablename__ = 'buildings_full_merge_scanning'
 
     # Primary identifiers
-    bbl = Column(String(10), primary_key=True)
-    bin = Column(String(7), index=True)
+    bin = Column(String(10), primary_key=True)  # BIN is primary - uniquely identifies buildings
+    bbl = Column(String(10), index=True, nullable=True)  # Secondary - can have multiple buildings per BBL
     address = Column(Text, nullable=False)
     borough = Column(String(20))
 
@@ -60,11 +62,12 @@ class ReferenceImage(Base):
     """
     Stores reference images (Street View, Mapillary, user-uploaded)
     for building facade matching
+    Now uses BIN (Building Identification Number) as foreign key instead of BBL
     """
     __tablename__ = 'reference_images'
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    BBL = Column('BBL', String(10), index=True, nullable=False)  # Note: uppercase column name
+    bin = Column(String(10), ForeignKey('buildings_full_merge_scanning.bin'), index=True, nullable=False)
 
     # Image storage
     image_url = Column(Text, nullable=False)
@@ -115,14 +118,14 @@ class Scan(Base):
     phone_pitch = Column(Float, default=0)  # -90 to 90 degrees
     phone_roll = Column(Float, default=0)
 
-    # Matching results
-    candidate_bbls = Column(ARRAY(Text))  # All candidates considered
-    candidate_scores = Column(JSON)  # Map of bbl -> confidence
-    top_match_bbl = Column(String(10))
+    # Matching results - now using BIN instead of BBL
+    candidate_bins = Column(ARRAY(Text))  # All candidates considered (BINs instead of BBLs)
+    candidate_scores = Column(JSON)  # Map of bin -> confidence
+    top_match_bin = Column(String(10))
     top_confidence = Column(Float)
 
     # User confirmation
-    confirmed_bbl = Column(String(10), ForeignKey('buildings.bbl'), index=True)
+    confirmed_bin = Column(String(10), ForeignKey('buildings_full_merge_scanning.bin'), index=True)
     was_correct = Column(Boolean)  # Did top match equal confirmed?
     confirmation_time_ms = Column(Integer)  # Time to confirm
 

@@ -1,0 +1,136 @@
+====================================================================================================
+BIN DATA QUALITY REPORT
+====================================================================================================
+
+📊 SUMMARY
+────────────────────────────────────────────────────────────────────────────────────────────────────
+Total buildings:                    37,237
+Buildings with missing BINs:        32 (0.09%)
+Buildings with placeholder BINs:    41 (0.11%)
+Buildings with duplicate BINs:      80
+Public spaces without real BINs:    16
+
+📋 PLACEHOLDER BINs (Need Research or Mark as N/A)
+────────────────────────────────────────────────────────────────────────────────────────────────────
+Total with placeholders: 41
+
+
+BIN 1000000.0: 18 buildings (6 public spaces)
+  Examples:
+    - 45 West 53rd Street                                @ 45 West 53rd Street            
+    - 1 Dekalb Avenue                                    @ 1 Dekalb Avenue                
+    - 26 Central Avenue                                  @ 26 Central Avenue              
+    ... and 15 more
+
+BIN 2000000.0: 7 buildings (2 public spaces)
+  Examples:
+    - 0                                                  @ Pelham Bay Park                🌳 PUBLIC SPACE
+    - Hall of Fame, New York University                  @ Hall of Fame Terrace at Sedgwi 
+    - 0                                                  @ 443 West 250th Street          
+    ... and 4 more
+
+BIN 3000000.0: 8 buildings (3 public spaces)
+  Examples:
+    - 0                                                  @ 200 Eastern Parkway at Washing 🌳 PUBLIC SPACE
+    - 0                                                  @ 676 Fulton Street              
+    - 0                                                  @ Park Drive (east of 7th Avenue 🌳 PUBLIC SPACE
+    ... and 5 more
+
+BIN 4000000.0: 4 buildings (1 public spaces)
+  Examples:
+    - Unisphere                                          @ Flushing Meadows-Corona Park   🌳 PUBLIC SPACE
+    - Pepsi-Cola Sign                                    @ 4-09 47th Road                 
+    - 0                                                  @ South side of 53rd Avenue step 
+    ... and 1 more
+
+BIN 5000000.0: 4 buildings (0 public spaces)
+  Examples:
+    - Battery Weed                                       @ Fort Wadsworth Reservation     
+    - 0                                                  @ Extending along Richmond Terra 
+    - Men's Dormitory (Dormitory 1 & 2)                  @ New York City Farm Colony      
+    ... and 1 more
+
+❌ MISSING BINs (Need Research or Mark as N/A)
+────────────────────────────────────────────────────────────────────────────────────────────────────
+Total missing: 32
+
+Public spaces without BIN: 4
+
+Examples of buildings needing BIN research:
+  - BBL 1000020001.0: Whitehall Ferry Terminal                           
+  - BBL 3001400111.0: 1 Boerum Place                                     
+  - BBL 3002470016.0: 21 India Street                                    
+  - BBL 3023220028.0: 34 North 7th Street                                
+  - BBL 1007120042.0: 111 North 12th Street                              
+  - BBL 3129800001.0: 29-59 Northern Boulevard                           
+  - BBL 5079660001.0: Pier 55                                            🌳 PUBLIC SPACE
+  - BBL 3018640014.0: 130 Felix Street                                   
+  - BBL 3019180065.0: Flushing Meadows Corona Park                       🌳 PUBLIC SPACE
+  - BBL 1006190033.0: Gansevoort & Washington Streets                    
+  ... and 22 more
+
+✔️  LEGITIMATE DUPLICATE BINs (Different Buildings, Same BIN)
+────────────────────────────────────────────────────────────────────────────────────────────────────
+
+Borough 1: 64 BINs with duplicates
+  - BIN 1086331.0: 3 buildings
+      • Governors Island
+      • Fort Jay; (later) Fort Columbus
+  - BIN 1032119.0: 3 buildings
+      • Center Boulevard
+      • 45-45 Center Boulevard
+  - BIN 1084144.0: 2 buildings
+      • Dunbar Apartments
+      • Dunbar Apartments
+
+Borough 2: 1 BINs with duplicates
+  - BIN 2124072.0: 2 buildings
+      • Orchard Beach Bathhouse
+      • 0
+
+Borough 3: 4 BINs with duplicates
+  - BIN 3329927.0: 2 buildings
+      • Havemeyers & Elder Filter, Pan and Finishing House
+      • Hecla Iron Works
+  - BIN 3114622.0: 2 buildings
+      • Chester Court Wall
+      • 0
+  - BIN 3031287.0: 2 buildings
+      • 0
+      • 0
+
+Borough 4: 6 BINs with duplicates
+  - BIN 4471087.0: 2 buildings
+      • 0
+      • 0
+  - BIN 4471008.0: 2 buildings
+      • 0
+      • 0
+  - BIN 4471034.0: 2 buildings
+      • 0
+      • 0
+
+====================================================================================================
+RECOMMENDATIONS
+====================================================================================================
+
+1. PUBLIC SPACES (Parks, Piers, etc.):
+   - Mark placeholder BINs for public spaces as 'N/A'
+   - These cannot have Building Identification Numbers (by definition)
+   - Total affected: ~4 buildings
+
+2. BUILDING STRUCTURES WITH MISSING/PLACEHOLDER BINs:
+   - Research using NYC DOB BIS API
+   - Cross-reference PLUTO data
+   - Manual lookup for iconic buildings
+   - Target: Replace at least 80% of non-public-space missing BINs
+
+3. LEGITIMATE DUPLICATE BINs:
+   - 75 buildings with legitimate duplicates (different buildings, same BIN)
+   - This is valid for complex lots with multiple structures
+   - Use composite key (BIN, BBL) for uniqueness if needed
+
+4. DATA QUALITY:
+   - After fixes, implement BIN validation in ingestion pipeline
+   - Add BIN as NOT NULL (except for public spaces marked 'N/A')
+   - Create unique constraint on BIN for scannable buildings
