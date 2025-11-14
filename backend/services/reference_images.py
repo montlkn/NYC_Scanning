@@ -19,6 +19,34 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
+def get_cache_key(building_id: int, bin: Optional[str], bbl: str, bearing: float) -> str:
+    """
+    Generate cache key for reference image
+
+    Strategy:
+    - Prefer BIN if available (99.91% of buildings)
+    - Fallback to building ID for buildings without BIN
+    - Legacy BBL path still checked for backward compatibility
+
+    Args:
+        building_id: Building database ID
+        bin: Building BIN (may be None)
+        bbl: Building BBL (legacy)
+        bearing: Compass bearing
+
+    Returns:
+        Cache key path (e.g., "reference/BIN-1088469/180.jpg" or "reference/ID-12345/180.jpg")
+    """
+    bearing_int = int(bearing)
+
+    if bin:
+        # Preferred: Use BIN
+        return f"reference/BIN-{bin}/{bearing_int}.jpg"
+    else:
+        # Fallback: Use building ID
+        return f"reference/ID-{building_id}/{bearing_int}.jpg"
+
+
 async def fetch_street_view(
     lat: float,
     lng: float,

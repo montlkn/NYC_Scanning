@@ -18,12 +18,19 @@ Base = declarative_base()
 class Building(Base):
     """
     Main buildings table - uses buildings_full_merge_scanning (860k NYC buildings + landmark data)
+
+    Note: After migration, uses auto-incrementing ID as primary key.
+    BIN is unique identifier for 99.91% of buildings.
+    BBL is NOT unique - multiple buildings can share same BBL (e.g., WTC complex).
     """
     __tablename__ = 'buildings_full_merge_scanning'
 
-    # Primary identifiers
-    bbl = Column(String(10), primary_key=True)
-    bin = Column(String(7), index=True)
+    # Primary key (after migration)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    # Building identifiers
+    bbl = Column(String(10), index=True, nullable=False)  # NOT unique
+    bin = Column(String(7), index=True, nullable=True)  # Unique where not null
     address = Column(Text, nullable=False)
     borough = Column(String(20))
 
@@ -60,11 +67,18 @@ class ReferenceImage(Base):
     """
     Stores reference images (Street View, Mapillary, user-uploaded)
     for building facade matching
+
+    Note: After migration, uses building_id as foreign key to buildings table.
+    BBL and BIN columns kept for backward compatibility and fast lookups.
     """
     __tablename__ = 'reference_images'
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    BBL = Column('BBL', String(10), index=True, nullable=False)  # Note: uppercase column name
+
+    # Building references (after migration)
+    building_id = Column(Integer, ForeignKey('buildings_full_merge_scanning.id'), index=True, nullable=True)
+    bin = Column(String(7), index=True, nullable=True)  # Denormalized for fast lookups
+    BBL = Column('BBL', String(10), index=True, nullable=False)  # Legacy column (uppercase)
 
     # Image storage
     image_url = Column(Text, nullable=False)
@@ -115,14 +129,17 @@ class Scan(Base):
     phone_pitch = Column(Float, default=0)  # -90 to 90 degrees
     phone_roll = Column(Float, default=0)
 
-    # Matching results
-    candidate_bbls = Column(ARRAY(Text))  # All candidates considered
-    candidate_scores = Column(JSON)  # Map of bbl -> confidence
-    top_match_bbl = Column(String(10))
+    # Matching results (after migration)
+    candidate_ids = Column(ARRAY(Integer))  # All candidate building IDs considered
+    candidate_bbls = Column(ARRAY(Text))  # Legacy: BBLs (for backward compat)
+    candidate_scores = Column(JSON)  # Map of building_id -> confidence
+    top_match_id = Column(Integer, ForeignKey('buildings_full_merge_scanning.id'), index=True)
+    top_match_bbl = Column(String(10))  # Legacy
     top_confidence = Column(Float)
 
     # User confirmation
-    confirmed_bbl = Column(String(10), ForeignKey('buildings.bbl'), index=True)
+    confirmed_id = Column(Integer, ForeignKey('buildings_full_merge_scanning.id'), index=True)
+    confirmed_bbl = Column(String(10))  # Legacy
     was_correct = Column(Boolean)  # Did top match equal confirmed?
     confirmation_time_ms = Column(Integer)  # Time to confirm
 
