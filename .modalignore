@@ -1,0 +1,24 @@
+# Ignore large directories and unnecessary files for Modal deployment
+backend/venv/
+backend/data/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/*.pyc
+backend/**/*.pyc
+backend/.env
+backend/.DS_Store
+backend/**/.DS_Store
+backend/*.jpg
+backend/*.jpeg
+backend/*.png
+backend/tests/
+backend/scripts/
+
+# General ignores
+.git/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+node_modules/

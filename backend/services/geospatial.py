@@ -1,14 +1,12 @@
 """
 Geospatial service for building candidate filtering
-Implements cone-of-vision logic using PostGIS
+Implements cone-of-vision logic using lat/lng bounding box calculations
 """
 
 import math
 from typing import List, Dict, Any, Optional
-from sqlalchemy import select, func, text
+from sqlalchemy import select, func, text, cast, Float
 from sqlalchemy.ext.asyncio import AsyncSession
-from geoalchemy2.functions import ST_GeomFromText, ST_Intersects, ST_Distance
-from geoalchemy2 import Geography
 import logging
 
 from models.database import Building
@@ -82,6 +80,43 @@ def create_view_cone_wkt(
     return f"POLYGON(({', '.join(points)}))"
 
 
+def calculate_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """
+    Calculate distance in meters between two points using Haversine formula
+    """
+    R = 6371000  # Earth radius in meters
+
+    lat1_rad = math.radians(lat1)
+    lat2_rad = math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlng = math.radians(lng2 - lng1)
+
+    a = (math.sin(dlat / 2) ** 2 +
+         math.cos(lat1_rad) * math.cos(lat2_rad) *
+         math.sin(dlng / 2) ** 2)
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+    return R * c
+
+
+def is_point_in_cone(
+    user_lat: float, user_lng: float,
+    point_lat: float, point_lng: float,
+    bearing: float, cone_angle: float, max_distance: float
+) -> bool:
+    """
+    Check if a point is within the user's view cone
+    """
+    distance = calculate_distance(user_lat, user_lng, point_lat, point_lng)
+    if distance > max_distance:
+        return False
+
+    point_bearing = calculate_bearing(user_lat, user_lng, point_lat, point_lng)
+    bearing_diff = abs(((point_bearing - bearing + 180) % 360) - 180)
+
+    return bearing_diff <= (cone_angle / 2)
+
+
 async def get_candidate_buildings(
     session: AsyncSession,
     lat: float,
@@ -111,95 +146,86 @@ async def get_candidate_buildings(
     if max_candidates is None:
         max_candidates = settings.max_candidates
 
-    # Generate view cone WKT
-    cone_wkt = create_view_cone_wkt(
-        lat, lng, bearing, max_distance, settings.cone_angle_degrees
-    )
-
     logger.info(f"Searching for buildings at ({lat}, {lng}), bearing {bearing}°, pitch {pitch}°")
 
-    # Build spatial query
-    # Filter out public spaces (bin == 'N/A') as they can't be scanned
+    # Calculate bounding box for initial filter (square around user)
+    # Approximate: 1 degree latitude ≈ 111km, 1 degree longitude ≈ 111km * cos(lat)
+    lat_delta = (max_distance / 111000) * 1.5  # Add 50% buffer
+    lng_delta = (max_distance / (111000 * math.cos(math.radians(lat)))) * 1.5
+
+    min_lat = lat - lat_delta
+    max_lat = lat + lat_delta
+    min_lng = lng - lng_delta
+    max_lng = lng + lng_delta
+
+    # Build query with bounding box filter
+    # Cast text columns to float for comparison
     query = (
         select(Building)
-        .where(
-            ST_Intersects(
-                Building.geom,
-                ST_GeomFromText(cone_wkt, 4326)
-            )
-        )
-        .where(Building.scan_enabled == True)
-        .where(Building.bin != 'N/A')  # Exclude public spaces
+        .where(cast(Building.latitude, Float) >= min_lat)
+        .where(cast(Building.latitude, Float) <= max_lat)
+        .where(cast(Building.longitude, Float) >= min_lng)
+        .where(cast(Building.longitude, Float) <= max_lng)
+        .where(Building.latitude != None)
+        .where(Building.longitude != None)
+        .where(Building.latitude != '')
+        .where(Building.longitude != '')
     )
-
-    # Priority boosting based on pitch
-    if pitch > 15:
-        # Looking up - prioritize tall buildings
-        logger.info("Looking up - prioritizing tall buildings")
-        query = query.order_by(Building.num_floors.desc().nulls_last())
-    elif pitch < -15:
-        # Looking down - prioritize nearby/shorter buildings
-        logger.info("Looking down - prioritizing nearby buildings")
-        pass
-
-    # Always prioritize landmarks
-    query = query.order_by(
-        Building.is_landmark.desc(),
-        Building.walk_score.desc().nulls_last()
-    )
-
-    # Limit results
-    query = query.limit(max_candidates)
 
     # Execute query
     result = await session.execute(query)
     buildings = result.scalars().all()
 
-    logger.info(f"Found {len(buildings)} candidate buildings")
+    logger.info(f"Found {len(buildings)} buildings in bounding box")
 
-    # Calculate distances and prepare output
+    # Filter buildings in view cone and calculate metadata
     candidates = []
-    user_point_wkt = f"POINT({lng} {lat})"
 
     for building in buildings:
-        # Calculate distance
-        dist_query = select(
-            ST_Distance(
-                ST_GeomFromText(user_point_wkt, 4326).cast(Geography),
-                Building.geom.cast(Geography)
-            )
-        ).where(Building.bin == building.bin)
+        try:
+            # Parse lat/lng from text
+            b_lat = float(building.latitude) if building.latitude else None
+            b_lng = float(building.longitude) if building.longitude else None
 
-        distance_result = await session.execute(dist_query)
-        distance = distance_result.scalar()
+            if b_lat is None or b_lng is None:
+                continue
 
-        # Calculate bearing from user to building
-        building_bearing = calculate_bearing(
-            lat, lng,
-            building.latitude, building.longitude
-        )
+            # Calculate distance
+            distance = calculate_distance(lat, lng, b_lat, b_lng)
 
-        # Calculate bearing difference (0-180)
-        bearing_diff = abs(((building_bearing - bearing + 180) % 360) - 180)
+            # Check if in view cone
+            if not is_point_in_cone(lat, lng, b_lat, b_lng, bearing, settings.cone_angle_degrees, max_distance):
+                continue
 
-        candidates.append({
-            'bin': building.bin,  # Primary identifier - BIN is now primary key
-            'bbl': building.bbl,  # Secondary - can have multiple buildings per lot
-            'address': building.address,
-            'borough': building.borough,
-            'latitude': building.latitude,
-            'longitude': building.longitude,
-            'distance_meters': round(distance, 2),
-            'bearing_to_building': round(building_bearing, 1),
-            'bearing_difference': round(bearing_diff, 1),
-            'num_floors': building.num_floors,
-            'year_built': building.year_built,
-            'is_landmark': building.is_landmark,
-            'landmark_name': building.landmark_name,
-            'architect': building.architect,
-            'architectural_style': building.architectural_style,
-            'walk_score': building.walk_score,
-        })
+            # Calculate bearing from user to building
+            building_bearing = calculate_bearing(lat, lng, b_lat, b_lng)
+
+            # Calculate bearing difference (0-180)
+            bearing_diff = abs(((building_bearing - bearing + 180) % 360) - 180)
+
+            # Parse other fields
+            bin_val = str(building.bin).replace('.0', '') if building.bin else 'N/A'
+
+            # Skip public spaces
+            if bin_val == 'N/A':
+                continue
+
+            candidates.append({
+                'bin': bin_val,
+                'bbl': str(building.bbl).replace('.0', '') if building.bbl else None,
+                'address': building.address,
+                'borough': building.borough,
+                'latitude': b_lat,
+                'longitude': b_lng,
+                'distance_meters': round(distance, 2),
+                'bearing_to_building': round(building_bearing, 1),
+                'bearing_difference': round(bearing_diff, 1),
+            })
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Skipping building due to parse error: {e}")
+            continue
+
+    logger.info(f"Found {len(candidates)} candidate buildings in view cone")
 
     # Sort by combined relevance score
     candidates.sort(key=lambda x: calculate_relevance_score(x), reverse=True)
@@ -229,13 +255,13 @@ def calculate_bearing(lat1: float, lng1: float, lat2: float, lng2: float) -> flo
 def calculate_relevance_score(candidate: Dict[str, Any]) -> float:
     """
     Calculate relevance score for sorting candidates
-    Combines distance, bearing alignment, landmark status, and score
+    Combines distance and bearing alignment
     """
     score = 0.0
 
     # Distance score (closer = better)
     # 0-30m: 1.0, 30-60m: 0.5, 60+m: 0.2
-    distance = candidate['distance_meters']
+    distance = candidate.get('distance_meters', float('inf'))
     if distance < 30:
         score += 1.0
     elif distance < 60:
@@ -245,21 +271,13 @@ def calculate_relevance_score(candidate: Dict[str, Any]) -> float:
 
     # Bearing alignment score (more aligned = better)
     # 0-15°: 1.0, 15-30°: 0.5, 30+°: 0.2
-    bearing_diff = candidate['bearing_difference']
+    bearing_diff = candidate.get('bearing_difference', 180)
     if bearing_diff < 15:
         score += 1.0
     elif bearing_diff < 30:
         score += 0.5
     else:
         score += 0.2
-
-    # Landmark bonus
-    if candidate['is_landmark']:
-        score += 0.5
-
-    # Final score bonus (normalized 0-1)
-    if candidate.get('walk_score'):
-        score += min(candidate['walk_score'] / 100, 1.0)
 
     return score
 
@@ -273,42 +291,61 @@ async def get_buildings_in_radius(
     """
     Simple radius-based search (fallback if cone search fails)
     """
-    user_point_wkt = f"POINT({lng} {lat})"
+    # Calculate bounding box
+    lat_delta = (radius_meters / 111000) * 1.5
+    lng_delta = (radius_meters / (111000 * math.cos(math.radians(lat)))) * 1.5
 
+    min_lat = lat - lat_delta
+    max_lat = lat + lat_delta
+    min_lng = lng - lng_delta
+    max_lng = lng + lng_delta
+
+    # Query buildings in bounding box
     query = (
-        select(
-            Building,
-            ST_Distance(
-                ST_GeomFromText(user_point_wkt, 4326).cast(Geography),
-                Building.geom.cast(Geography)
-            ).label('distance')
-        )
-        .where(
-            ST_Distance(
-                ST_GeomFromText(user_point_wkt, 4326).cast(Geography),
-                Building.geom.cast(Geography)
-            ) <= radius_meters
-        )
-        .where(Building.scan_enabled == True)
-        .where(Building.bin != 'N/A')  # Exclude public spaces
-        .order_by('distance')
-        .limit(settings.max_candidates)
+        select(Building)
+        .where(cast(Building.latitude, Float) >= min_lat)
+        .where(cast(Building.latitude, Float) <= max_lat)
+        .where(cast(Building.longitude, Float) >= min_lng)
+        .where(cast(Building.longitude, Float) <= max_lng)
+        .where(Building.latitude != None)
+        .where(Building.longitude != None)
+        .where(Building.latitude != '')
+        .where(Building.longitude != '')
     )
 
     result = await session.execute(query)
-    rows = result.all()
+    buildings = result.scalars().all()
 
+    # Filter by actual distance and prepare output
     candidates = []
-    for building, distance in rows:
-        candidates.append({
-            'bin': building.bin,  # Primary identifier - BIN is now primary key
-            'bbl': building.bbl,  # Secondary - can have multiple buildings per lot
-            'address': building.address,
-            'latitude': building.latitude,
-            'longitude': building.longitude,
-            'distance_meters': round(distance, 2),
-            'is_landmark': building.is_landmark,
-            'final_score': building.final_score,
-        })
+    for building in buildings:
+        try:
+            b_lat = float(building.latitude) if building.latitude else None
+            b_lng = float(building.longitude) if building.longitude else None
 
-    return candidates
+            if b_lat is None or b_lng is None:
+                continue
+
+            distance = calculate_distance(lat, lng, b_lat, b_lng)
+
+            if distance <= radius_meters:
+                bin_val = str(building.bin).replace('.0', '') if building.bin else 'N/A'
+
+                if bin_val == 'N/A':
+                    continue
+
+                candidates.append({
+                    'bin': bin_val,
+                    'bbl': str(building.bbl).replace('.0', '') if building.bbl else None,
+                    'address': building.address,
+                    'latitude': b_lat,
+                    'longitude': b_lng,
+                    'distance_meters': round(distance, 2),
+                })
+        except (ValueError, TypeError):
+            continue
+
+    # Sort by distance
+    candidates.sort(key=lambda x: x['distance_meters'])
+
+    return candidates[:settings.max_candidates]

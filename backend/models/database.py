@@ -23,39 +23,17 @@ class Building(Base):
     """
     __tablename__ = 'buildings_full_merge_scanning'
 
-    # Primary identifiers
-    bin = Column(String(10), primary_key=True)  # BIN is primary - uniquely identifies buildings
-    bbl = Column(String(10), index=True, nullable=True)  # Secondary - can have multiple buildings per BBL
-    address = Column(Text, nullable=False)
-    borough = Column(String(20))
+    # Primary identifiers - note: using 'id' as primary key since BIN/BBL are stored as text with decimals
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    bin = Column(Text, index=True, nullable=True)  # BIN as text (may have .0 suffix)
+    bbl = Column(Text, index=True, nullable=True)  # BBL as text (may have .0 suffix)
+    address = Column(Text, nullable=True)
+    borough = Column(Text, nullable=True)
 
-    # Geometry (PostGIS)
-    latitude = Column(Float, nullable=False)
-    longitude = Column(Float, nullable=False)
-    geom = Column(Geometry('POINT', srid=4326), index=True)
-
-    # Physical characteristics
-    year_built = Column(Integer, nullable=True)
-    num_floors = Column(Integer, nullable=True)
-    building_class = Column(String(10), nullable=True)
-    land_use = Column(String(10), nullable=True)
-
-    # Landmark data
-    is_landmark = Column(Boolean, default=False, index=True, nullable=True)
-    landmark_name = Column(Text, nullable=True)
-    architect = Column(Text, nullable=True)
-    architectural_style = Column(Text, nullable=True)  # Note: called architectural_style in DB
-    short_bio = Column(Text, nullable=True)
-
-    # Walk optimization
-    is_walk_optimized = Column(Boolean, default=False, nullable=True)
-    walk_score = Column(Float, nullable=True)
-
-    # Image matching metadata
-    scan_enabled = Column(Boolean, default=True, nullable=True)
-
-    # Timestamps
-    created_at = Column(TIMESTAMP, default=datetime.utcnow, nullable=True)
+    # Coordinates (stored as text in database, cast to float when querying)
+    # Map to actual column names in the database
+    latitude = Column('geocoded_lat', Text, nullable=True)
+    longitude = Column('geocoded_lng', Text, nullable=True)
 
 
 class ReferenceImage(Base):

@@ -168,9 +168,11 @@ async def get_reference_images_for_candidates(
     session: AsyncSession,
     candidates: List[Dict],
     user_bearing: float
-) -> Dict[str, str]:
+) -> Dict[str, List[Dict]]:
     """
-    Fetch reference images for all candidates in parallel
+    Get reference images with embeddings for all candidates
+
+    Queries reference_embeddings table which stores pregenerated images and CLIP embeddings
 
     Args:
         session: Database session
@@ -178,55 +180,66 @@ async def get_reference_images_for_candidates(
         user_bearing: User's compass bearing
 
     Returns:
-        Dictionary mapping BIN to image URL
+        Dictionary mapping BIN to list of reference image dicts with embeddings
     """
-    logger.info(f"📥 Fetching reference images for {len(candidates)} candidates @ bearing {user_bearing}°")
+    logger.info(f"📥 Fetching reference embeddings for {len(candidates)} candidates")
 
-    # Create tasks for parallel fetching
-    tasks = []
-    for candidate in candidates:
-        task = get_or_fetch_reference_image(
-            session,
-            candidate['bin'],  # Use BIN (primary key) instead of BBL
-            candidate['latitude'],
-            candidate['longitude'],
-            user_bearing
-        )
-        tasks.append((candidate['bin'], task))
+    # Get all unique BINs from candidates
+    bins = list(set(candidate['bin'] for candidate in candidates))
 
-    # Execute in parallel with semaphore to limit concurrency
-    semaphore = asyncio.Semaphore(5)  # Max 5 concurrent fetches
+    # Query reference_embeddings table
+    # Note: reference_embeddings uses building_id (integer) as foreign key
+    # Need to join with buildings table to match BIN
+    from sqlalchemy import text
 
-    async def fetch_with_limit(bin: str, task):
-        try:
-            async with semaphore:
-                result = await task
-                logger.debug(f"✅ Fetched for BIN {bin}: {result is not None}")
-                return bin, result
-        except Exception as e:
-            logger.error(f"❌ Error fetching BIN {bin}: {type(e).__name__}: {e}", exc_info=True)
-            return bin, None
+    query = text("""
+        SELECT
+            b.bin,
+            re.angle,
+            re.pitch,
+            re.image_key,
+            re.embedding
+        FROM reference_embeddings re
+        JOIN buildings_full_merge_scanning b ON b.id = re.building_id
+        WHERE REPLACE(b.bin, '.0', '') = ANY(:bins)
+    """)
 
-    results = await asyncio.gather(*[
-        fetch_with_limit(bin, task) for bin, task in tasks
-    ], return_exceptions=True)
+    result = await session.execute(query, {"bins": bins})
+    rows = result.fetchall()
 
-    # Build result dict
-    reference_images = {}
-    for result in results:
-        if isinstance(result, Exception):
-            logger.error(f"❌ Exception in gather: {type(result).__name__}: {result}")
-            continue
+    # Group by BIN
+    reference_data = {}
+    for row in rows:
+        bin_val = str(row[0]).replace('.0', '')
+        if bin_val not in reference_data:
+            reference_data[bin_val] = []
 
-        bin, url = result
-        if url:
-            reference_images[bin] = url
-            logger.info(f"✅ Added reference image for BIN {bin}")
+        # Construct R2 URL from image_key
+        image_url = f"{settings.r2_public_url}/{row[3]}"
+
+        # Parse embedding from string to list
+        # PostgreSQL vector type returns as string like "[0.1, 0.2, ...]"
+        import json
+        embedding_str = row[4]
+        if isinstance(embedding_str, str):
+            # Remove brackets and split by comma
+            embedding = json.loads(embedding_str)
         else:
-            logger.warning(f"⚠️ No reference image available for BIN {bin}")
+            embedding = embedding_str
 
-    logger.info(f"✅ Successfully fetched {len(reference_images)}/{len(candidates)} reference images")
-    return reference_images
+        reference_data[bin_val].append({
+            'angle': row[1],
+            'pitch': row[2],
+            'image_key': row[3],
+            'image_url': image_url,
+            'embedding': embedding  # List of floats
+        })
+
+    logger.info(f"✅ Found reference images for {len(reference_data)}/{len(bins)} buildings")
+    for bin_val, images in reference_data.items():
+        logger.info(f"  BIN {bin_val}: {len(images)} reference images")
+
+    return reference_data
 
 
 async def get_all_reference_images_for_building(

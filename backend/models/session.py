@@ -14,30 +14,29 @@ from models.config import get_settings
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# Convert postgres:// to postgresql+asyncpg://
-# Remove any existing query parameters for clean parsing
+# Convert postgres:// to postgresql+psycopg://
+# psycopg3 has better pgbouncer compatibility than asyncpg
 database_url = settings.database_url.split('?')[0]
 if database_url.startswith("postgres://"):
-    database_url = database_url.replace("postgres://", "postgresql+asyncpg://", 1)
+    database_url = database_url.replace("postgres://", "postgresql+psycopg://", 1)
 elif database_url.startswith("postgresql://"):
-    database_url = database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    database_url = database_url.replace("postgresql://", "postgresql+psycopg://", 1)
 
 # Create SSL context that requires encryption for Supabase
 ssl_context = ssl.create_default_context()
 ssl_context.check_hostname = False  # Supabase uses shared certificates
 ssl_context.verify_mode = ssl.CERT_NONE  # Don't verify certificate (Supabase pooled connections)
 
-# Create async engine with SSL required for Supabase
+# Create async engine with pgbouncer compatibility
+# psycopg3 doesn't use prepared statements by default, making it pgbouncer-friendly
 engine = create_async_engine(
     database_url,
     echo=settings.debug,  # Log SQL queries in debug mode
     pool_pre_ping=True,   # Verify connections before using
-    poolclass=NullPool if settings.env == "development" else None,  # No pooling in dev
+    poolclass=NullPool,  # Disable connection pooling (pgbouncer handles pooling)
     connect_args={
-        "ssl": ssl_context,  # Pass SSL context to require encrypted connection
-        "server_settings": {
-            "application_name": "nyc_scan_backend"
-        }
+        "sslmode": "require",  # Require SSL for Supabase
+        "options": "-c application_name=nyc_scan_backend"
     }
 )
 
@@ -113,7 +112,7 @@ async def init_db():
             logger.info(f"✅ PostGIS version: {postgis_version}")
 
     except Exception as e:
-        logger.error(f"❌ Database initialization failed: {e}")
+        logger.error(f"❌ Database initialization failed: {e}", exc_info=True)
         logger.warning("⚠️  Continuing without database connection - API endpoints requiring database will fail")
         # Don't raise - allow server to start without database for development
 

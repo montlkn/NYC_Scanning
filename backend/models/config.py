@@ -18,8 +18,8 @@ class Settings(BaseSettings):
     # Database
     database_url: str
 
-    # Redis
-    redis_url: str
+    # Redis (optional - can be disabled for initial deployment)
+    redis_url: Optional[str] = None
 
     # Google Maps
     google_maps_api_key: str

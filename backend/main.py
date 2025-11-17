@@ -13,10 +13,11 @@ import os
 
 import sentry_sdk
 from sentry_sdk.integrations.fastapi import FastApiIntegration
+import posthog
 
 from models.config import get_settings
 from models.session import init_db, close_db
-from routers import scan, buildings, debug, scan_phase1
+from routers import scan, buildings, debug, scan_phase1, confirm
 
 # Configure logging
 logging.basicConfig(
@@ -41,6 +42,15 @@ if sentry_dsn:
     logger.info("✅ Sentry initialized for error tracking")
 else:
     logger.warning("⚠️  SENTRY_DSN not set, error tracking disabled")
+
+# Initialize PostHog for product analytics
+posthog_api_key = os.getenv("POSTHOG_API_KEY")
+if posthog_api_key:
+    posthog.project_api_key = posthog_api_key
+    posthog.host = 'https://app.posthog.com'
+    logger.info("✅ PostHog initialized for analytics")
+else:
+    logger.warning("⚠️  POSTHOG_API_KEY not set, analytics disabled")
 
 
 @asynccontextmanager
@@ -142,6 +152,7 @@ async def health_check():
 app.include_router(scan.router, prefix="/api", tags=["scan"])
 app.include_router(buildings.router, prefix="/api", tags=["buildings"])
 app.include_router(scan_phase1.router, prefix="/api/phase1", tags=["phase1"])
+app.include_router(confirm.router, tags=["confirm"])
 
 # Debug endpoints (only in development)
 if settings.debug:

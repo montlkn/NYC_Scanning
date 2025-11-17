@@ -13,6 +13,7 @@ import time
 from models.database import Scan
 from models.session import get_db
 from services import geospatial, reference_images, clip_matcher
+from services.analytics import track_scan, track_confirmation
 from utils.storage import upload_image
 from models.config import get_settings
 
@@ -61,16 +62,37 @@ async def scan_building(
 
         logger.info(f"[{scan_id}] Starting scan at ({gps_lat}, {gps_lng}), bearing {compass_bearing}°, floor {floor}, confidence {confidence}%")
 
-        # === STEP 1: Upload user photo ===
+        # === STEP 1: Resize and upload user photo ===
         photo_start = time.time()
         photo_bytes = await photo.read()
+
+        # Resize image to reduce upload time (CLIP uses 224x224 anyway)
+        from PIL import Image
+        from io import BytesIO
+
+        image = Image.open(BytesIO(photo_bytes))
+
+        # Resize to max 1024px on longest side (preserves aspect ratio)
+        max_size = 1024
+        if max(image.size) > max_size:
+            ratio = max_size / max(image.size)
+            new_size = tuple(int(dim * ratio) for dim in image.size)
+            image = image.resize(new_size, Image.Resampling.LANCZOS)
+
+        # Compress to JPEG with quality 85
+        buffer = BytesIO()
+        image.save(buffer, format='JPEG', quality=85, optimize=True)
+        photo_bytes = buffer.getvalue()
+
+        logger.info(f"[{scan_id}] Resized image to {image.size}, size: {len(photo_bytes) / 1024:.1f}KB")
+
         user_photo_url = await upload_image(
             photo_bytes,
             f"scans/{scan_id}.jpg",
             create_thumbnail=True
         )
         upload_time_ms = int((time.time() - photo_start) * 1000)
-        logger.info(f"[{scan_id}] Photo uploaded in {upload_time_ms}ms")
+        logger.info(f"[{scan_id}] Photo processed and uploaded in {upload_time_ms}ms")
 
         # === STEP 2: Geospatial filtering ===
         geo_start = time.time()
@@ -155,6 +177,16 @@ async def scan_building(
 
         logger.info(f"[{scan_id}] Scan completed in {total_time_ms}ms")
 
+        # Track scan event for analytics
+        track_result = {
+            'confidence': matches[0]['confidence'] if matches else 0,
+            'num_candidates': len(candidates),
+            'processing_time_ms': total_time_ms,
+            'status': 'match_found' if matches else 'no_candidates',
+            'bin': matches[0]['bin'] if matches else None,
+        }
+        track_scan(scan_id, track_result)
+
         return {
             'scan_id': scan_id,
             'matches': matches[:3],  # Return top 3
@@ -211,6 +243,9 @@ async def confirm_building(
     """
     try:
         logger.info(f"[{scan_id}] User confirmed BIN: {confirmed_bin}")
+
+        # Track confirmation for analytics
+        track_confirmation(scan_id, confirmed_bin, was_top_match=True)
 
         # TODO: Update scan record
         # result = await db.execute(

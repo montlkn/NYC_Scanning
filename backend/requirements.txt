@@ -44,5 +44,6 @@ pydantic-settings==2.1.0
 # Utilities
 aiofiles==23.2.1
 
-# Error Tracking
+# Error Tracking & Analytics
 sentry-sdk[fastapi]==1.40.0
+posthog==3.5.0
