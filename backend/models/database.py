@@ -161,3 +161,76 @@ class CacheStat(Base):
     street_view_count = Column(Integer)
     mapillary_count = Column(Integer)
     user_upload_count = Column(Integer)
+
+
+class UserContributedBuilding(Base):
+    """
+    User-contributed building metadata and enrichment data.
+    Allows crowdsourcing additional information for buildings in NYC datasets.
+    """
+    __tablename__ = 'user_contributed_buildings'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    # Link to NYC building data
+    bin = Column(String(10), nullable=False, index=True)
+    bbl = Column(String(10), index=True)
+    building_id = Column(Integer, index=True)  # FK to buildings_full_merge_scanning
+
+    # Address and names
+    address = Column(Text, nullable=False)
+    building_name = Column(Text)
+    alternate_names = Column(ARRAY(Text))
+
+    # Location from user's scan
+    gps_lat = Column(Float, nullable=False)
+    gps_lng = Column(Float, nullable=False)
+    gps_accuracy = Column(Float)
+
+    # Building metadata
+    year_built = Column(Integer)
+    architect = Column(Text)
+    architectural_style = Column(Text)
+    num_floors = Column(Integer)
+    height_feet = Column(Float)
+    landmark_status = Column(Text)
+    historic_district = Column(Text)
+    building_use = Column(Text)
+    notable_features = Column(Text)
+    user_notes = Column(Text)
+
+    # Submission data
+    submitted_by = Column(String(36), index=True)
+    initial_photo_url = Column(Text, nullable=False)
+    initial_scan_id = Column(String(36), ForeignKey('scans.id'))
+    compass_bearing = Column(Float)
+    phone_pitch = Column(Float)
+
+    # Verification status
+    status = Column(String(20), default='pending', index=True)
+    verified_by = Column(String(36))
+    verified_at = Column(TIMESTAMP)
+    rejection_reason = Column(Text)
+
+    # Data enrichment
+    enrichment_status = Column(String(20), default='pending', index=True)
+    enrichment_source = Column(Text)
+    enrichment_data = Column(JSON)
+    enrichment_confidence = Column(Float)
+    enrichment_completed_at = Column(TIMESTAMP)
+
+    # Street View images
+    street_view_images_fetched = Column(Boolean, default=False)
+    street_view_image_count = Column(Integer, default=0)
+    street_view_fetch_attempted_at = Column(TIMESTAMP)
+
+    # Reference images
+    reference_image_count = Column(Integer, default=0)
+
+    # Community validation
+    upvotes = Column(Integer, default=0)
+    downvotes = Column(Integer, default=0)
+
+    # Timestamps
+    created_at = Column(TIMESTAMP, default=datetime.utcnow, index=True)
+    updated_at = Column(TIMESTAMP, default=datetime.utcnow, onupdate=datetime.utcnow)

@@ -50,7 +50,10 @@ async def compare_images(
     Args:
         user_photo_url: URL to user's uploaded photo
         candidates: List of candidate buildings from geospatial search
-        reference_data: Dict mapping BIN -> list of reference image dicts with embeddings
+        reference_data: Dict mapping BIN -> list of reference image dicts
+            Each dict can contain either:
+            - 'embedding': Pre-computed embedding from database
+            - 'image_bytes': Raw image bytes (for lazy-fetched Street View)
 
     Returns:
         List of matches sorted by confidence score
@@ -79,8 +82,17 @@ async def compare_images(
         # Calculate similarity scores for all reference images of this building
         similarities = []
         for ref_img in ref_images:
-            # ref_img['embedding'] is a list from the database
-            ref_embedding = np.array(ref_img['embedding'])
+            # Handle two cases:
+            # 1. Pre-computed embedding from database
+            if 'embedding' in ref_img:
+                ref_embedding = np.array(ref_img['embedding'])
+            # 2. Lazy-fetched image bytes (need to encode on-the-fly)
+            elif 'image_bytes' in ref_img:
+                logger.info(f"  Encoding lazy-fetched Street View for BIN {bin_val}")
+                ref_embedding = await encode_photo(ref_img['image_bytes'])
+            else:
+                logger.warning(f"  Reference image for BIN {bin_val} has neither embedding nor image_bytes")
+                continue
 
             # Cosine similarity (embeddings are already normalized)
             similarity = float(np.dot(user_embedding, ref_embedding))

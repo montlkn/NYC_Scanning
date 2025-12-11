@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     r2_bucket: str = "building-images"
     r2_public_url: str
 
+    # User Images R2 Bucket (separate from reference images)
+    r2_user_images_bucket: str = "user-images"
+    r2_user_images_public_url: Optional[str] = None
+
     # Optional APIs
     perplexity_api_key: Optional[str] = None
 

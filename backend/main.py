@@ -17,7 +17,7 @@ import posthog
 
 from models.config import get_settings
 from models.session import init_db, close_db
-from routers import scan, buildings, debug, scan_phase1, confirm
+from routers import scan, buildings, debug, scan_phase1, confirm, contribute, stamps, vetting, similar_buildings
 
 # Configure logging
 logging.basicConfig(
@@ -151,6 +151,10 @@ async def health_check():
 # Include routers
 app.include_router(scan.router, prefix="/api", tags=["scan"])
 app.include_router(buildings.router, prefix="/api", tags=["buildings"])
+app.include_router(contribute.router, prefix="/api", tags=["contribute"])  # NEW: Building contributions
+app.include_router(stamps.router, prefix="/api", tags=["stamps"])  # NEW: Stamps and achievements
+app.include_router(vetting.router, prefix="/api", tags=["vetting"])  # NEW: Community verification
+app.include_router(similar_buildings.router, prefix="/api", tags=["similar-buildings"])  # NEW: Find similar buildings
 app.include_router(scan_phase1.router, prefix="/api/phase1", tags=["phase1"])
 app.include_router(confirm.router, tags=["confirm"])
 

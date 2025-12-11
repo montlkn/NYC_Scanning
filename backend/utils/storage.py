@@ -34,7 +34,7 @@ async def upload_image(
     create_thumbnail: bool = False
 ) -> str:
     """
-    Upload image to Cloudflare R2
+    Upload image to Cloudflare R2 (uses default building-images bucket)
 
     Args:
         image_bytes: Image bytes to upload
@@ -46,19 +46,54 @@ async def upload_image(
     Returns:
         Public URL of uploaded image
     """
+    return await upload_image_to_bucket(
+        image_bytes=image_bytes,
+        key=key,
+        bucket=settings.r2_bucket,
+        public_url=settings.r2_public_url,
+        content_type=content_type,
+        make_public=make_public,
+        create_thumbnail=create_thumbnail
+    )
+
+
+async def upload_image_to_bucket(
+    image_bytes: bytes,
+    key: str,
+    bucket: str,
+    public_url: str,
+    content_type: str = 'image/jpeg',
+    make_public: bool = True,
+    create_thumbnail: bool = False
+) -> str:
+    """
+    Upload image to a specific Cloudflare R2 bucket
+
+    Args:
+        image_bytes: Image bytes to upload
+        key: Object key/path in bucket
+        bucket: Bucket name (e.g., 'building-images' or 'user-images')
+        public_url: Public URL base for this bucket
+        content_type: MIME type
+        make_public: Whether to make publicly accessible
+        create_thumbnail: Whether to also create and upload thumbnail
+
+    Returns:
+        Public URL of uploaded image
+    """
     try:
         # Upload main image in thread pool (boto3 is synchronous)
         await asyncio.to_thread(
             s3_client.put_object,
-            Bucket=settings.r2_bucket,
+            Bucket=bucket,
             Key=key,
             Body=image_bytes,
             ContentType=content_type,
             ACL='public-read' if make_public else 'private'
         )
 
-        image_url = f"{settings.r2_public_url}/{key}"
-        logger.info(f"Uploaded image to R2: {key}")
+        image_url = f"{public_url}/{key}"
+        logger.info(f"Uploaded image to R2 ({bucket}): {key}")
 
         # Optionally create thumbnail
         thumbnail_url = None
@@ -68,19 +103,19 @@ async def upload_image(
             if thumbnail_bytes:
                 await asyncio.to_thread(
                     s3_client.put_object,
-                    Bucket=settings.r2_bucket,
+                    Bucket=bucket,
                     Key=thumbnail_key,
                     Body=thumbnail_bytes,
                     ContentType=content_type,
                     ACL='public-read' if make_public else 'private'
                 )
-                thumbnail_url = f"{settings.r2_public_url}/{thumbnail_key}"
-                logger.info(f"Uploaded thumbnail to R2: {thumbnail_key}")
+                thumbnail_url = f"{public_url}/{thumbnail_key}"
+                logger.info(f"Uploaded thumbnail to R2 ({bucket}): {thumbnail_key}")
 
         return image_url
 
     except Exception as e:
-        logger.error(f"Failed to upload image to R2: {e}", exc_info=True)
+        logger.error(f"Failed to upload image to R2 ({bucket}): {e}", exc_info=True)
         raise
 
 
