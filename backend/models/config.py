@@ -17,6 +17,7 @@ class Settings(BaseSettings):
 
     # Database
     database_url: str
+    footprints_db_url: Optional[str] = None  # Railway database for building footprints
 
     # Redis (optional - can be disabled for initial deployment)
     redis_url: Optional[str] = None
@@ -46,7 +47,7 @@ class Settings(BaseSettings):
 
     # Scan Configuration
     max_scan_distance_meters: int = 100
-    cone_angle_degrees: int = 60
+    cone_angle_degrees: int = 90  # Wider cone for better accuracy with imperfect compass
     max_candidates: int = 20
     confidence_threshold: float = 0.70
     landmark_boost_factor: float = 1.05
@@ -68,6 +69,14 @@ class Settings(BaseSettings):
     cache_ttl_seconds: int = 86400  # 24 hours
     precache_top_n_buildings: int = 5000
     precache_cardinal_directions: list = [0, 90, 180, 270]
+
+    # V2 Scan System Configuration
+    use_scan_v2: bool = False  # Set to True to use footprint-based scanning
+    v2_ambiguity_threshold: float = 15.0  # Score gap below which CLIP is used
+    v2_single_building_confidence: float = 95.0  # Confidence for single building in cone
+    v2_clear_winner_confidence: float = 85.0  # Confidence for clear geometric winner
+    v2_expanded_radius_max: float = 300.0  # Max radius for expanded search (meters)
+    v2_expanded_radius_step: float = 50.0  # Step size for radius expansion
 
     class Config:
         env_file = ".env"
