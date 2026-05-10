@@ -134,13 +134,13 @@ async def run(
     # ── 4. Resolve thumbnails + evidence chips ─────────────────────────────────
     top3_out = candidates[:3]
     for c in top3_out:
-        c["thumbnail_url"] = _r2_aerial_url(c["bin"])
         c["evidence"] = perception.evidence_for_candidate(c)
         c["bearing_offset_deg"] = c.get("bearing_difference")
 
-    # Fire-and-forget: backfill Street View thumbnails for any BINs missing R2 aerial.
-    # Next scan for those buildings will serve the Street View image from R2.
-    asyncio.ensure_future(_backfill_street_view_thumbnails(top3_out, bearing))
+    # Resolve thumbnails synchronously — picker is shown immediately, spinner is useless.
+    # For each candidate: try R2 aerial (HEAD check). If missing, fetch Street View,
+    # upload to R2, and return that URL. Falls back to R2 aerial URL if all else fails.
+    await _resolve_thumbnails(top3_out, bearing)
 
     # ── 5. Telemetry ──────────────────────────────────────────────────────────
     total_ms = int((time.time() - t_start) * 1000)
@@ -170,47 +170,69 @@ async def run(
 
 
 def _r2_aerial_url(bin_val: str) -> Optional[str]:
-    """Construct the R2 aerial thumbnail URL for a BIN."""
     if not bin_val:
         return None
     clean = bin_val.strip().replace(".0", "")
     return _cfg.r2_aerial_template.format(bin=clean)
 
 
-async def _backfill_street_view_thumbnails(candidates: List[Dict], bearing: float) -> None:
+async def _resolve_thumbnails(candidates: List[Dict], bearing: float) -> None:
     """
-    For each candidate whose R2 aerial thumbnail doesn't exist (HTTP 404),
-    fetch a Street View image at the candidate's centroid and upload it to R2
-    under thumbs/{bin}/streetview.jpg. Non-blocking — runs after the response
-    is returned to the client. The API key stays server-side.
+    Resolve thumbnail_url for each candidate synchronously before returning
+    the response — the picker needs real images immediately, not on retry.
+
+    Priority:
+      1. R2 aerial (instant if exists — just a HEAD check)
+      2. Street View fetched live → uploaded to R2 → URL returned
+      3. R2 aerial URL as last resort (client shows spinner, but this rarely happens)
     """
     try:
         from services.reference_images import fetch_street_view
         from utils.storage import upload_image
+        sv_available = True
     except ImportError:
-        logger.warning("Street View backfill skipped — imports unavailable")
-        return
+        sv_available = False
+        logger.warning("Street View unavailable — falling back to R2 aerial URLs only")
 
-    for c in candidates:
-        bin_val = c.get("bin", "")
-        lat = c.get("geocoded_lat") or c.get("latitude")
-        lng = c.get("geocoded_lng") or c.get("longitude")
-        if not (bin_val and lat and lng):
-            continue
+    tasks = [_resolve_one_thumbnail(c, bearing, sv_available) for c in candidates]
+    await asyncio.gather(*tasks)
 
-        r2_url = _r2_aerial_url(bin_val)
-        if not r2_url:
-            continue
 
+async def _resolve_one_thumbnail(c: Dict, bearing: float, sv_available: bool) -> None:
+    from services.reference_images import fetch_street_view
+    from utils.storage import upload_image
+
+    bin_val = c.get("bin", "")
+    lat = c.get("geocoded_lat") or c.get("latitude")
+    lng = c.get("geocoded_lng") or c.get("longitude")
+    r2_aerial = _r2_aerial_url(bin_val)
+
+    # Check cached Street View R2 key first (fastest path for repeat scans)
+    if bin_val:
+        clean_bin = bin_val.strip().replace(".0", "")
+        sv_r2_url = f"https://pub-234fc67c039149b2b46b864a1357763d.r2.dev/thumbs/{clean_bin}/streetview.jpg"
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                head = await client.head(r2_url)
-            if head.status_code == 200:
-                continue  # R2 aerial exists — no Street View needed
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                sv_head = await client.head(sv_r2_url)
+            if sv_head.status_code == 200:
+                c["thumbnail_url"] = sv_r2_url
+                return
         except Exception:
-            pass  # Network error checking R2 — skip this candidate
+            pass
 
-        # R2 aerial missing — fetch Street View and cache it
+    # Check R2 aerial
+    if r2_aerial:
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                head = await client.head(r2_aerial)
+            if head.status_code == 200:
+                c["thumbnail_url"] = r2_aerial
+                return
+        except Exception:
+            pass
+
+    # Neither cached — fetch Street View live, upload, return URL
+    if sv_available and lat and lng:
         try:
             sv_bytes = await fetch_street_view(
                 lat=float(lat), lng=float(lng), bearing=bearing,
@@ -218,16 +240,19 @@ async def _backfill_street_view_thumbnails(candidates: List[Dict], bearing: floa
                 pitch=_cfg.street_view_pitch,
                 fov=_cfg.street_view_fov,
             )
-            if sv_bytes:
+            if sv_bytes and bin_val:
                 clean_bin = bin_val.strip().replace(".0", "")
                 sv_r2_key = f"thumbs/{clean_bin}/streetview.jpg"
                 sv_url = await upload_image(sv_bytes, sv_r2_key)
                 if sv_url:
-                    # Update in-place so future scans return the Street View URL
                     c["thumbnail_url"] = sv_url
-                    logger.info(f"Backfilled Street View thumbnail for BIN {clean_bin}")
+                    logger.info(f"Fetched live Street View thumbnail for BIN {clean_bin}")
+                    return
         except Exception as e:
-            logger.debug(f"Street View backfill failed for BIN {bin_val}: {e}")
+            logger.debug(f"Street View fetch failed for BIN {bin_val}: {e}")
+
+    # Last resort — R2 aerial URL (client shows spinner if 404)
+    c["thumbnail_url"] = r2_aerial
 
 
 def _empty_response(retrieval_meta: dict, t_start: float) -> Dict[str, Any]:
