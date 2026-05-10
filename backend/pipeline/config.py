@@ -24,8 +24,10 @@ class PipelineConfig:
     cone_heading_scale: float = 1.0              # deg of cone per deg of heading accuracy
     cone_ultrawide_bonus: float = 20.0
 
-    # Ring fallback — triggered when top-1 CLIP score is too low
-    ring_fallback_clip_threshold: float = float(os.environ.get("PIPELINE_RING_THRESH", 0.55))
+    # Ring fallback — now also triggered when picker margin is thin (see match.py).
+    # Threshold lowered: wrong NYC brownstones CLIP at 0.60-0.75 each, so 0.55 never fired.
+    # 0.35 catches genuinely low-confidence cone results; picker_ambiguous catches the rest.
+    ring_fallback_clip_threshold: float = float(os.environ.get("PIPELINE_RING_THRESH", 0.35))
     ring_fallback_min_candidates: int = 2        # also trigger if fewer than N returned
 
     # ─── Scoring weights ───────────────────────────────────────────────────────

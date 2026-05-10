@@ -54,8 +54,17 @@ async def cone_query(
     max_distance_m: float,
     max_candidates: int
 ) -> List[Dict[str, Any]]:
-    """Run the PostGIS find_buildings_in_cone function and return raw rows."""
+    """
+    Run find_buildings_in_cone AND a proximity fallback.
+
+    The footprint-intersection cone can silently exclude the correct building
+    when GPS drifts a few metres (apex moves, footprint misses the cone edge).
+    The proximity fallback adds any building whose centroid is within 50m and
+    whose centroid bearing is within the cone — these are almost certainly
+    visible to the user regardless of exact footprint overlap.
+    """
     try:
+        # Primary: footprint-intersection cone
         result = await footprints_db.execute(
             text("""
                 SELECT
@@ -74,7 +83,54 @@ async def cone_query(
             }
         )
         rows = result.fetchall()
-        return [_row_to_candidate(r) for r in rows]
+        primary = [_row_to_candidate(r) for r in rows]
+
+        # Proximity fallback: centroid-bearing check for close buildings the cone may have missed
+        prox_result = await footprints_db.execute(
+            text("""
+                WITH user_pt AS (
+                    SELECT ST_SetSRID(ST_MakePoint(:lng, :lat), 4326) AS geom
+                )
+                SELECT
+                    bf.bin, bf.bbl, bf.name,
+                    ST_Distance(bf.centroid::geography, u.geom::geography) AS dist_m,
+                    DEGREES(ST_Azimuth(u.geom, bf.centroid)) AS bearing_to_bldg,
+                    ABS(
+                        MOD(
+                            (DEGREES(ST_Azimuth(u.geom, bf.centroid)) - :bearing + 180 + 360)::numeric,
+                            360::numeric
+                        )::double precision - 180
+                    ) AS bearing_diff,
+                    bf.shape_area,
+                    bf.shape_area AS visible_area,
+                    bf.height_roof,
+                    0.5 AS visibility_score
+                FROM building_footprints bf, user_pt u
+                WHERE
+                    ST_Distance(bf.centroid::geography, u.geom::geography) < 50
+                    AND ABS(
+                        MOD(
+                            (DEGREES(ST_Azimuth(u.geom, bf.centroid)) - :bearing + 180 + 360)::numeric,
+                            360::numeric
+                        )::double precision - 180
+                    ) < (:cone_angle / 2.0)
+                ORDER BY dist_m ASC
+                LIMIT :max_candidates
+            """),
+            {"lat": lat, "lng": lng, "bearing": bearing,
+             "cone_angle": cone_deg, "max_candidates": max_candidates}
+        )
+        prox_rows = prox_result.fetchall()
+        prox = [_row_to_candidate(r) for r in prox_rows]
+
+        # Merge: proximity candidates not already in primary set
+        primary_bins = {c["bin"] for c in primary}
+        new_from_prox = [c for c in prox if c["bin"] not in primary_bins]
+        if new_from_prox:
+            logger.info(f"Proximity fallback added {len(new_from_prox)} candidates inside 50m")
+
+        return primary + new_from_prox
+
     except Exception as e:
         logger.error(f"Cone query failed: {e}", exc_info=True)
         return []
@@ -153,6 +209,26 @@ def _row_to_candidate(row) -> Dict[str, Any]:
         "height_roof": round(row[8], 1) if row[8] else None,
         "footprint_score": round(float(row[9]), 2) if row[9] else 0.0,
     }
+
+
+async def ring_query_direct(
+    session: AsyncSession,
+    lat: float,
+    lng: float,
+    bearing: float,
+    max_distance_m: float,
+    max_candidates: int,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Full-ring query callable directly from match.py without going through
+    the two-pass wrapper. Used when we've already scored cone candidates and
+    decided the ring is needed.
+    """
+    async with get_footprints_db() as footprints_db:
+        if footprints_db is None:
+            return [], {}
+        candidates = await ring_query(footprints_db, lat, lng, bearing, max_distance_m, max_candidates)
+    return candidates, {}
 
 
 async def get_candidates(

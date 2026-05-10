@@ -97,25 +97,44 @@ async def run(
         if c["bin"] in clip_by_bin:
             c["clip_similarity"] = clip_by_bin[c["bin"]].get("clip_similarity", 0.0)
 
-    # ── 2b. Ring fallback if top CLIP score is still low ───────────────────────
+    # ── 2b. Preliminary score to decide if ring fallback is needed ─────────────
+    # Score cone candidates first so we can check the margin, not just raw CLIP.
+    # The broken pattern was: wrong buildings CLIP at 65-75 each, threshold=55,
+    # so fallback never fired even though all 3 candidates were wrong.
+    pre_scored = scoring.blend_scores(list(enriched_cands), perception, pitch, bearing)
+    pre_calibrated = scoring.calibrate(pre_scored)
+    _, pre_show_picker = scoring.sort_and_decide_picker(pre_calibrated)
+
     top_clip = max((c.get("clip_similarity", 0.0) for c in enriched_cands[:3]), default=0.0)
-    if top_clip < _cfg.ring_fallback_clip_threshold * 100:
-        logger.info(f"Top CLIP={top_clip:.1f} < threshold — triggering ring fallback")
-        extra_raw, ring_meta = await retrieval.get_candidates(
-            session, lat, lng, bearing, pitch,
-            gps_accuracy_m, heading_accuracy_deg, lens_type,
-            top_clip_score=top_clip / 100.0,
+
+    # Ring fallback triggers when:
+    #   (a) CLIP top score is genuinely low — none of the cone candidates match well
+    #   (b) picker would be shown anyway — margin is thin, worth a wider search
+    #   (c) too few cone candidates — cone may have missed the building entirely
+    should_ring = (
+        top_clip < _cfg.ring_fallback_clip_threshold * 100  # e.g. < 35 (tuned down from 55)
+        or pre_show_picker                                    # ambiguous result → search wider
+        or len(raw_candidates) < _cfg.ring_fallback_min_candidates
+    )
+
+    if should_ring:
+        reason = (
+            f"low_clip={top_clip:.1f}" if top_clip < _cfg.ring_fallback_clip_threshold * 100
+            else ("picker_ambiguous" if pre_show_picker else "too_few")
+        )
+        logger.info(f"Ring fallback triggered ({reason})")
+        extra_raw, _ = await retrieval.ring_query_direct(
+            session, lat, lng, bearing, _cfg.max_distance_m, _cfg.max_candidates
         )
         existing_bins = {c["bin"] for c in enriched_cands}
         new_raws = [c for c in extra_raw if c["bin"] not in existing_bins]
         if new_raws:
             new_enriched = await enrich_candidates_with_metadata(session, new_raws)
-            # Run CLIP on the new batch
             async with AsyncSessionLocal() as ring_sess:
                 ring_clip = await clip_disambiguation.disambiguate_candidates(
                     session=ring_sess,
                     user_photo_url=user_photo_url,
-                    candidates=new_raws[:3],
+                    candidates=new_raws[:5],  # wider batch for ring
                     user_lat=lat, user_lng=lng, user_bearing=bearing,
                 )
             ring_clip_by_bin = {c["bin"]: c for c in ring_clip.get("matches", [])}
@@ -125,6 +144,8 @@ async def run(
             enriched_cands.extend(new_enriched)
             clip_cost += ring_clip.get("cost_usd", 0.0)
             retrieval_meta["used_ring_fallback"] = True
+            retrieval_meta["ring_reason"] = reason
+            retrieval_meta["ring_added"] = len(new_raws)
 
     # ── 3. Multi-signal scoring ────────────────────────────────────────────────
     scored = scoring.blend_scores(enriched_cands, perception, pitch, bearing)
