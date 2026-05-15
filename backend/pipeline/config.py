@@ -66,6 +66,16 @@ class PipelineConfig:
     # than a confidently wrong one."
     no_confident_match_threshold: float = float(os.environ.get("PIPELINE_BAIL_CONF", 0.50))
 
+    # ─── P4: Grok Vision disambig ─────────────────────────────────────────────
+    # Kill-switch + tunable confidence bump. Grok is great on photos with
+    # readable identifying marks (numbers, flags, plaques) but fails on
+    # generic facades — it confidently picks a wrong-but-similar neighbour.
+    # The textual-evidence gate downgrades picks whose reason is just
+    # "facade similarity / materials / period" to UNSURE so we bail honestly.
+    grok_disambig_enabled: bool = os.environ.get("PIPELINE_GROK_DISAMBIG", "true").lower() == "true"
+    grok_confidence_bump: float = float(os.environ.get("PIPELINE_GROK_BUMP", 0.65))
+    grok_require_textual_evidence: bool = os.environ.get("PIPELINE_GROK_REQUIRE_TEXT", "true").lower() == "true"
+
     # ─── Thumbnails ───────────────────────────────────────────────────────────
     r2_aerial_template: str = (
         "https://pub-234fc67c039149b2b46b864a1357763d.r2.dev/{bin}/0deg_40pitch.jpg"

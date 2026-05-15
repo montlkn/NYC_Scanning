@@ -582,3 +582,32 @@ def calculate_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> fl
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
     return R * c
+
+
+async def get_footprints_for_bins(bins: List[str]) -> Dict[str, str]:
+    """Fetch GeoJSON footprint for each BIN. Returns {bin: geojson_string}.
+
+    Used by the bail path so the iOS map picker can render polygons over the
+    map. Only fires when we've already decided to show the picker, so it's a
+    once-per-bail cost (5 BINs typical).
+    """
+    if not bins:
+        return {}
+    clean = [str(b).replace(".0", "").strip() for b in bins if b]
+    if not clean:
+        return {}
+    try:
+        async with get_footprints_db() as db:
+            if db is None:
+                return {}
+            result = await db.execute(
+                text(
+                    "SELECT bin, ST_AsGeoJSON(footprint) AS geojson "
+                    "FROM building_footprints WHERE bin = ANY(:bins)"
+                ),
+                {"bins": clean},
+            )
+            return {row.bin: row.geojson for row in result.fetchall() if row.geojson}
+    except Exception as e:
+        logger.warning(f"get_footprints_for_bins failed: {e}")
+        return {}

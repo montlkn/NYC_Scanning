@@ -17,6 +17,7 @@ The router in routers/scan_v2.py is the only caller.
 
 import asyncio
 import logging
+import re
 import time
 from typing import Optional, Tuple, List, Dict, Any
 
@@ -31,6 +32,28 @@ from services import clip_disambiguation
 
 logger = logging.getLogger(__name__)
 _cfg = get_pipeline_config()
+
+
+_GROK_TEXT_EVIDENCE_KEYWORDS = (
+    "number", "address", "flag", "sign", "signage", "plaque",
+    "awning", "lettering", "letters", "inscribed", "written",
+    "consulate", "logo", "banner", "stencil", "name plate",
+    "nameplate", "engraved", "house number", "street number",
+)
+_GROK_DIGIT_RE = re.compile(r"\b\d{2,5}\b")
+
+
+def _has_textual_evidence(reason: Optional[str]) -> bool:
+    """Grok's pick is trustworthy only when its reason cites readable marks
+    (numbers, flags, signage, plaques). Pure facade-similarity reasons are
+    the regression mode that loses 555 Park to a visually-similar neighbour."""
+    if not reason:
+        return False
+    r = reason.lower()
+    if any(k in r for k in _GROK_TEXT_EVIDENCE_KEYWORDS):
+        return True
+    # A standalone digit string in the reason ("121", "555") is strong evidence.
+    return bool(_GROK_DIGIT_RE.search(r))
 
 
 async def run(
@@ -151,39 +174,63 @@ async def run(
     # and address numbers. Triggers only on ambiguous scans (~10-30% of total).
     grok_decision: Optional[str] = None
     grok_reason: Optional[str] = None
-    if (bail or show_picker) and len(candidates) >= 2:
+    if _cfg.grok_disambig_enabled and (bail or show_picker) and len(candidates) >= 2:
         try:
             grok_decision, grok_reason = await _try_grok_disambig(
                 photo_bytes=photo_bytes,
                 top_candidates=candidates[:3],
             )
             if grok_decision is not None and grok_decision != "UNSURE":
-                # Grok picked a winner. Reorder so the chosen candidate is #1
-                # and bump its confidence so the client doesn't bail.
-                idx = {"A": 0, "B": 1, "C": 2}.get(grok_decision)
-                if idx is not None and idx < len(candidates):
-                    chosen = candidates[idx]
-                    chosen["confidence"] = max(chosen.get("confidence", 0.0), 0.90)
-                    chosen["grok_reason"] = grok_reason
-                    # Move chosen to front, keep the rest in their current order.
-                    candidates = [chosen] + [
-                        c for i, c in enumerate(candidates) if i != idx
-                    ]
-                    bail = False
-                    show_picker = False
-                    retrieval_meta["grok_pick"] = grok_decision
+                # Gate: only trust the pick if Grok's reason cites readable
+                # evidence (numbers, flags, signage). Without that, Grok is
+                # matching facade similarity — same failure mode as CLIP, and
+                # exactly the 555 Park regression case.
+                if (
+                    _cfg.grok_require_textual_evidence
+                    and not _has_textual_evidence(grok_reason)
+                ):
+                    retrieval_meta["grok_pick"] = "GATED_GENERIC"
                     retrieval_meta["grok_reason"] = grok_reason
-                    logger.info(f"Grok Vision picked {grok_decision} ({grok_reason!r})")
+                    logger.info(
+                        f"Grok pick {grok_decision} gated (no textual evidence): {grok_reason!r}"
+                    )
+                else:
+                    idx = {"A": 0, "B": 1, "C": 2}.get(grok_decision)
+                    if idx is not None and idx < len(candidates):
+                        chosen = candidates[idx]
+                        # Bump bounded by config — 0.65 default. Lower than the
+                        # original 0.90 so a soft Grok pick doesn't drown out
+                        # the picker UX for ambiguous cases.
+                        chosen["confidence"] = max(
+                            chosen.get("confidence", 0.0), _cfg.grok_confidence_bump
+                        )
+                        chosen["grok_reason"] = grok_reason
+                        candidates = [chosen] + [
+                            c for i, c in enumerate(candidates) if i != idx
+                        ]
+                        # Recompute bail/picker against the bumped confidence.
+                        new_conf = chosen["confidence"]
+                        bail = new_conf < _cfg.no_confident_match_threshold
+                        show_picker = new_conf < _cfg.picker_abs_threshold
+                        retrieval_meta["grok_pick"] = grok_decision
+                        retrieval_meta["grok_reason"] = grok_reason
+                        logger.info(
+                            f"Grok Vision picked {grok_decision} ({grok_reason!r}) conf={new_conf:.2f}"
+                        )
             elif grok_decision == "UNSURE":
                 retrieval_meta["grok_pick"] = "UNSURE"
                 retrieval_meta["grok_reason"] = grok_reason
                 logger.info(f"Grok Vision returned UNSURE ({grok_reason!r})")
         except Exception as e:
             logger.warning(f"Grok disambig failed (continuing with CLIP rank): {e}")
+    elif not _cfg.grok_disambig_enabled:
+        retrieval_meta["grok_pick"] = "DISABLED"
 
     # ── 4. Resolve thumbnails ──────────────────────────────────────────────────
-    # On bail return top-5 so the map picker has more options to render.
-    n_out = 5 if bail else 3
+    # On bail or any picker situation return top-5 so the map picker has more
+    # candidates to render. (We used to return 3 unless bailing, which left the
+    # P5 map picker under-populated whenever margin-bail tripped.)
+    n_out = 5 if (bail or show_picker) else 3
     out = candidates[:n_out]
     for c in out:
         c["bearing_offset_deg"] = c.get("bearing_difference")
@@ -193,7 +240,26 @@ async def run(
         if not c.get("name"):
             c["name"] = c.get("address") or (f"BIN {c.get('bin')}" if c.get("bin") else None)
 
+    # Fetch footprint GeoJSON whenever a picker will be shown so the iOS map
+    # picker can render polygons. Cheap query (~5 BINs by primary key).
+    fetch_geom_task = None
+    if bail or show_picker:
+        from services.geospatial_v2 import get_footprints_for_bins
+        fetch_geom_task = asyncio.create_task(
+            get_footprints_for_bins([str(c.get("bin") or "") for c in out])
+        )
+
     await _resolve_thumbnails(out)
+
+    if fetch_geom_task is not None:
+        try:
+            geom_by_bin = await fetch_geom_task
+            for c in out:
+                geo = geom_by_bin.get(str(c.get("bin") or ""))
+                if geo:
+                    c["footprint_geojson"] = geo
+        except Exception as e:
+            logger.warning(f"footprint geojson fetch failed: {e}")
 
     # ── 5. Telemetry ──────────────────────────────────────────────────────────
     verification_method = (

@@ -68,6 +68,7 @@ def _format_match_v3(c: dict) -> dict:
         "secondary_aesthetic": c.get("secondary_aesthetic"),
         "normalized_profile": c.get("normalized_profile"),
         "clip_similarity": c.get("clip_similarity"),
+        "footprint_geojson": c.get("footprint_geojson"),
     }
 
 # Scan data cache for confirmation flow
@@ -270,6 +271,7 @@ async def scan_building_v2(
             return {
                 "scan_id": scan_id, "matches": matches,
                 "show_picker": show_picker, "can_contribute": True,
+                "bail": pipeline_result.get("bail", False),
                 "verification_method": verification_method,
                 "processing_time_ms": total_time_ms,
                 "performance": {

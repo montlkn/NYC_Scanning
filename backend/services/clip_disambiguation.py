@@ -427,6 +427,21 @@ async def fetch_street_view_embedding(
         embedding = await encode_photo(image_bytes)
         embedding_list = embedding.tolist()
 
+        # Persist the source image to R2 BEFORE writing the cache row.
+        # Critical: without this, the embedding's image_key would point at a
+        # phantom file and we'd lose the ability to audit what CLIP encoded.
+        # If the upload fails, refuse to cache the embedding — a half-written
+        # cache entry is exactly what poisoned the embeddings table previously.
+        image_key = f"ondemand/{bin_val}/{int(cam_heading)}.jpg"
+        try:
+            from utils.storage import upload_image
+            await upload_image(image_bytes, image_key)
+        except Exception as upload_err:
+            logger.error(
+                f"Refusing to cache embedding for BIN {bin_val}: image upload failed: {upload_err}"
+            )
+            return (embedding_list, cost)
+
         # Cache the embedding for future use, tagged with the source that
         # produced it so we can audit cache composition.
         await cache_embedding(
