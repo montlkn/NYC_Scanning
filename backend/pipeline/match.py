@@ -42,6 +42,49 @@ _GROK_TEXT_EVIDENCE_KEYWORDS = (
 )
 _GROK_DIGIT_RE = re.compile(r"\b\d{2,5}\b")
 
+# Rowhouse-cluster threshold: when 2+ candidates fall within this radius of
+# each other (centroid-to-centroid), geometry alone cannot tell them apart and
+# we should fire the VLM even if bail/picker hasn't tripped. Tuned to the NYC
+# rowhouse footprint (~6m wide x 18m deep → adjacent centroids ≈ 8-12m apart).
+_GROK_CLUSTER_RADIUS_M = 15.0
+
+
+def _candidates_clustered_within(
+    candidates: List[Dict[str, Any]],
+    radius_m: float,
+) -> bool:
+    """True if any two candidates' centroids are within `radius_m` of each other."""
+    import math
+
+    def latlng(c: Dict[str, Any]) -> Optional[tuple[float, float]]:
+        la = c.get("geocoded_lat") or c.get("latitude")
+        ln = c.get("geocoded_lng") or c.get("longitude")
+        if la is None or ln is None:
+            return None
+        try:
+            return float(la), float(ln)
+        except (TypeError, ValueError):
+            return None
+
+    points = [p for p in (latlng(c) for c in candidates) if p is not None]
+    if len(points) < 2:
+        return False
+
+    R = 6371000.0
+    for i in range(len(points)):
+        la1, ln1 = points[i]
+        p1 = math.radians(la1)
+        for j in range(i + 1, len(points)):
+            la2, ln2 = points[j]
+            p2 = math.radians(la2)
+            dp = math.radians(la2 - la1)
+            dl = math.radians(ln2 - ln1)
+            a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+            d = 2 * R * math.asin(math.sqrt(a))
+            if d <= radius_m:
+                return True
+    return False
+
 
 def _has_textual_evidence(reason: Optional[str]) -> bool:
     """Grok's pick is trustworthy only when its reason cites readable marks
@@ -174,7 +217,21 @@ async def run(
     # and address numbers. Triggers only on ambiguous scans (~10-30% of total).
     grok_decision: Optional[str] = None
     grok_reason: Optional[str] = None
-    if _cfg.grok_disambig_enabled and (bail or show_picker) and len(candidates) >= 2:
+    # Trigger expanded 2026-05-15: bail/picker OR clustered candidates within
+    # ~15m. The rowhouse failure mode is geometrically indistinguishable
+    # centroids — we should fire the VLM there even when the top-1 confidence
+    # looks fine, because "looks fine" with twin neighbours is exactly when
+    # we get a confidently-wrong answer.
+    _grok_cluster_trigger = _candidates_clustered_within(
+        candidates[:5], _GROK_CLUSTER_RADIUS_M
+    )
+    if (
+        _cfg.grok_disambig_enabled
+        and (bail or show_picker or _grok_cluster_trigger)
+        and len(candidates) >= 2
+    ):
+        if _grok_cluster_trigger and not (bail or show_picker):
+            retrieval_meta["grok_trigger"] = "cluster_15m"
         try:
             grok_decision, grok_reason = await _try_grok_disambig(
                 photo_bytes=photo_bytes,

@@ -245,7 +245,7 @@ async def scan_building_v2(
 
             try:
                 await db.rollback()
-                scan = Scan(
+                scan_kwargs = dict(
                     id=scan_id, user_id=user_id, user_photo_url=user_photo_url,
                     gps_lat=gps_lat, gps_lng=gps_lng, gps_accuracy=gps_accuracy,
                     compass_bearing=compass_bearing, phone_pitch=phone_pitch, phone_roll=phone_roll,
@@ -254,11 +254,23 @@ async def scan_building_v2(
                     top_confidence=top_confidence,
                     confirmed_bin=auto_confirmed_bin,
                     confirmed_at=datetime.now(timezone.utc) if auto_confirmed_bin else None,
+                    verification_method="auto_confirm" if auto_confirmed_bin else None,
                     processing_time_ms=total_time_ms, num_candidates=len(raw_matches),
                     created_at=datetime.now(timezone.utc),
                 )
-                db.add(scan)
-                await db.commit()
+                try:
+                    scan = Scan(**scan_kwargs)
+                    db.add(scan)
+                    await db.commit()
+                except Exception as e:
+                    await db.rollback()
+                    if "verification_method" in str(e):
+                        scan_kwargs.pop("verification_method", None)
+                        scan = Scan(**scan_kwargs)
+                        db.add(scan)
+                        await db.commit()
+                    else:
+                        raise
                 _scan_cache[scan_id] = {
                     "photo_bytes": photo_bytes, "user_photo_url": user_photo_url,
                     "gps_lat": gps_lat, "gps_lng": gps_lng, "compass_bearing": compass_bearing,
@@ -575,6 +587,10 @@ async def confirm_building_v2(
     confirmed_bin: str = Form(..., description="BIN of confirmed building"),
     confirmation_time_ms: int = Form(None, description="Time taken to confirm (ms)"),
     user_id: str = Form(None, description="User ID for tracking"),
+    verification_method: str = Form(
+        "photo_banner",
+        description="How the confirmation happened: map_picker | list_picker | photo_banner | auto_confirm",
+    ),
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -625,18 +641,36 @@ async def confirm_building_v2(
             del _scan_cache[scan_id]
             logger.info(f"[{scan_id}] Photo discarded (not in top 3)")
 
-        # Update scan record
-        await db.execute(
-            update(Scan)
-            .where(Scan.id == scan_id)
-            .values(
-                confirmed_bin=confirmed_bin,
-                confirmed_at=datetime.now(timezone.utc),
-                confirmation_time_ms=confirmation_time_ms,
-                was_correct=was_correct
+        # Update scan record. verification_method is captured as gold-quality
+        # signal for the flywheel — map_picker rows are user-tap-accurate ground
+        # truth and seed the per-NYC fine-tune dataset. Tolerates the column
+        # not existing yet (during the rollout window before the ALTER TABLE).
+        update_values = {
+            "confirmed_bin": confirmed_bin,
+            "confirmed_at": datetime.now(timezone.utc),
+            "confirmation_time_ms": confirmation_time_ms,
+            "was_correct": was_correct,
+            "verification_method": verification_method,
+        }
+        try:
+            await db.execute(
+                update(Scan).where(Scan.id == scan_id).values(**update_values)
             )
-        )
-        await db.commit()
+            await db.commit()
+        except Exception as e:
+            await db.rollback()
+            if "verification_method" in str(e):
+                update_values.pop("verification_method", None)
+                await db.execute(
+                    update(Scan).where(Scan.id == scan_id).values(**update_values)
+                )
+                await db.commit()
+                logger.warning(
+                    f"[{scan_id}] scans.verification_method column missing — "
+                    "wrote confirmation without it. Run the Phase 7 ALTER TABLE."
+                )
+            else:
+                raise
 
         # Track confirmation + pipeline telemetry
         pipeline_telemetry.log_confirmation(

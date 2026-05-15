@@ -28,11 +28,13 @@ from io import BytesIO
 from models.config import get_settings
 from models.footprints_session import get_footprints_db
 from models.session import AsyncSessionLocal
+from pipeline.config import PipelineConfig
 from services.clip_matcher import encode_photo, get_model
 from services.geospatial_v2 import calculate_bearing
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+_pipeline_cfg = PipelineConfig()
 
 # Similarity threshold for confident match
 SIMILARITY_CONFIDENCE_THRESHOLD = 0.70  # 70% similarity = confident
@@ -70,6 +72,22 @@ async def disambiguate_candidates(
     """
     import time
     start_time = time.time()
+
+    # Short-circuit when CLIP carries no weight in the final blend. Avoids
+    # ~$0.007/BIN on cache-miss Street View fetches and 1-2s of encode time
+    # on every scan. Output would be multiplied by 0 in scoring.blend_scores
+    # anyway — see pipeline/config.py:45.
+    if _pipeline_cfg.w_clip_image == 0:
+        for c in candidates:
+            c.setdefault('clip_similarity', 0)
+            c.setdefault('embedding_source', None)
+        logger.info("CLIP disambig skipped: w_clip_image=0 (geometry-only mode)")
+        return {
+            'matches': candidates,
+            'method': 'skipped_w_clip_zero',
+            'cost_usd': 0.0,
+            'processing_time_ms': int((time.time() - start_time) * 1000),
+        }
 
     logger.info(
         f"CLIP disambiguating {len(candidates)} candidates: "
@@ -404,11 +422,13 @@ async def fetch_street_view_embedding(
 
         from services.reference_image_chain import fetch_reference_image
 
-        async def _google_fallback(lat: float, lng: float) -> Optional[bytes]:
-            return await fetch_street_view_image(lat, lng, cam_heading)
+        # Street View wants the *camera's* location, not the subject's — point
+        # the lens from across the street (centerline-derived pose) and aim at
+        # the building. Passing the building's lat/lng here would place the
+        # camera *inside* the building and produce useless frames.
+        async def _google_fallback(_lat: float, _lng: float) -> Optional[bytes]:
+            return await fetch_street_view_image(cam_lat, cam_lng, cam_heading)
 
-        # Chain searches near the camera point. Pass the building's true
-        # coordinate so Mapillary's pano-alignment scoring still aims at it.
         image_bytes, source_label = await fetch_reference_image(
             lat=building_lat,
             lng=building_lng,

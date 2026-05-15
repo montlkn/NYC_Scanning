@@ -125,7 +125,10 @@ app = modal.App("nyc-scan-api", image=image)
 
 
 @app.function(
-    gpu="T4",  # T4 GPU for fast CLIP inference (~2-3s vs 15-40s on CPU)
+    # CPU-only: CLIP is short-circuited on the live path (W_CLIP_IMAGE=0).
+    # Only thing left is FastAPI + Postgres + Grok HTTP calls + Pillow.
+    # Reinstate gpu="T4" if CLIP ever returns to the live path.
+    cpu=2.0,
     memory=4096,
     secrets=[modal.Secret.from_name("nyc-scan-secrets")],
     timeout=60,
@@ -135,7 +138,7 @@ app = modal.App("nyc-scan-api", image=image)
 @modal.concurrent(max_inputs=10)  # Batch requests to share container costs
 @modal.asgi_app()
 def fastapi_app():
-    """Deploy FastAPI application to Modal with T4 GPU for CLIP inference"""
+    """Deploy FastAPI application to Modal (CPU since CLIP is bypassed)."""
     import sys
     # Add backend directory to path so relative imports work
     sys.path.insert(0, "/root/backend")

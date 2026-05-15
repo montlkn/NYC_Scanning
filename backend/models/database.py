@@ -107,6 +107,10 @@ class Scan(Base):
     confirmed_bin = Column(String(10), ForeignKey('buildings_full_merge_scanning.bin'), index=True)
     was_correct = Column(Boolean)  # Did top match equal confirmed?
     confirmation_time_ms = Column(Integer)  # Time to confirm
+    # How the confirmation happened — 'map_picker' / 'list_picker' / 'photo_banner' /
+    # 'auto_confirm'. map_picker is gold-quality training data (user tapped the
+    # exact footprint on a map). See docs/scanning_strategy_2026-05-15.md flywheel.
+    verification_method = Column(String(20), index=True)
 
     # Performance metrics
     processing_time_ms = Column(Integer)
