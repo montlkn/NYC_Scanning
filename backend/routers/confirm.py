@@ -110,23 +110,45 @@ async def confirm_with_photo(
         # Mark this as user-contributed with image_key
         image_key = f"{confirmed_bin}/user_{scan_id}_{int(compass_bearing)}deg_{int(phone_pitch)}pitch.jpg"
 
-        insert_query = text("""
-            INSERT INTO reference_embeddings
-            (building_id, angle, pitch, embedding, image_key)
-            VALUES (:building_id, :angle, :pitch, :embedding, :image_key)
-            ON CONFLICT (building_id, angle, pitch)
-            DO UPDATE SET
-                embedding = :embedding,
-                image_key = :image_key
-        """)
-
-        await db.execute(insert_query, {
-            "building_id": building_id,
-            "angle": int(compass_bearing),
-            "pitch": int(phone_pitch),
-            "embedding": embedding.tolist(),
-            "image_key": image_key
-        })
+        try:
+            async with db.begin_nested():
+                await db.execute(
+                    text("""
+                        INSERT INTO reference_embeddings
+                        (building_id, angle, pitch, embedding, image_key)
+                        VALUES (:building_id, :angle, :pitch, :embedding, :image_key)
+                        ON CONFLICT (building_id, angle, pitch)
+                        DO UPDATE SET
+                            embedding = EXCLUDED.embedding,
+                            image_key = EXCLUDED.image_key,
+                            updated_at = NOW()
+                    """),
+                    {
+                        "building_id": building_id,
+                        "angle": int(compass_bearing),
+                        "pitch": int(phone_pitch),
+                        "embedding": embedding.tolist(),
+                        "image_key": image_key
+                    }
+                )
+        except Exception as upsert_err:
+            logger.warning(f"Upsert failed (constraint may be missing), trying INSERT OR IGNORE: {upsert_err}")
+            async with db.begin_nested():
+                await db.execute(
+                    text("""
+                        INSERT INTO reference_embeddings
+                        (building_id, angle, pitch, embedding, image_key)
+                        VALUES (:building_id, :angle, :pitch, :embedding, :image_key)
+                        ON CONFLICT DO NOTHING
+                    """),
+                    {
+                        "building_id": building_id,
+                        "angle": int(compass_bearing),
+                        "pitch": int(phone_pitch),
+                        "embedding": embedding.tolist(),
+                        "image_key": image_key
+                    }
+                )
 
         await db.commit()
 

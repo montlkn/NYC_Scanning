@@ -46,10 +46,10 @@ class Settings(BaseSettings):
     api_port: int = 8000
 
     # Scan Configuration
-    max_scan_distance_meters: int = 100
-    cone_angle_degrees: int = 90  # Wider cone for better accuracy with imperfect compass
+    max_scan_distance_meters: int = 150
+    cone_angle_degrees: int = 75  # Tighter cone for better precision
     max_candidates: int = 20
-    confidence_threshold: float = 0.70
+    confidence_threshold: float = 0.80
     landmark_boost_factor: float = 1.05
     proximity_boost_threshold: float = 30  # meters
     proximity_boost_factor: float = 1.10
@@ -62,8 +62,8 @@ class Settings(BaseSettings):
 
     # CLIP Model Configuration
     clip_model_name: str = "ViT-B-32"
-    clip_pretrained: str = "laion2b_s34b_b79k"
-    clip_device: str = "cuda"  # or "cpu"
+    clip_pretrained: str = "openai"  # Must match the weights used to generate DB embeddings
+    clip_device: str = "auto"  # Auto-detects GPU; clip_matcher uses torch.cuda.is_available()
 
     # Cache Configuration
     cache_ttl_seconds: int = 86400  # 24 hours

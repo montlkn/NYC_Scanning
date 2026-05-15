@@ -19,10 +19,21 @@ async def create_tables():
     """Create all tables defined in models"""
     settings = get_settings()
 
-    # Create async engine
-    # Convert postgresql:// to postgresql+asyncpg:// for async connection
-    database_url = settings.database_url.replace("postgresql://", "postgresql+asyncpg://")
-    engine = create_async_engine(database_url, echo=True)
+    # Use psycopg3 — asyncpg fails auth with Supabase Session pooler
+    database_url = settings.database_url
+    if database_url.startswith("postgres://"):
+        database_url = database_url.replace("postgres://", "postgresql+psycopg://", 1)
+    elif database_url.startswith("postgresql://"):
+        database_url = database_url.replace("postgresql://", "postgresql+psycopg://", 1)
+    import ssl
+    from sqlalchemy.pool import NullPool
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+    engine = create_async_engine(
+        database_url, echo=True, poolclass=NullPool,
+        connect_args={"sslmode": "require"}
+    )
 
     async with engine.begin() as conn:
         # Create all tables

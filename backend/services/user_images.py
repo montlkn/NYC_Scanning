@@ -131,30 +131,52 @@ async def add_user_image_to_references(
         building_row = result.fetchone()
 
         if not building_row:
-            logger.error(f"[{scan_id}] Building with BIN {clean_bin} not found in database")
+            logger.info(f"[{scan_id}] BIN {clean_bin} not in scan DB — skipping embedding (building outside dataset)")
             return False
 
         building_id = building_row[0]
 
-        # Insert into reference_embeddings table
-        # Schema: building_id, angle, pitch, embedding, image_key
-        insert_query = text("""
-            INSERT INTO reference_embeddings
-            (building_id, angle, pitch, embedding, image_key)
-            VALUES (:building_id, :angle, :pitch, :embedding, :image_key)
-            ON CONFLICT (building_id, angle, pitch)
-            DO UPDATE SET
-                embedding = :embedding,
-                image_key = :image_key
-        """)
-
-        await db.execute(insert_query, {
-            'building_id': building_id,
-            'angle': int(compass_bearing),
-            'pitch': int(phone_pitch),
-            'embedding': embedding_list,
-            'image_key': image_key,
-        })
+        # Insert into reference_embeddings table.
+        # Use a savepoint so a missing unique constraint doesn't abort the outer tx.
+        try:
+            async with db.begin_nested():
+                await db.execute(
+                    text("""
+                        INSERT INTO reference_embeddings
+                        (building_id, angle, pitch, embedding, image_key)
+                        VALUES (:building_id, :angle, :pitch, :embedding, :image_key)
+                        ON CONFLICT (building_id, angle, pitch)
+                        DO UPDATE SET
+                            embedding = EXCLUDED.embedding,
+                            image_key = EXCLUDED.image_key,
+                            updated_at = NOW()
+                    """),
+                    {
+                        'building_id': building_id,
+                        'angle': int(compass_bearing),
+                        'pitch': int(phone_pitch),
+                        'embedding': embedding_list,
+                        'image_key': image_key,
+                    }
+                )
+        except Exception as upsert_err:
+            logger.warning(f"[{scan_id}] Upsert failed (constraint may be missing), trying INSERT OR IGNORE: {upsert_err}")
+            async with db.begin_nested():
+                await db.execute(
+                    text("""
+                        INSERT INTO reference_embeddings
+                        (building_id, angle, pitch, embedding, image_key)
+                        VALUES (:building_id, :angle, :pitch, :embedding, :image_key)
+                        ON CONFLICT DO NOTHING
+                    """),
+                    {
+                        'building_id': building_id,
+                        'angle': int(compass_bearing),
+                        'pitch': int(phone_pitch),
+                        'embedding': embedding_list,
+                        'image_key': image_key,
+                    }
+                )
 
         await db.commit()
 

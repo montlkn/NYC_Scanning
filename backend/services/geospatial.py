@@ -259,15 +259,10 @@ def calculate_relevance_score(candidate: Dict[str, Any]) -> float:
     """
     score = 0.0
 
-    # Distance score (closer = better)
-    # 0-30m: 1.0, 30-60m: 0.5, 60+m: 0.2
+    # Distance score: exponential decay — 1.0 at 0m, 0.37 at 30m, 0.14 at 60m
     distance = candidate.get('distance_meters', float('inf'))
-    if distance < 30:
-        score += 1.0
-    elif distance < 60:
-        score += 0.5
-    else:
-        score += 0.2
+    distance_score = math.exp(-distance / 30.0)
+    score += distance_score * 1.5  # Weight distance more heavily than bearing
 
     # Bearing alignment score (more aligned = better)
     # 0-15°: 1.0, 15-30°: 0.5, 30+°: 0.2

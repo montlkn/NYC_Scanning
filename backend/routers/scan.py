@@ -2,7 +2,7 @@
 Scan API endpoints - Main building identification flow
 """
 
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, BackgroundTasks
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import update, select
@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 import uuid
 import logging
 import time
+import asyncio
 
 from models.database import Scan, ScanFeedback
 from models.session import get_db
@@ -57,7 +58,8 @@ async def scan_building(
     movement_type: str = Form(None, description="Movement type: stationary/walking/running"),
     gps_accuracy: float = Form(None, description="GPS accuracy in meters"),
     user_id: str = Form(None, description="Optional user ID for tracking"),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    background_tasks: BackgroundTasks = BackgroundTasks()
 ):
     """
     Main scan endpoint - identifies building from photo + GPS + compass
@@ -69,6 +71,7 @@ async def scan_building(
     4. CLIP comparison
     5. Return sorted matches
     """
+    _clean_old_cache_entries()
     start_time = datetime.now()
     scan_id = str(uuid.uuid4())
 
@@ -81,11 +84,15 @@ async def scan_building(
         if not (0 <= compass_bearing <= 360):
             raise HTTPException(status_code=400, detail="Invalid compass bearing")
 
+        if gps_accuracy and gps_accuracy > 30:
+            logger.warning(f"[SCAN] Poor GPS accuracy: {gps_accuracy:.1f}m — user {user_id}")
+
         logger.info(f"[{scan_id}] Starting scan at ({gps_lat}, {gps_lng}), bearing {compass_bearing}°, floor {floor}, confidence {confidence}%")
 
         # === STEP 1: Resize and upload user photo ===
         photo_start = time.time()
         photo_bytes = await photo.read()
+        read_time_ms = int((time.time() - photo_start) * 1000)
 
         # Resize image to reduce upload time (CLIP uses 224x224 anyway)
         from PIL import Image
@@ -105,37 +112,29 @@ async def scan_building(
         image.save(buffer, format='JPEG', quality=85, optimize=True)
         photo_bytes = buffer.getvalue()
 
-        logger.info(f"[{scan_id}] Resized image to {image.size}, size: {len(photo_bytes) / 1024:.1f}KB")
+        resize_time_ms = int((time.time() - photo_start) * 1000) - read_time_ms
+        logger.info(f"[{scan_id}] Resized image to {image.size}, {len(photo_bytes) / 1024:.1f}KB in {resize_time_ms}ms")
 
-        user_photo_url = await upload_image(
-            photo_bytes,
-            f"scans/{scan_id}.jpg",
-            create_thumbnail=True
-        )
-        upload_time_ms = int((time.time() - photo_start) * 1000)
-        logger.info(f"[{scan_id}] Photo processed and uploaded in {upload_time_ms}ms")
+        # === STEP 1+2: Upload photo AND geospatial query IN PARALLEL ===
+        async def _upload():
+            url = await upload_image(
+                photo_bytes,
+                f"scans/{scan_id}.jpg",
+                create_thumbnail=True
+            )
+            return url
 
-        # Cache scan data for confirmation flow (needed for re-embedding)
-        _clean_old_cache_entries()
-        _scan_cache[scan_id] = {
-            'photo_bytes': photo_bytes,
-            'user_photo_url': user_photo_url,
-            'gps_lat': gps_lat,
-            'gps_lng': gps_lng,
-            'compass_bearing': compass_bearing,
-            'phone_pitch': phone_pitch,
-            'user_id': user_id,
-            'timestamp': time.time(),
-        }
-        logger.info(f"[{scan_id}] Cached scan data for confirmation flow")
+        async def _geospatial():
+            return await geospatial.get_candidate_buildings(
+                db, gps_lat, gps_lng, compass_bearing, phone_pitch
+            )
 
-        # === STEP 2: Geospatial filtering ===
-        geo_start = time.time()
-        candidates = await geospatial.get_candidate_buildings(
-            db, gps_lat, gps_lng, compass_bearing, phone_pitch
-        )
-        geo_time_ms = int((time.time() - geo_start) * 1000)
-        logger.info(f"[{scan_id}] Found {len(candidates)} candidates in {geo_time_ms}ms")
+        parallel_start = time.time()
+        user_photo_url, candidates = await asyncio.gather(_upload(), _geospatial())
+        parallel_time_ms = int((time.time() - parallel_start) * 1000)
+        upload_time_ms = parallel_time_ms  # Combined timing
+        geo_time_ms = parallel_time_ms
+        logger.info(f"[{scan_id}] Upload + geospatial completed in {parallel_time_ms}ms (parallel), {len(candidates)} candidates")
 
         if len(candidates) == 0:
             logger.warning(f"[{scan_id}] No candidate buildings found - fetching address suggestions")
@@ -261,53 +260,80 @@ async def scan_building(
                 } if settings.debug else None
             }
 
-        # === STEP 4: CLIP comparison ===
+        # === STEP 4: CLIP comparison (pass raw bytes to skip R2 re-download) ===
         clip_start = time.time()
         matches = await clip_matcher.compare_images(
-            user_photo_url, candidates, reference_imgs
+            user_photo_url, candidates, reference_imgs,
+            user_photo_bytes=photo_bytes  # Pass raw bytes directly
         )
         clip_time_ms = int((time.time() - clip_start) * 1000)
         logger.info(f"[{scan_id}] CLIP comparison completed in {clip_time_ms}ms")
 
-        # === STEP 5: Store scan for analytics ===
+        # GPS fallback: if top result is low confidence, prepend nearest building by GPS
+        if matches and matches[0]['confidence'] < settings.confidence_threshold:
+            nearest = min(candidates, key=lambda c: c.get('distance_meters', 9999))
+            if nearest['bin'] not in {r['bin'] for r in matches}:
+                matches.insert(0, {**nearest, 'confidence': 0.0, 'is_gps_fallback': True})
+
+        # === STEP 5: Store scan for analytics (fire-and-forget) ===
         total_time_ms = int((datetime.now() - start_time).total_seconds() * 1000)
 
-        # Store scan in database for analytics
-        try:
-            scan = Scan(
-                id=scan_id,
-                user_id=user_id,
-                user_photo_url=user_photo_url,
-                gps_lat=gps_lat,
-                gps_lng=gps_lng,
-                gps_accuracy=gps_accuracy,
-                compass_bearing=compass_bearing,
-                phone_pitch=phone_pitch,
-                phone_roll=phone_roll,
-                candidate_bins=[m['bin'] for m in matches[:5]],
-                top_match_bin=matches[0]['bin'] if matches else None,
-                top_confidence=matches[0]['confidence'] if matches else 0,
-                processing_time_ms=total_time_ms,
-                num_candidates=len(candidates),
-                geospatial_query_ms=geo_time_ms,
-                image_fetch_ms=ref_time_ms,
-                clip_comparison_ms=clip_time_ms,
-                created_at=datetime.now(timezone.utc)
-            )
-            db.add(scan)
-            await db.commit()
-            logger.info(f"[{scan_id}] Scan stored in database")
-        except Exception as e:
-            logger.error(f"[{scan_id}] Failed to store scan in database: {e}")
-            # Don't fail the request if database storage fails
-            await db.rollback()
+        # Cache scan data for confirmation flow
+        _scan_cache[scan_id] = {
+            'photo_bytes': photo_bytes,
+            'user_photo_url': user_photo_url,
+            'gps_lat': gps_lat,
+            'gps_lng': gps_lng,
+            'compass_bearing': compass_bearing,
+            'phone_pitch': phone_pitch,
+            'user_id': user_id,
+            'timestamp': time.time(),
+        }
+
+        async def _store_scan():
+            try:
+                async with get_db() as store_db:
+                    scan = Scan(
+                        id=scan_id,
+                        user_id=user_id,
+                        user_photo_url=user_photo_url,
+                        gps_lat=gps_lat,
+                        gps_lng=gps_lng,
+                        gps_accuracy=gps_accuracy,
+                        compass_bearing=compass_bearing,
+                        phone_pitch=phone_pitch,
+                        phone_roll=phone_roll,
+                        candidate_bins=[m['bin'] for m in matches[:5]],
+                        top_match_bin=matches[0]['bin'] if matches else None,
+                        top_confidence=matches[0]['confidence'] if matches else 0,
+                        processing_time_ms=total_time_ms,
+                        num_candidates=len(candidates),
+                        geospatial_query_ms=geo_time_ms,
+                        image_fetch_ms=ref_time_ms,
+                        clip_comparison_ms=clip_time_ms,
+                        created_at=datetime.now(timezone.utc)
+                    )
+                    store_db.add(scan)
+                    await store_db.commit()
+            except Exception as e:
+                logger.error(f"[{scan_id}] Failed to store scan in database: {e}")
+
+        # Fire-and-forget: don't block the response
+        background_tasks.add_task(asyncio.create_task, _store_scan())
 
         # Determine if we should show picker UI
         show_picker = True
         if matches and matches[0]['confidence'] >= settings.confidence_threshold:
             show_picker = False
 
-        logger.info(f"[{scan_id}] Scan completed in {total_time_ms}ms")
+        logger.info(
+            f"[{scan_id}] ✅ SCAN COMPLETE {total_time_ms}ms | "
+            f"resize={resize_time_ms}ms upload+geo={parallel_time_ms}ms "
+            f"refs={ref_time_ms}ms clip={clip_time_ms}ms | "
+            f"{len(candidates)} candidates {len(reference_imgs)} refs "
+            f"top={matches[0]['confidence']:.2f} ({matches[0].get('bin','?')}) " if matches else
+            f"[{scan_id}] ✅ SCAN COMPLETE {total_time_ms}ms | no matches"
+        )
 
         # Track scan event for analytics
         track_result = {
@@ -333,16 +359,14 @@ async def scan_building(
             'can_contribute': can_contribute,  # NEW: Allow building contribution
             'processing_time_ms': total_time_ms,
             'performance': {
-                'upload_ms': upload_time_ms,
-                'geospatial_ms': geo_time_ms,
+                'total_ms': total_time_ms,
+                'resize_ms': resize_time_ms,
+                'upload_and_geo_ms': parallel_time_ms,
                 'reference_images_ms': ref_time_ms,
-                'clip_comparison_ms': clip_time_ms,
-            },
-            'debug_info': {
+                'clip_ms': clip_time_ms,
                 'num_candidates': len(candidates),
-                'num_reference_images': len(reference_imgs),
-                'num_matches': len(matches),
-            } if settings.debug else None
+                'num_refs': len(reference_imgs),
+            }
         }
 
     except HTTPException:
@@ -488,6 +512,23 @@ async def confirm_building(
 
             await db.commit()
             logger.info(f"[{scan_id}] Scan confirmation stored in database (was_correct={was_correct}, was_in_top_3={was_in_top_3})")
+
+            # Update hero_image_url if building doesn't have one yet
+            if was_in_top_3 and scan.user_photo_url:
+                try:
+                    from models.database import Building as BuildingModel
+                    await db.execute(
+                        update(BuildingModel)
+                        .where(BuildingModel.bin == confirmed_bin)
+                        .where(BuildingModel.hero_image_url == None)
+                        .values(hero_image_url=scan.user_photo_url)
+                    )
+                    await db.commit()
+                    logger.info(f"[{scan_id}] Set hero_image_url for BIN {confirmed_bin}")
+                except Exception as hero_err:
+                    logger.warning(f"[{scan_id}] Could not update hero_image_url: {hero_err}")
+                    await db.rollback()
+
         except Exception as e:
             logger.error(f"[{scan_id}] Failed to update scan confirmation: {e}")
             await db.rollback()

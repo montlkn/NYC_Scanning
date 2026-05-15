@@ -40,7 +40,7 @@ settings = get_settings()
 router = APIRouter()
 
 
-def _format_match_v3(c: dict, perception_dict: dict | None) -> dict:
+def _format_match_v3(c: dict) -> dict:
     """Format a pipeline-v3 candidate for the API response."""
     return {
         "bin": c.get("bin"),
@@ -210,15 +210,19 @@ async def scan_building_v2(
                 })
 
             raw_matches = pipeline_result["matches"]
-            perception_dict = pipeline_result.get("perception")
             show_picker = pipeline_result["show_picker"]
             verification_method = pipeline_result["verification_method"]
             total_time_ms = pipeline_result["processing_time_ms"]
 
-            matches = [_format_match_v3(c, perception_dict) for c in raw_matches]
+            matches = [_format_match_v3(c) for c in raw_matches]
+
+            # Skip lore generation when we're not confident which building it is.
+            # Lore for a wrong building wastes a Grok call and confuses telemetry;
+            # we'll regenerate after the user confirms via the map picker.
+            bailing = verification_method == "no_confident_match"
 
             # Lore generation for top match if missing
-            if matches and not matches[0].get("storytelling"):
+            if not bailing and matches and not matches[0].get("storytelling"):
                 top = matches[0]
                 try:
                     lore = await generate_building_lore(
@@ -268,7 +272,6 @@ async def scan_building_v2(
                 "show_picker": show_picker, "can_contribute": True,
                 "verification_method": verification_method,
                 "processing_time_ms": total_time_ms,
-                "perception": perception_dict,
                 "performance": {
                     "upload_ms": upload_time_ms,
                     "pipeline_ms": total_time_ms,

@@ -27,7 +27,6 @@ def log_scan(
     cone_deg: float,
     used_ring_fallback: bool,
     clip_method: str,
-    perception_summary: Optional[str],
     processing_time_ms: int,
     verification_method: str,
     top_confidence: float,
@@ -38,7 +37,6 @@ def log_scan(
         f"top3={top3_bins} "
         f"cone={cone_deg:.0f}° ring={used_ring_fallback} "
         f"clip={clip_method} "
-        f"perc='{perception_summary}' "
         f"conf={top_confidence:.3f} picker={show_picker} "
         f"{processing_time_ms}ms"
     )
@@ -49,7 +47,6 @@ def log_scan(
         "cone_deg": cone_deg,
         "used_ring_fallback": used_ring_fallback,
         "clip_method": clip_method,
-        "perception_summary": perception_summary,
         "show_picker": show_picker,
         "processing_time_ms": processing_time_ms,
         "verification_method": verification_method,

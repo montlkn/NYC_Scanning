@@ -34,6 +34,7 @@ class Building(Base):
     # Map to actual column names in the database
     latitude = Column('geocoded_lat', Text, nullable=True)
     longitude = Column('geocoded_lng', Text, nullable=True)
+    hero_image_url = Column(Text, nullable=True)
 
 
 class ReferenceImage(Base):

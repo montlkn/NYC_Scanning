@@ -5,6 +5,13 @@ Deploys FastAPI backend with GPU support for CLIP inference
 
 import modal
 
+
+def download_clip_weights():
+    """Bake CLIP weights into the image at build time — avoids HuggingFace download on cold start."""
+    import open_clip
+    open_clip.create_model_and_transforms('ViT-B-32', pretrained='openai')
+
+
 # Define the image with all dependencies
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -50,6 +57,7 @@ image = (
         "google-generativeai>=0.3.0",
     )
     .env({"PYTHONPATH": "/root"})
+    .run_function(download_clip_weights)
     .add_local_dir(
         "backend",
         remote_path="/root/backend",
@@ -77,6 +85,7 @@ scheduled_image = (
         "sqlalchemy==2.0.25",
         "geoalchemy2==0.14.3",
         "psycopg2-binary==2.9.9",
+        "psycopg[binary]==3.1.18",
         "asyncpg==0.29.0",
         "greenlet==3.0.3",
         # Image Processing & ML
@@ -93,6 +102,7 @@ scheduled_image = (
         "pydantic-settings==2.1.0",
     )
     .env({"PYTHONPATH": "/root"})
+    .run_function(download_clip_weights)
     .add_local_dir(
         "backend",
         remote_path="/root/backend",
@@ -115,18 +125,17 @@ app = modal.App("nyc-scan-api", image=image)
 
 
 @app.function(
-    # NO GPU - CLIP works on CPU (slower but ~60x cheaper)
-    # T4 GPU = $0.59/hour, CPU = ~$0.01/hour
-    cpu=2.0,  # 2 vCPUs for faster CPU inference
-    memory=4096,  # 4GB RAM for CLIP model
+    gpu="T4",  # T4 GPU for fast CLIP inference (~2-3s vs 15-40s on CPU)
+    memory=4096,
     secrets=[modal.Secret.from_name("nyc-scan-secrets")],
-    timeout=120,  # Allow more time since CPU is slower
-    scaledown_window=60,  # Container dies after 60s idle (saves $$$)
+    timeout=60,
+    scaledown_window=60,  # 1 min idle keep-alive (~$0.05/session vs $0.25 at 300s)
+    enable_memory_snapshot=True,
 )
 @modal.concurrent(max_inputs=10)  # Batch requests to share container costs
 @modal.asgi_app()
 def fastapi_app():
-    """Deploy FastAPI application to Modal - CPU only for cost optimization"""
+    """Deploy FastAPI application to Modal with T4 GPU for CLIP inference"""
     import sys
     # Add backend directory to path so relative imports work
     sys.path.insert(0, "/root/backend")
@@ -187,10 +196,24 @@ async def manual_reembed(force_all: bool = False):
 
     settings = get_settings()
 
-    # Convert postgresql:// to postgresql+asyncpg:// for async connection
-    database_url = settings.database_url.replace("postgresql://", "postgresql+asyncpg://")
+    # Use psycopg3 (not asyncpg) — Supabase Session pooler rejects asyncpg auth
+    database_url = settings.database_url
+    if database_url.startswith("postgres://"):
+        database_url = database_url.replace("postgres://", "postgresql+psycopg://", 1)
+    elif database_url.startswith("postgresql://"):
+        database_url = database_url.replace("postgresql://", "postgresql+psycopg://", 1)
 
-    engine = create_async_engine(database_url)
+    import ssl
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+
+    from sqlalchemy.pool import NullPool
+    engine = create_async_engine(
+        database_url,
+        poolclass=NullPool,
+        connect_args={"sslmode": "require"}
+    )
     async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
     async with async_session() as db:
@@ -227,10 +250,23 @@ async def create_tables():
 
     settings = get_settings()
 
-    # Convert postgresql:// to postgresql+asyncpg:// for async connection
-    database_url = settings.database_url.replace("postgresql://", "postgresql+asyncpg://")
+    # Use psycopg3 — asyncpg fails auth with Supabase Session pooler
+    database_url = settings.database_url
+    if database_url.startswith("postgres://"):
+        database_url = database_url.replace("postgres://", "postgresql+psycopg://", 1)
+    elif database_url.startswith("postgresql://"):
+        database_url = database_url.replace("postgresql://", "postgresql+psycopg://", 1)
 
-    engine = create_async_engine(database_url, echo=True)
+    import ssl
+    from sqlalchemy.pool import NullPool
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+
+    engine = create_async_engine(
+        database_url, echo=True, poolclass=NullPool,
+        connect_args={"sslmode": "require"}
+    )
 
     async with engine.begin() as conn:
         print("Creating tables...")
@@ -239,6 +275,7 @@ async def create_tables():
 
     await engine.dispose()
     return {"status": "success", "message": "Tables created"}
+
 
 
 if __name__ == "__main__":

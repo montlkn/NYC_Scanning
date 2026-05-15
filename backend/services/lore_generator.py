@@ -71,54 +71,63 @@ async def _get_raw_chunks(bin_val: str, building_name: Optional[str]) -> Optiona
         return None
 
 
-async def _synthesize_with_gemini(
+async def _synthesize_with_grok(
     raw_text: str,
     building_name: Optional[str],
+    address: Optional[str],
     year_built: Optional[str],
     style: Optional[str],
-    architect: Optional[str]
+    architect: Optional[str],
 ) -> Optional[str]:
-    """Use Gemini to synthesize raw PDF/Wikipedia chunks into punchy app-quality copy."""
-    api_key = os.getenv('GEMINI_API_KEY')
-    if not api_key:
-        logger.warning("GEMINI_API_KEY not set — skipping synthesis")
-        return None
-    try:
-        import google.generativeai as genai
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.0-flash')
+    """Use Grok to synthesize raw LPC/Wikipedia chunks into punchy, grounded copy."""
+    from services.grok import grok_text
 
-        meta_parts = []
-        if building_name and building_name != '0':
-            meta_parts.append(building_name)
-        if year_built:
-            meta_parts.append(year_built)
-        if style:
-            meta_parts.append(style)
-        if architect:
-            meta_parts.append(f"architect: {architect}")
-        meta_line = ', '.join(meta_parts) if meta_parts else 'Unknown NYC building'
+    meta_parts = []
+    if building_name and building_name != '0':
+        meta_parts.append(building_name)
+    if address:
+        meta_parts.append(address)
+    if year_built:
+        meta_parts.append(str(year_built))
+    if style:
+        meta_parts.append(str(style))
+    if architect:
+        meta_parts.append(f"architect: {architect}")
+    meta_line = ', '.join(meta_parts) if meta_parts else 'NYC building'
 
-        prompt = (
-            "You are writing for Jink, a stylish NYC architecture discovery app. "
-            "Given raw source material about a building, extract the most interesting, "
-            "surprising, and historically rich details. Write 3-4 punchy sentences that "
-            "feel like a knowledgeable friend telling you about this place — not a textbook. "
-            "Lead with the most fascinating fact. Skip boilerplate like designation dates, "
-            "LP numbers, legal language. Focus on: who built it and why, what made it "
-            "architecturally daring or significant, any surprising history or cultural resonance.\n\n"
-            f"Building: {meta_line}\n"
-            f"Source material:\n{raw_text}"
-        )
-
-        response = model.generate_content(prompt)
-        result = response.text.strip() if response.text else None
-        if result and len(result) > 30:
-            logger.info(f"Synthesized lore for '{building_name}'")
-            return result
-    except Exception as e:
-        logger.warning(f"Gemini synthesis failed: {e}")
+    system = (
+        "You are an architecture writer for Jink, a NYC discovery app. Write "
+        "in the voice of a knowledgeable friend, not a textbook. Strict "
+        "grounding rules: every factual claim (year, architect, style, "
+        "designation, tenant, history) must come from the source material or "
+        "a verifiable web search of THIS specific building. Do not invent "
+        "names, dates, or events. If the source material doesn't have "
+        "anything beyond generic district designation, say so plainly using "
+        "only the verified building fields — don't pad with filler.\n\n"
+        "Hard bans: 'rose amid', 'quiet sentinel', 'bustling streets', "
+        "'whisper of jazz', 'sentinel on a street', 'time capsule', "
+        "'frozen in time', 'turn-of-the-century dreams'. No clichés. No "
+        "markdown, no bullets, no headers."
+    )
+    user = (
+        "Write 3-4 punchy sentences about this NYC building. Lead with the "
+        "most specific, verifiable, building-specific fact in the source. "
+        "Skip designation dates, LP numbers, and district-level language "
+        "unless they are the building's defining feature. Focus on: who "
+        "built it and why, what makes it architecturally specific, any "
+        "verifiable history or named tenant.\n\n"
+        f"Building: {meta_line}\n"
+        f"Source material:\n{raw_text}"
+    )
+    result = await grok_text(system=system, user=user, max_tokens=300, temperature=0.3)
+    if result and len(result) > 30:
+        logger.info(f"Grok synthesised lore for '{building_name or address}'")
+        return result.strip()
     return None
+
+
+# Back-compat alias — old callers still use _synthesize_with_gemini name.
+_synthesize_with_gemini = _synthesize_with_grok
 
 
 async def _wikipedia_fetch(query: str) -> Optional[str]:
@@ -167,55 +176,63 @@ async def _get_lore_from_wikipedia(
     return None
 
 
-async def _get_lore_from_gemini(
+async def _get_lore_from_grok(
     building_name: Optional[str],
+    address: Optional[str],
     year_built: Optional[str],
     style: Optional[str],
     architect: Optional[str],
-    materials: Optional[str]
+    materials: Optional[str],
 ) -> Optional[str]:
-    """Use Gemini Flash to generate 2-3 sentences of architectural lore."""
-    api_key = os.getenv('GEMINI_API_KEY')
-    if not api_key:
-        logger.warning("GEMINI_API_KEY not set — skipping Gemini lore generation")
+    """Use Grok (with web search) to generate grounded lore from building fields.
+    Last-resort fallback when no LPC chunks and no Wikipedia hit existed.
+    Search is enabled so Grok can verify named tenants, recent history, etc.
+    """
+    from services.grok import grok_text
+
+    fields = []
+    if building_name and building_name != '0':
+        fields.append(f"Name: {building_name}")
+    if address:
+        fields.append(f"Address: {address}")
+    if year_built:
+        fields.append(f"Year built: {year_built}")
+    if style:
+        fields.append(f"Architectural style: {style}")
+    if architect:
+        fields.append(f"Architect: {architect}")
+    if materials:
+        fields.append(f"Primary materials: {materials}")
+    if not fields:
         return None
-    try:
-        import google.generativeai as genai
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.0-flash')
 
-        fields = []
-        if building_name and building_name != '0':
-            fields.append(f"Name: {building_name}")
-        if year_built:
-            fields.append(f"Year built: {year_built}")
-        if style:
-            fields.append(f"Architectural style: {style}")
-        if architect:
-            fields.append(f"Architect: {architect}")
-        if materials:
-            fields.append(f"Primary materials: {materials}")
-
-        if not fields:
-            return None
-
-        prompt = (
-            "You are writing for Jink, a stylish NYC architecture discovery app. "
-            "Write 3-4 punchy sentences about this NYC building that feel like a knowledgeable "
-            "friend telling you about this place — not a textbook. Lead with the most fascinating "
-            "fact. Focus on: who built it and why, what made it architecturally daring or "
-            "significant, any surprising history or cultural resonance.\n\n"
-            + '\n'.join(fields)
-        )
-
-        response = model.generate_content(prompt)
-        text_out = response.text.strip() if response.text else None
-        if text_out and len(text_out) > 30:
-            logger.info(f"Gemini generated lore for '{building_name}'")
-            return text_out
-    except Exception as e:
-        logger.warning(f"Gemini lore generation failed: {e}")
+    system = (
+        "You are an architecture writer for Jink, a NYC discovery app. Write "
+        "in the voice of a knowledgeable friend, not a textbook. Strict "
+        "grounding rules: every factual claim must come from the building "
+        "fields below or a verifiable web search of THIS specific address. "
+        "Do not invent names, dates, events, or details. If after searching "
+        "you find nothing specific, write a concise description using only "
+        "the verified fields — no filler.\n\n"
+        "Hard bans: 'rose amid', 'quiet sentinel', 'bustling streets', "
+        "'whisper of jazz', 'sentinel on a street', 'time capsule', "
+        "'frozen in time'. No clichés. No markdown."
+    )
+    user = (
+        "Write 3-4 punchy sentences about this NYC building. Search the web "
+        "to find documented history of this exact address. Only state facts "
+        "you can ground in the fields or a verified web source.\n\n"
+        + '\n'.join(fields)
+    )
+    result = await grok_text(system=system, user=user, max_tokens=300, temperature=0.3)
+    if result and len(result) > 30:
+        logger.info(f"Grok generated lore for '{building_name or address}'")
+        return result.strip()
     return None
+
+
+# Back-compat alias — old callers still use _get_lore_from_gemini name.
+_get_lore_from_gemini = _get_lore_from_grok
 
 
 async def _cache_storytelling(session: AsyncSession, bin_val: str, lore: str):
@@ -253,10 +270,10 @@ async def generate_building_lore(
     Returns lore string or None if all sources fail.
     Caches result back to DB by default so next scan is instant.
     """
-    # 1. Landmark chunks (LPC-sourced, free) — stored on Railway → synthesize with Gemini
+    # 1. Landmark chunks (LPC-sourced, free) — stored on Railway → synthesize with Grok
     raw = await _get_raw_chunks(bin_val, building_name)
     if raw:
-        lore = await _synthesize_with_gemini(raw, building_name, year_built, style, architect)
+        lore = await _synthesize_with_grok(raw, building_name, address, year_built, style, architect)
         if not lore:
             lore = raw  # fallback to raw if synthesis fails
         if cache_to_db:
@@ -267,15 +284,15 @@ async def generate_building_lore(
     if building_name or address:
         raw = await _get_lore_from_wikipedia(building_name, address)
         if raw:
-            lore = await _synthesize_with_gemini(raw, building_name, year_built, style, architect)
+            lore = await _synthesize_with_grok(raw, building_name, address, year_built, style, architect)
             if not lore:
                 lore = raw
             if cache_to_db:
                 await _cache_storytelling(session, bin_val, lore)
             return lore
 
-    # 3. Gemini generation from building fields (pure generation, last resort)
-    lore = await _get_lore_from_gemini(building_name, year_built, style, architect, materials)
+    # 3. Grok generation from building fields + web search (pure generation, last resort)
+    lore = await _get_lore_from_grok(building_name, address, year_built, style, architect, materials)
     if lore:
         if cache_to_db:
             await _cache_storytelling(session, bin_val, lore)

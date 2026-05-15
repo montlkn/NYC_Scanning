@@ -188,11 +188,15 @@ async def _fetch_street_view_for_candidates(
     """
     import asyncio
 
-    logger.info(f"Fetching Street View images for {len(candidates)} candidates")
+    max_fetches = 3
+    candidates_to_fetch = candidates[:max_fetches]
+    if len(candidates) > max_fetches:
+        logger.info(f"Capping Street View fetches at {max_fetches} (had {len(candidates)} candidates)")
+    logger.info(f"Fetching Street View images for {len(candidates_to_fetch)} candidates")
 
     # Fetch images in parallel for speed
     tasks = []
-    for candidate in candidates:
+    for candidate in candidates_to_fetch:
         task = reference_images.fetch_street_view(
             lat=candidate['latitude'],
             lng=candidate['longitude'],
@@ -202,7 +206,7 @@ async def _fetch_street_view_for_candidates(
         )
         tasks.append((candidate['bin'], task))
 
-    # Execute all fetches in parallel
+    # Execute all fetches in parallel (capped at max_fetches)
     results = await asyncio.gather(*[task for _, task in tasks], return_exceptions=True)
 
     # Build reference image dict

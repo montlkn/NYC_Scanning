@@ -1,60 +1,35 @@
 """
-Multi-signal scoring, softmax calibration, and picker-trigger decision.
+Two-signal scoring, softmax calibration, and picker-trigger decision.
 
-Score formula (all weights in pipeline/config.py):
-    raw = w_f·footprint + w_v·clip_image + w_p·clip_perception
-        + w_g·ground_plane - w_o·occlusion_penalty
-
-Then temperature-scaled softmax so outputs sum to 1.
-Picker is triggered by margin (top1 - top2) or absolute threshold — not by
-a raw percentage — so the user only sees a choice when it actually matters.
+Score formula:
+    raw = w_footprint·footprint + w_clip_image·clip_image
 """
 
 import numpy as np
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 from pipeline.config import get_pipeline_config
-from pipeline.perception import PerceptionAttributes, perception_match_score
 
 logger = logging.getLogger(__name__)
 _cfg = get_pipeline_config()
 
 
-def blend_scores(
-    candidates: List[Dict[str, Any]],
-    perception: Optional[PerceptionAttributes],
-    phone_pitch: float,
-    user_bearing: float,
-) -> List[Dict[str, Any]]:
+def blend_scores(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Compute raw blended score for each candidate.
     Adds 'raw_score' and 'score_breakdown' keys.
     """
-    from pipeline.retrieval import ground_plane_score  # avoid circular at module level
-
     for c in candidates:
-        fp = (c.get("footprint_score") or 0.0) / 100.0  # normalise 0-100 → 0-1
+        fp = (c.get("footprint_score") or 0.0) / 100.0       # normalise 0-100 → 0-1
         clip_img = (c.get("clip_similarity") or 0.0) / 100.0
-        gp = ground_plane_score(c, phone_pitch, user_bearing)
 
-        perc_score = 0.0
-        if perception is not None:
-            perc_score = perception_match_score(perception, c)
-
-        raw = (
-            _cfg.w_footprint * fp
-            + _cfg.w_clip_image * clip_img
-            + _cfg.w_clip_perception * perc_score
-            + _cfg.w_ground_plane * gp
-        )
+        raw = _cfg.w_footprint * fp + _cfg.w_clip_image * clip_img
 
         c["raw_score"] = round(raw, 4)
         c["score_breakdown"] = {
             "footprint": round(_cfg.w_footprint * fp, 4),
             "clip_image": round(_cfg.w_clip_image * clip_img, 4),
-            "clip_perception": round(_cfg.w_clip_perception * perc_score, 4),
-            "ground_plane": round(_cfg.w_ground_plane * gp, 4),
         }
 
     return candidates
@@ -83,20 +58,27 @@ def calibrate(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def sort_and_decide_picker(
     candidates: List[Dict[str, Any]]
-) -> tuple[List[Dict[str, Any]], bool]:
+) -> tuple[List[Dict[str, Any]], bool, bool]:
     """
-    Sort by confidence descending. Decide whether to show the picker.
-    Returns (sorted_candidates, show_picker).
+    Sort by confidence descending. Decide:
+      - whether to show the percentage-style picker (close call between candidates), and
+      - whether to bail to the map-picker UX (no candidate is confidently right).
+
+    Returns (sorted_candidates, show_picker, bail).
+    `bail=True` means top-1 confidence is below the no_confident_match threshold
+    and the client should route to the map picker (P5) instead of trusting any
+    of the listed candidates.
     """
     candidates = sorted(candidates, key=lambda x: x.get("confidence", 0), reverse=True)
 
     if not candidates:
-        return candidates, True
+        return candidates, True, True
 
     top = candidates[0]["confidence"]
+    bail = top < _cfg.no_confident_match_threshold
 
     if len(candidates) == 1:
-        return candidates, top < _cfg.picker_abs_threshold
+        return candidates, top < _cfg.picker_abs_threshold, bail
 
     margin = top - candidates[1]["confidence"]
     show_picker = (
@@ -104,4 +86,4 @@ def sort_and_decide_picker(
         or top < _cfg.picker_abs_threshold
     )
 
-    return candidates, show_picker
+    return candidates, show_picker, bail

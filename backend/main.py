@@ -72,8 +72,12 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing footprints database connection (Railway)...")
     init_footprints_engine()
 
-    # CLIP model will lazy-load on first scan request to save memory
-    logger.info("⏳ CLIP model will load on first scan request (lazy loading)")
+    # Pre-warm CLIP model so first scan request doesn't pay the load penalty
+    logger.info("⏳ Pre-warming CLIP model...")
+    import asyncio
+    from services.clip_matcher import get_model
+    await asyncio.to_thread(get_model)
+    logger.info("✅ CLIP model ready")
 
     yield
 

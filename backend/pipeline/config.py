@@ -23,22 +23,29 @@ class PipelineConfig:
     cone_gps_threshold_m: float = 15.0          # below this: no widening
     cone_heading_scale: float = 1.0              # deg of cone per deg of heading accuracy
     cone_ultrawide_bonus: float = 20.0
+    # iPhone GPS in urban canyons can be off by 30–80m while reporting a tiny
+    # `gps_accuracy`. We floor the value before the cone calculation so the
+    # cone widens enough to recover. Applied globally — slightly wider cones
+    # outside dense areas are an acceptable cost.
+    gps_accuracy_floor_m: float = float(os.environ.get("PIPELINE_GPS_FLOOR_M", 50))
 
-    # Ring fallback — now also triggered when picker margin is thin (see match.py).
-    # Threshold lowered: wrong NYC brownstones CLIP at 0.60-0.75 each, so 0.55 never fired.
-    # 0.35 catches genuinely low-confidence cone results; picker_ambiguous catches the rest.
-    ring_fallback_clip_threshold: float = float(os.environ.get("PIPELINE_RING_THRESH", 0.35))
+    # Ring fallback — only fires for genuinely sparse/low-signal cone results.
+    # The previous "fire when picker is ambiguous" trigger lived in match.py and
+    # was responsible for ~3 live Street View fetches per scan (the picker spinner).
+    ring_fallback_clip_threshold: float = float(os.environ.get("PIPELINE_RING_THRESH", 0.30))
     ring_fallback_min_candidates: int = 2        # also trigger if fewer than N returned
 
     # ─── Scoring weights ───────────────────────────────────────────────────────
-    w_footprint: float = float(os.environ.get("PIPELINE_W_FOOTPRINT", 0.25))
-    w_clip_image: float = float(os.environ.get("PIPELINE_W_CLIP_IMAGE", 0.35))
-    w_clip_perception: float = float(os.environ.get("PIPELINE_W_CLIP_PERC", 0.25))
-    w_ground_plane: float = float(os.environ.get("PIPELINE_W_GROUND", 0.10))
-    w_occlusion: float = float(os.environ.get("PIPELINE_W_OCCL", 0.05))  # subtracted
+    # Two-signal blend. After P3 widened the CLIP pool to the full cone, we
+    # found that CLIP-on-brownstones can rank a cross-block building higher
+    # than the actual target. Footprint geometry (distance + alignment) is the
+    # right tiebreaker for those cases — buildings on the wrong block should
+    # not win on CLIP alone. So footprint gets nontrivial weight.
+    w_footprint: float = float(os.environ.get("PIPELINE_W_FOOTPRINT", 0.45))
+    w_clip_image: float = float(os.environ.get("PIPELINE_W_CLIP_IMAGE", 0.55))
 
     # ─── Calibration ──────────────────────────────────────────────────────────
-    softmax_temperature: float = float(os.environ.get("PIPELINE_TEMP", 0.08))
+    softmax_temperature: float = float(os.environ.get("PIPELINE_TEMP", 0.25))
 
     # ─── Picker trigger ───────────────────────────────────────────────────────
     # Show picker when top1 - top2 margin (after softmax) is below this
@@ -46,12 +53,18 @@ class PipelineConfig:
     # Also show picker if top-1 absolute calibrated confidence is below this
     picker_abs_threshold: float = float(os.environ.get("PIPELINE_PICKER_ABS", 0.55))
 
-    # ─── Perception (CLIP zero-shot) ──────────────────────────────────────────
-    perception_top_k: int = int(os.environ.get("PIPELINE_PERC_K", 3))
-    perception_vocab_path: str = os.environ.get(
-        "PIPELINE_VOCAB_PATH",
-        "/root/backend/data/perception_vocab.yaml"
-    )
+    # ─── CLIP-primary retrieval (P3) ──────────────────────────────────────────
+    # Fast path: skip CLIP-ranking the rest of the cone if the top-3 already
+    # has a clear winner. "Clear" = top-1 CLIP >= threshold AND gap to #2 >= margin.
+    fast_path_clip_threshold: float = float(os.environ.get("PIPELINE_FASTPATH_CLIP", 0.75))
+    fast_path_clip_margin: float = float(os.environ.get("PIPELINE_FASTPATH_MARGIN", 0.15))
+    # When fast path doesn't fire, expand CLIP comparison to this many candidates.
+    # Most will hit cached embeddings (F1) so the cost is minimal.
+    full_cone_clip_pool: int = int(os.environ.get("PIPELINE_FULL_CONE_POOL", 10))
+    # Bail to map picker when top-1 calibrated confidence is below this even
+    # after the full cone has been CLIP-ranked. Tuned to "no answer is better
+    # than a confidently wrong one."
+    no_confident_match_threshold: float = float(os.environ.get("PIPELINE_BAIL_CONF", 0.50))
 
     # ─── Thumbnails ───────────────────────────────────────────────────────────
     r2_aerial_template: str = (

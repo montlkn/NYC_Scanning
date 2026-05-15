@@ -7,42 +7,57 @@ import httpx
 import logging
 from typing import List, Dict, Any
 
+from models.config import get_settings
+
 logger = logging.getLogger(__name__)
+settings = get_settings()
 
 _model = None
 _preprocess = None
 
+def _get_device():
+    """Auto-detect GPU availability, falling back to CPU."""
+    if torch.cuda.is_available():
+        logger.info("Using CUDA GPU for CLIP inference")
+        return "cuda"
+    return "cpu"
+
 def get_model():
     global _model, _preprocess
     if _model is None:
-        logger.info('Loading CLIP model (ViT-B-32)...')
+        device = _get_device()
+        logger.info(f'Loading CLIP model ({settings.clip_model_name}, pretrained={settings.clip_pretrained}) on {device}...')
         _model, _, _preprocess = open_clip.create_model_and_transforms(
-            'ViT-B-32',
-            pretrained='openai'
+            settings.clip_model_name,
+            pretrained=settings.clip_pretrained
         )
-        _model.eval()
-        logger.info('✅ CLIP model loaded')
+        _model = _model.to(device).eval()
+        logger.info(f'✅ CLIP model loaded on {device}')
     return _model, _preprocess
 
-async def encode_photo(photo_bytes):
-    """Encode a photo into a CLIP embedding"""
+def _encode_photo_sync(photo_bytes):
+    """Synchronous CLIP encoding — run via asyncio.to_thread to avoid blocking the event loop"""
     model, preprocess = get_model()
-
+    device = _get_device()
     image = Image.open(BytesIO(photo_bytes))
-    image_tensor = preprocess(image).unsqueeze(0)
-
+    image_tensor = preprocess(image).unsqueeze(0).to(device)
     with torch.no_grad():
         embedding = model.encode_image(image_tensor)
-
-    # Normalize
     embedding = embedding / embedding.norm(dim=-1, keepdim=True)
     return embedding.cpu().numpy()[0]
+
+
+async def encode_photo(photo_bytes):
+    """Encode a photo into a CLIP embedding (non-blocking)"""
+    import asyncio
+    return await asyncio.to_thread(_encode_photo_sync, photo_bytes)
 
 
 async def compare_images(
     user_photo_url: str,
     candidates: List[Dict[str, Any]],
-    reference_data: Dict[str, List[Dict[str, Any]]]
+    reference_data: Dict[str, List[Dict[str, Any]]],
+    user_photo_bytes: bytes = None
 ) -> List[Dict[str, Any]]:
     """
     Compare user photo against reference images using CLIP embeddings
@@ -54,16 +69,20 @@ async def compare_images(
             Each dict can contain either:
             - 'embedding': Pre-computed embedding from database
             - 'image_bytes': Raw image bytes (for lazy-fetched Street View)
+        user_photo_bytes: Optional raw bytes of user photo (skip download if provided)
 
     Returns:
         List of matches sorted by confidence score
     """
     logger.info(f"🔍 Comparing user photo against {len(reference_data)} buildings with reference images")
 
-    # Download and encode user photo
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(user_photo_url)
-        user_photo_bytes = response.content
+    # Use raw bytes if available, otherwise download from R2
+    if user_photo_bytes is not None:
+        logger.info("Using pre-loaded user photo bytes (skipping R2 download)")
+    else:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(user_photo_url)
+            user_photo_bytes = response.content
 
     user_embedding = await encode_photo(user_photo_bytes)
 

@@ -33,8 +33,13 @@ def adaptive_cone(
     """
     cone = _cfg.base_cone_deg
 
-    if gps_accuracy_m and gps_accuracy_m > _cfg.cone_gps_threshold_m:
-        cone += min(40, (gps_accuracy_m - _cfg.cone_gps_threshold_m) * _cfg.cone_gps_scale)
+    # Floor reported accuracy because CoreLocation under-reports error in urban
+    # canyons. Without this, a phone "reporting" 8m accuracy but actually 60m off
+    # produces a tight cone that misses the right building entirely.
+    effective_gps_m = max(gps_accuracy_m or 0.0, _cfg.gps_accuracy_floor_m)
+
+    if effective_gps_m > _cfg.cone_gps_threshold_m:
+        cone += min(40, (effective_gps_m - _cfg.cone_gps_threshold_m) * _cfg.cone_gps_scale)
 
     if heading_accuracy_deg and heading_accuracy_deg > 10:
         cone += min(30, heading_accuracy_deg * _cfg.cone_heading_scale)
@@ -167,33 +172,6 @@ async def ring_query(
     except Exception as e:
         logger.error(f"Ring fallback query failed: {e}", exc_info=True)
         return []
-
-
-def ground_plane_score(
-    candidate: Dict[str, Any],
-    phone_pitch: float,
-    user_bearing: float
-) -> float:
-    """
-    When phone is near horizontal (|pitch| < 25°), the user is shooting a facade
-    across the street.  Buildings whose centroid is roughly opposite the user's
-    bearing get a small boost; those behind the user get a penalty.
-
-    Returns [0, 1] — 0.5 is neutral.
-    """
-    bearing_diff = candidate.get("bearing_difference")
-    if bearing_diff is None:
-        return 0.5
-
-    abs_diff = abs(bearing_diff)
-
-    if abs(phone_pitch) > 40:
-        # Looking up or down — bearing matters less; don't apply ground-plane bias
-        return 0.5
-
-    # Smooth falloff: facing = 1.0, 90° off = 0.5, 180° (behind) = 0.0
-    score = 1.0 - (abs_diff / 180.0)
-    return float(max(0.0, min(1.0, score)))
 
 
 def _row_to_candidate(row) -> Dict[str, Any]:

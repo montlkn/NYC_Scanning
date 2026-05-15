@@ -27,6 +27,7 @@ from io import BytesIO
 
 from models.config import get_settings
 from models.footprints_session import get_footprints_db
+from models.session import AsyncSessionLocal
 from services.clip_matcher import encode_photo, get_model
 from services.geospatial_v2 import calculate_bearing
 
@@ -86,33 +87,39 @@ async def disambiguate_candidates(
             'error': 'Failed to encode user photo'
         }
 
-    # Get reference embeddings for each candidate
-    candidate_embeddings = {}
+    # Get reference embeddings for each candidate — fetch in parallel
     method_used = 'cached_embeddings'
     total_cost = 0.0
 
-    for candidate in candidates:
-        bin_val = candidate.get('bin')
-        if not bin_val:
+    bins_with_data = [(c.get('bin'), c) for c in candidates if c.get('bin')]
+
+    # Each embedding fetch gets its own session — sharing one session across
+    # concurrent asyncio tasks causes "concurrent operations not permitted" errors.
+    async def _get_embedding(bin_val):
+        async with AsyncSessionLocal() as own_session:
+            return bin_val, await get_or_create_embedding(
+                session=own_session,
+                bin_val=bin_val,
+                user_lat=user_lat,
+                user_lng=user_lng,
+                user_bearing=user_bearing
+            )
+
+    import asyncio
+    results = await asyncio.gather(*[_get_embedding(b) for b, _ in bins_with_data], return_exceptions=True)
+
+    candidate_embeddings = {}
+    for item in results:
+        if isinstance(item, Exception):
+            logger.warning(f"Embedding fetch failed: {item}")
             continue
-
-        # Try to get embedding from cache first
-        embedding, source, cost = await get_or_create_embedding(
-            session=session,
-            bin_val=bin_val,
-            user_lat=user_lat,
-            user_lng=user_lng,
-            user_bearing=user_bearing
-        )
-
+        bin_val, (embedding, source, cost) = item
         if embedding is not None:
             candidate_embeddings[bin_val] = {
                 'embedding': embedding,
                 'source': source
             }
             total_cost += cost
-
-            # Track method (prioritize showing most expensive method used)
             if source == 'street_view' and method_used != 'street_view':
                 method_used = 'street_view'
             elif source == 'user_images' and method_used == 'cached_embeddings':
@@ -241,33 +248,36 @@ async def check_reference_embeddings(
     """
     Check reference_embeddings table for pre-computed embeddings.
 
-    Prefers embeddings closest to user's viewing angle.
+    Prefers embeddings closest to user's viewing angle. Keyed by BIN directly
+    so the cache works for every PLUTO BIN, not just those curated into
+    buildings_full_merge_scanning.
+
+    Uses a dedicated session so a poisoned parent transaction can't break the
+    lookup (the disambig flow shares one session across multiple checks and
+    a failure anywhere upstream would otherwise prevent every cache hit).
     """
     try:
-        # Query for embeddings, preferring angles close to user bearing
-        result = await session.execute(
-            text("""
-                SELECT re.embedding, re.angle
-                FROM reference_embeddings re
-                JOIN buildings_full_merge_scanning b ON b.id = re.building_id
-                WHERE REPLACE(b.bin, '.0', '') = :bin
-                ORDER BY ABS(re.angle - :bearing)
-                LIMIT 1
-            """),
-            {'bin': bin_val, 'bearing': user_bearing}
-        )
-
-        row = result.fetchone()
-        if row and row[0]:
-            # Parse embedding from string/list
-            embedding = row[0]
-            if isinstance(embedding, str):
-                import json
-                embedding = json.loads(embedding)
-            return embedding
+        async with AsyncSessionLocal() as read_session:
+            result = await read_session.execute(
+                text("""
+                    SELECT embedding, angle
+                    FROM reference_embeddings
+                    WHERE bin = :bin
+                    ORDER BY ABS(angle - :bearing)
+                    LIMIT 1
+                """),
+                {'bin': bin_val, 'bearing': user_bearing}
+            )
+            row = result.fetchone()
+            if row and row[0]:
+                embedding = row[0]
+                if isinstance(embedding, str):
+                    import json
+                    embedding = json.loads(embedding)
+                return embedding
 
     except Exception as e:
-        logger.error(f"Error checking reference_embeddings: {e}")
+        logger.error(f"Error checking reference_embeddings: {e}", exc_info=True)
 
     return None
 
@@ -329,15 +339,23 @@ async def fetch_street_view_embedding(
     """
     try:
         row = None
+        bbl_val = None
+        # Centerline-derived camera pose (F2-free-2). Filled in below from
+        # Railway; falls back to user-bearing heuristic if Railway is offline
+        # or the function returns no row.
+        cam_lat: Optional[float] = None
+        cam_lng: Optional[float] = None
+        cam_heading: Optional[float] = None
 
-        # Get building centroid from Railway footprints database
+        # Get building centroid + BBL + camera pose from Railway footprints database
         async with get_footprints_db() as footprints_db:
             if footprints_db:
                 result = await footprints_db.execute(
                     text("""
                         SELECT
                             ST_X(centroid) as lng,
-                            ST_Y(centroid) as lat
+                            ST_Y(centroid) as lat,
+                            bbl::text       as bbl
                         FROM building_footprints
                         WHERE bin = :bin
                     """),
@@ -345,11 +363,21 @@ async def fetch_street_view_embedding(
                 )
                 row = result.fetchone()
 
+                pose = await footprints_db.execute(
+                    text("SELECT cam_lat, cam_lng, heading_deg FROM camera_pose_for_bin(:bin)"),
+                    {'bin': bin_val}
+                )
+                pose_row = pose.fetchone()
+                if pose_row and pose_row[0] is not None:
+                    cam_lat = float(pose_row[0])
+                    cam_lng = float(pose_row[1])
+                    cam_heading = float(pose_row[2])
+
         if not row:
             # Fallback to buildings_full_merge_scanning
             result = await session.execute(
                 text("""
-                    SELECT geocoded_lng, geocoded_lat
+                    SELECT geocoded_lng, geocoded_lat, bbl::text
                     FROM buildings_full_merge_scanning
                     WHERE REPLACE(bin, '.0', '') = :bin
                 """),
@@ -363,33 +391,55 @@ async def fetch_street_view_embedding(
 
         building_lng = float(row[0])
         building_lat = float(row[1])
+        if len(row) > 2 and row[2]:
+            bbl_val = str(row[2]).replace(".0", "")
 
-        # Calculate optimal camera heading (from user toward building)
-        camera_heading = calculate_bearing(user_lat, user_lng, building_lat, building_lng)
+        # Camera-origin selection: prefer the centerline-derived pose (looks at
+        # the building's frontage from across the street) and fall back to the
+        # legacy user-bearing heuristic only when no centerline is nearby.
+        if cam_heading is None:
+            cam_heading = calculate_bearing(user_lat, user_lng, building_lat, building_lng)
+        if cam_lat is None or cam_lng is None:
+            cam_lat, cam_lng = building_lat, building_lng
 
-        # Fetch Street View image
-        image_bytes = await fetch_street_view_image(
-            building_lat, building_lng, camera_heading
+        from services.reference_image_chain import fetch_reference_image
+
+        async def _google_fallback(lat: float, lng: float) -> Optional[bytes]:
+            return await fetch_street_view_image(lat, lng, cam_heading)
+
+        # Chain searches near the camera point. Pass the building's true
+        # coordinate so Mapillary's pano-alignment scoring still aims at it.
+        image_bytes, source_label = await fetch_reference_image(
+            lat=building_lat,
+            lng=building_lng,
+            bbl=bbl_val,
+            google_fallback=_google_fallback,
         )
 
+        # Only Google charges us; the free sources cost $0.
+        cost = 0.007 if source_label == "google_streetview" else 0.0
+
         if image_bytes is None:
-            logger.warning(f"Street View not available for BIN {bin_val}")
-            return (None, 0.007)  # Still costs money even if no image
+            logger.warning(f"No reference image available for BIN {bin_val}")
+            return (None, cost)
 
         # Compute CLIP embedding
         embedding = await encode_photo(image_bytes)
         embedding_list = embedding.tolist()
 
-        # Cache the embedding for future use
+        # Cache the embedding for future use, tagged with the source that
+        # produced it so we can audit cache composition.
         await cache_embedding(
-            session, bin_val, embedding_list, camera_heading,
-            f"street_view_ondemand"
+            session, bin_val, embedding_list, cam_heading, source_label
         )
 
-        return (embedding_list, 0.007)
+        logger.info(
+            f"Fetched reference for BIN {bin_val} via {source_label} (cost=${cost})"
+        )
+        return (embedding_list, cost)
 
     except Exception as e:
-        logger.error(f"Error fetching Street View: {e}")
+        logger.error(f"Error fetching reference image: {e}", exc_info=True)
         return (None, 0.0)
 
 
@@ -426,7 +476,7 @@ async def fetch_street_view_image(
     )
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.get(url)
 
             if response.status_code == 200:
@@ -454,59 +504,46 @@ async def cache_embedding(
     source: str
 ) -> bool:
     """
-    Cache a computed embedding in reference_embeddings for future use.
+    Cache a computed embedding in reference_embeddings, keyed by BIN.
+
+    No longer joins through buildings_full_merge_scanning — that scoped the
+    cache to a tiny curated subset and silently dropped writes for every
+    other BIN. Now every PLUTO BIN can accumulate cache entries.
+
+    Duplicates (same bin/angle/pitch) may accumulate until a unique
+    constraint is added in a follow-up migration; check_reference_embeddings
+    handles it via LIMIT 1 ORDER BY ABS(angle - bearing).
     """
+    # Use a dedicated session so a poisoned parent transaction can't block writes.
+    # The disambig pipeline upstream sometimes leaves `session` in an aborted state
+    # (psycopg.errors.InFailedSqlTransaction), which made every write fail silently.
+    embedding_list = list(embedding) if not isinstance(embedding, list) else embedding
+    params = {
+        'bin': bin_val,
+        'angle': int(angle),
+        'image_key': f"ondemand/{bin_val}/{int(angle)}.jpg",
+        'embedding': embedding_list,
+        'source': source,
+    }
     try:
-        # Get building_id from buildings_full_merge_scanning
-        result = await session.execute(
-            text("""
-                SELECT id FROM buildings_full_merge_scanning
-                WHERE REPLACE(bin, '.0', '') = :bin
-                LIMIT 1
-            """),
-            {'bin': bin_val}
-        )
-        row = result.fetchone()
-
-        if not row:
-            logger.warning(f"Cannot cache embedding: building not found for BIN {bin_val}")
-            return False
-
-        building_id = row[0]
-
-        # Insert embedding
-        import json
-        embedding_str = json.dumps(embedding)
-
-        await session.execute(
-            text("""
-                INSERT INTO reference_embeddings (
-                    building_id, angle, pitch, image_key, embedding, source
-                )
-                VALUES (
-                    :building_id, :angle, 10,
-                    :image_key, CAST(:embedding AS vector(512)), :source
-                )
-                ON CONFLICT (building_id, angle, pitch) DO UPDATE SET
-                    embedding = EXCLUDED.embedding,
-                    updated_at = NOW()
-            """),
-            {
-                'building_id': building_id,
-                'angle': int(angle),
-                'image_key': f"ondemand/{bin_val}/{int(angle)}.jpg",
-                'embedding': embedding_str,
-                'source': source
-            }
-        )
-
-        await session.commit()
-        logger.info(f"Cached embedding for BIN {bin_val} at {angle}°")
+        async with AsyncSessionLocal() as write_session:
+            await write_session.execute(
+                text("""
+                    INSERT INTO reference_embeddings
+                        (bin, angle, pitch, image_key, embedding, reference_source)
+                    VALUES
+                        (:bin, :angle, 10, :image_key, :embedding, :source)
+                """),
+                params,
+            )
+            await write_session.commit()
+        logger.info(f"Cached embedding for BIN {bin_val} at {int(angle)}° (source={source})")
         return True
-
     except Exception as e:
-        logger.error(f"Failed to cache embedding: {e}")
-        await session.rollback()
+        logger.error(
+            f"Failed to cache embedding for BIN {bin_val} at {int(angle)}°: {e}",
+            exc_info=True,
+        )
         return False
 
 
@@ -518,7 +555,7 @@ async def fetch_and_encode_image(image_url: str) -> Optional[np.ndarray]:
         Normalized CLIP embedding as numpy array, or None if failed
     """
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(image_url)
 
             if response.status_code != 200:

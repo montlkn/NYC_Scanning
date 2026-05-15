@@ -164,6 +164,9 @@ async def get_or_fetch_reference_image(
         return None
 
 
+MAX_STREET_VIEW_FETCHES_PER_SCAN = 3
+
+
 async def get_reference_images_for_candidates(
     session: AsyncSession,
     candidates: List[Dict],
@@ -172,7 +175,9 @@ async def get_reference_images_for_candidates(
     """
     Get reference images with embeddings for all candidates
 
-    Queries reference_embeddings table which stores pregenerated images and CLIP embeddings
+    Queries reference_embeddings table which stores pregenerated images and CLIP embeddings.
+    Falls back to Street View only for buildings with zero pre-computed embeddings,
+    capped at MAX_STREET_VIEW_FETCHES_PER_SCAN to control API costs.
 
     Args:
         session: Database session

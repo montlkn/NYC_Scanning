@@ -3,7 +3,6 @@ Async database session management for Railway footprints database
 """
 
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
-from sqlalchemy.pool import NullPool
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator, Optional
 import logging
@@ -33,12 +32,15 @@ def init_footprints_engine():
     elif database_url.startswith("postgresql://"):
         database_url = database_url.replace("postgresql://", "postgresql+psycopg://", 1)
 
-    # Create async engine for Railway
+    # Create async engine for Railway — small persistent pool to avoid
+    # TCP handshake overhead on every scan within a warm container
     footprints_engine = create_async_engine(
         database_url,
         echo=settings.debug,
+        pool_size=3,
+        max_overflow=2,
         pool_pre_ping=True,
-        poolclass=NullPool,  # Railway handles pooling
+        pool_recycle=300,  # Recycle connections every 5 min
         connect_args={
             "options": "-c application_name=nyc_scan_footprints"
         }

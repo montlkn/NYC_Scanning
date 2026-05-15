@@ -332,7 +332,13 @@ async def get_building_metadata(
                     landmark,
                     mat_prim,
                     height,
-                    num_floors
+                    num_floors,
+                    storytelling,
+                    primary_aesthetic,
+                    secondary_aesthetic,
+                    normalized_profile,
+                    geocoded_lat,
+                    geocoded_lng
                 FROM buildings_full_merge_scanning
                 WHERE REPLACE(bin, '.0', '') = ANY(:bins)
             """),
@@ -341,6 +347,13 @@ async def get_building_metadata(
 
         for row in result:
             bin_val = row[0]
+            # Filter out float-corrupted storytelling values
+            storytelling_raw = row[10]
+            try:
+                float(storytelling_raw)
+                storytelling_clean = None  # It's a float — corrupted
+            except (TypeError, ValueError):
+                storytelling_clean = storytelling_raw
             metadata[bin_val] = {
                 'name': row[1],
                 'address': row[2],
@@ -352,6 +365,12 @@ async def get_building_metadata(
                 'material': row[7],
                 'height': row[8],
                 'num_floors': row[9],
+                'storytelling': storytelling_clean,
+                'primary_aesthetic': row[11],
+                'secondary_aesthetic': row[12],
+                'normalized_profile': row[13],
+                'geocoded_lat': float(row[14]) if row[14] else None,
+                'geocoded_lng': float(row[15]) if row[15] else None,
                 'source': 'notable_buildings'
             }
 
@@ -459,6 +478,12 @@ async def enrich_candidates_with_metadata(
                 'use': metadata[bin_val].get('use'),
                 'type': metadata[bin_val].get('type'),
                 'materials': metadata[bin_val].get('material'),
+                'storytelling': metadata[bin_val].get('storytelling'),
+                'primary_aesthetic': metadata[bin_val].get('primary_aesthetic'),
+                'secondary_aesthetic': metadata[bin_val].get('secondary_aesthetic'),
+                'normalized_profile': metadata[bin_val].get('normalized_profile'),
+                'geocoded_lat': metadata[bin_val].get('geocoded_lat'),
+                'geocoded_lng': metadata[bin_val].get('geocoded_lng'),
             })
         enriched.append(candidate)
 

@@ -306,10 +306,23 @@ async def main():
     logger.info(f"Time: {datetime.utcnow().isoformat()}")
     logger.info("=" * 50)
 
-    # Create database session
-    # Convert postgresql:// to postgresql+asyncpg:// for async connection
-    database_url = settings.database_url.replace("postgresql://", "postgresql+asyncpg://")
-    engine = create_async_engine(database_url)
+    # Create database session — use psycopg3, not asyncpg
+    # asyncpg fails auth with Supabase's pgbouncer Session pooler
+    database_url = settings.database_url
+    if database_url.startswith("postgres://"):
+        database_url = database_url.replace("postgres://", "postgresql+psycopg://", 1)
+    elif database_url.startswith("postgresql://"):
+        database_url = database_url.replace("postgresql://", "postgresql+psycopg://", 1)
+    import ssl
+    from sqlalchemy.pool import NullPool
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+    engine = create_async_engine(
+        database_url,
+        poolclass=NullPool,
+        connect_args={"sslmode": "require"}
+    )
     async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
     async with async_session() as db:
