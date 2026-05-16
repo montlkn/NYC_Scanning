@@ -111,6 +111,12 @@ async def run(
     heading_accuracy_deg: Optional[float],
     lens_type: str,
     scan_id: str,
+    tap_x: Optional[float] = None,
+    tap_y: Optional[float] = None,
+    tap_mask_b64: Optional[str] = None,
+    tap_mask_w: int = 0,
+    tap_mask_h: int = 0,
+    tap_depth_m: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Execute the full matching pipeline.
@@ -162,6 +168,152 @@ async def run(
         if c["bin"] in clip_by_bin:
             c["clip_similarity"] = clip_by_bin[c["bin"]].get("clip_similarity", 0.0)
 
+    # When tap is present, fetch footprints up front — both the IoU
+    # pre-filter and the facade-edge matcher below need them, and the
+    # original fetch at step 4 runs too late (after scoring) to feed them.
+    if tap_x is not None and tap_y is not None:
+        try:
+            from services.geospatial_v2 import get_footprints_for_bins
+            geom_by_bin = await get_footprints_for_bins(
+                [str(c.get("bin") or "") for c in enriched_cands[:20]]
+            )
+            for c in enriched_cands[:20]:
+                geo = geom_by_bin.get(str(c.get("bin") or ""))
+                if geo:
+                    c["footprint_geojson"] = geo
+        except Exception as e:
+            logger.warning(f"[{scan_id}] early footprint fetch failed (tap will degrade): {e}")
+
+    # ── 2b. Tap-to-pick pre-filter (Phase 13) ────────────────────────────────
+    # When the user tapped a building in the AR preview, project each
+    # candidate's PLUTO footprint into the camera image plane and drop
+    # candidates whose footprint has zero overlap with the tap region.
+    # This happens BEFORE scoring so the signal is used as a hard gate, not
+    # a soft weight. If no candidates survive (e.g. all footprints missing)
+    # we fall through with the full set — never fail silently.
+    if tap_x is not None and tap_y is not None:
+        try:
+            from services.footprint_projection import rank_by_tap_overlap
+            filtered = await rank_by_tap_overlap(
+                candidates=enriched_cands,
+                tap_x=tap_x,
+                tap_y=tap_y,
+                mask_b64=tap_mask_b64,
+                mask_w=tap_mask_w,
+                mask_h=tap_mask_h,
+                cam_lat=lat,
+                cam_lng=lng,
+                bearing_deg=bearing,
+                pitch_deg=pitch,
+                lens_type=lens_type,
+            )
+            # Only apply pre-filter if at least one candidate overlapped.
+            nonzero = [c for c in filtered if c.get("tap_overlap_score", 0) > 0]
+            if nonzero:
+                enriched_cands = nonzero
+                retrieval_meta["tap_prefilter"] = {
+                    "kept": len(nonzero),
+                    "dropped": len(filtered) - len(nonzero),
+                    "top_score": nonzero[0].get("tap_overlap_score"),
+                    "top_bin": nonzero[0].get("bin"),
+                }
+                logger.info(
+                    f"[{scan_id}] tap pre-filter: kept {len(nonzero)}, "
+                    f"top BIN {nonzero[0].get('bin')} score {nonzero[0].get('tap_overlap_score'):.3f}"
+                )
+            else:
+                retrieval_meta["tap_prefilter"] = "no_overlap_fallthrough"
+        except Exception as e:
+            logger.warning(f"[{scan_id}] tap pre-filter failed (continuing): {e}")
+
+        # ── 2c. Facade-edge match (the orthographic / plan-view step) ──────
+        # The IoU pre-filter above asks "which projected footprint best fills
+        # the tap silhouette?" — that's a visual-region test. The stronger
+        # signal lives in plan view: take the tap mask's two ground vertices,
+        # back-project them to (lat, lng) anchors on the sidewalk, and find
+        # the candidate whose *near facade edge* in plan best matches those
+        # two anchors. This survives oblique angles and partial occlusion
+        # that confuse the IoU approach, and gives us a hard discriminator
+        # for adjacent rowhouses (their facade edges are 6-8m apart in plan
+        # even when they're visually identical in the camera frame).
+        try:
+            from services.footprint_projection import (
+                tap_facade_anchors, score_facade_match,
+            )
+            # Compute the mask bbox in normalised image coords. Prefer the
+            # client-provided mask geometry when present (down-sampled binary
+            # mask), else fall back to a small square around the tap point.
+            if tap_mask_b64 and tap_mask_w > 0 and tap_mask_h > 0:
+                # The mask bbox is the tightest rect around lit pixels —
+                # rank_by_tap_overlap already needs this; we reuse the same
+                # decoder.
+                import base64
+                raw = base64.b64decode(tap_mask_b64)
+                if len(raw) == tap_mask_w * tap_mask_h:
+                    minx, miny, maxx, maxy = tap_mask_w, tap_mask_h, -1, -1
+                    for yy in range(tap_mask_h):
+                        row = raw[yy * tap_mask_w : (yy + 1) * tap_mask_w]
+                        if any(b >= 128 for b in row):
+                            for xx in range(tap_mask_w):
+                                if row[xx] >= 128:
+                                    if xx < minx: minx = xx
+                                    if xx > maxx: maxx = xx
+                                    if yy < miny: miny = yy
+                                    if yy > maxy: maxy = yy
+                    if maxx >= 0:
+                        bbox = (
+                            minx / tap_mask_w, miny / tap_mask_h,
+                            (maxx + 1) / tap_mask_w, (maxy + 1) / tap_mask_h,
+                        )
+                    else:
+                        bbox = (max(0.0, tap_x - 0.04), max(0.0, tap_y - 0.04),
+                                min(1.0, tap_x + 0.04), min(1.0, tap_y + 0.04))
+                else:
+                    bbox = (max(0.0, tap_x - 0.04), max(0.0, tap_y - 0.04),
+                            min(1.0, tap_x + 0.04), min(1.0, tap_y + 0.04))
+            else:
+                # No mask — back-project a small square around the tap point
+                # as a degenerate "facade segment." Less accurate but still
+                # tells us roughly where on the sidewalk the user pointed.
+                bbox = (max(0.0, tap_x - 0.04), max(0.0, tap_y - 0.04),
+                        min(1.0, tap_x + 0.04), min(1.0, tap_y + 0.04))
+
+            anchors = tap_facade_anchors(
+                mask_bbox=bbox,
+                cam_lat=lat, cam_lng=lng,
+                bearing_deg=bearing, pitch_deg=pitch,
+                lens_type=lens_type,
+                depth_m=tap_depth_m,
+            )
+            if anchors is not None:
+                scored = score_facade_match(enriched_cands, anchors, lat, lng)
+                scored.sort(key=lambda c: c.get("tap_facade_score_m", float("inf")))
+                top_score = scored[0].get("tap_facade_score_m", float("inf"))
+                second_score = scored[1].get("tap_facade_score_m", float("inf")) if len(scored) > 1 else float("inf")
+                # Tight match + clear gap → trust the tap. 6m threshold
+                # accommodates ARKit pose error + GPS error + facade edge
+                # measurement error. 2x ratio rejects ties where adjacent
+                # rowhouses are all roughly equidistant.
+                if top_score < 6.0 and (second_score == float("inf") or second_score > top_score * 1.5):
+                    enriched_cands = scored
+                    retrieval_meta["tap_facade_match"] = {
+                        "bin": scored[0].get("bin"),
+                        "score_m": round(top_score, 2),
+                        "second_score_m": (round(second_score, 2) if second_score != float("inf") else None),
+                    }
+                    logger.info(
+                        f"[{scan_id}] tap-facade winner BIN {scored[0].get('bin')} "
+                        f"score {top_score:.2f}m (next: {second_score:.2f}m)"
+                    )
+                else:
+                    retrieval_meta["tap_facade_match"] = {
+                        "rejected": True,
+                        "top_score_m": (round(top_score, 2) if top_score != float("inf") else None),
+                        "second_score_m": (round(second_score, 2) if second_score != float("inf") else None),
+                    }
+        except Exception as e:
+            logger.warning(f"[{scan_id}] tap facade match failed (continuing): {e}")
+
     # ── 2a. Fast-path check ───────────────────────────────────────────────────
     # Inspect just the top-3 CLIP scores. If the leader is clearly winning,
     # don't bother CLIP-ranking the rest of the cone.
@@ -206,10 +358,57 @@ async def run(
             clip_cost += wider.get("cost_usd", 0.0)
             retrieval_meta["wide_clip_ranked"] = len(rest)
 
+    # The tap is the new high-signal source — same role CLIP used to play,
+    # except it's user-driven and grounded in PLUTO's authoritative city
+    # plan instead of image similarity. A clean facade match is treated as
+    # an *auto-confirm*, not a bias: bypass Grok, bypass picker, the user
+    # already told us the answer.
+    _tap_winner_bin: Optional[str] = None
+    _tap_winner_via: Optional[str] = None
+    facade = retrieval_meta.get("tap_facade_match")
+    if isinstance(facade, dict) and facade.get("bin") and not facade.get("rejected"):
+        _tap_winner_bin = facade["bin"]
+        _tap_winner_via = "facade_match"
+    elif tap_x is not None and retrieval_meta.get("tap_prefilter", {}) != "no_overlap_fallthrough":
+        # Fallback: the coarser IoU pre-filter narrowed to exactly one. Still
+        # a strong signal, just less precise than the facade-edge match.
+        pf = retrieval_meta.get("tap_prefilter", {})
+        if isinstance(pf, dict) and pf.get("kept", 0) == 1:
+            _tap_winner_bin = enriched_cands[0].get("bin") if enriched_cands else None
+            _tap_winner_via = "iou_singleton"
+
     # ── 3. Two-signal scoring ──────────────────────────────────────────────────
     scored = scoring.blend_scores(enriched_cands)
     calibrated = scoring.calibrate(scored)
     candidates, show_picker, bail = scoring.sort_and_decide_picker(calibrated)
+
+    # Tap auto-confirm: find the winner in the (possibly multi-candidate)
+    # post-scoring list and float it to top-1 with auto-confirm confidence.
+    # The tap is a higher-signal disambiguator than facade-similarity ranking
+    # so it should *override* score ordering when present, not just bias it.
+    if _tap_winner_bin:
+        winner_idx = next(
+            (i for i, c in enumerate(candidates) if c.get("bin") == _tap_winner_bin),
+            None,
+        )
+        if winner_idx is not None:
+            w = candidates[winner_idx]
+            # Auto-confirm threshold (settings.confidence_threshold default 0.7).
+            # We bump above the picker_abs_threshold so the picker doesn't
+            # re-appear, and above the bail threshold so we never bail on a
+            # tap-confirmed scan.
+            w["confidence"] = max(
+                w.get("confidence", 0.0),
+                _cfg.picker_abs_threshold + 0.05,  # comfortably above picker line
+                0.75,                              # standard auto-confirm floor
+            )
+            w["verification_method_override"] = f"tap_{_tap_winner_via}"
+            # Move to top.
+            candidates = [w] + [c for i, c in enumerate(candidates) if i != winner_idx]
+            bail = False
+            show_picker = False
+            retrieval_meta["tap_winner"] = _tap_winner_bin
+            retrieval_meta["tap_winner_via"] = _tap_winner_via
 
     # ── 3a. P4: Grok Vision disambig on close calls ──────────────────────────
     # When CLIP can't separate the top candidates (which is the consulate /
@@ -225,8 +424,13 @@ async def run(
     _grok_cluster_trigger = _candidates_clustered_within(
         candidates[:5], _GROK_CLUSTER_RADIUS_M
     )
+    # The user's tap is a higher-signal disambiguator than Grok's facade
+    # similarity — once the tap has named a winner we trust it and don't
+    # ask Grok to second-guess. Grok still fires when there's no tap and
+    # the geometry alone can't separate candidates.
     if (
         _cfg.grok_disambig_enabled
+        and _tap_winner_bin is None
         and (bail or show_picker or _grok_cluster_trigger)
         and len(candidates) >= 2
     ):
@@ -319,9 +523,15 @@ async def run(
             logger.warning(f"footprint geojson fetch failed: {e}")
 
     # ── 5. Telemetry ──────────────────────────────────────────────────────────
-    verification_method = (
-        "no_confident_match" if bail else f"pipeline_v3_{clip_method}"
-    )
+    # Tap auto-confirm wins the verification_method label so the flywheel can
+    # separate tap-driven scans from geometry/CLIP-driven ones — they're
+    # different data products (user-labeled vs algorithm-labeled).
+    if out and out[0].get("verification_method_override"):
+        verification_method = out[0]["verification_method_override"]
+    elif bail:
+        verification_method = "no_confident_match"
+    else:
+        verification_method = f"pipeline_v3_{clip_method}"
     total_ms = int((time.time() - t_start) * 1000)
     telemetry.log_scan(
         scan_id=scan_id,

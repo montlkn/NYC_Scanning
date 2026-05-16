@@ -100,6 +100,12 @@ async def scan_building_v2(
     lens_type: str = Form("standard", description="Camera lens: 'standard' or 'ultrawide'"),
     user_id: str = Form(None, description="Optional user ID for tracking"),
     use_pipeline_v3: bool = Form(False, description="Use new pipeline (feature flag, default off until validated)"),
+    tap_x: float = Form(None, description="Normalised tap X (0..1) in image space"),
+    tap_y: float = Form(None, description="Normalised tap Y (0..1) in image space"),
+    tap_mask_b64: str = Form(None, description="Base64-encoded binary mask from Vision segmentation"),
+    tap_mask_w: int = Form(0, description="Width of tap_mask_b64 in pixels"),
+    tap_mask_h: int = Form(0, description="Height of tap_mask_b64 in pixels"),
+    tap_depth_m: float = Form(None, description="ARKit sceneDepth at tap pixel (metres). Absent → flat-ground fallback."),
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -196,6 +202,12 @@ async def scan_building_v2(
                 heading_accuracy_deg=heading_accuracy,
                 lens_type=lens_type,
                 scan_id=scan_id,
+                tap_x=tap_x,
+                tap_y=tap_y,
+                tap_mask_b64=tap_mask_b64,
+                tap_mask_w=tap_mask_w,
+                tap_depth_m=tap_depth_m,
+                tap_mask_h=tap_mask_h,
             )
 
             if pipeline_result.get("error") == "no_candidates":
@@ -280,11 +292,22 @@ async def scan_building_v2(
                 logger.error(f"[{scan_id}] DB store failed: {e}")
                 await db.rollback()
 
+            # Surface tap outcome unconditionally — iOS uses it to know whether
+            # the tap auto-confirmed (skip Grok wait UX, jump straight to the
+            # confirmed view).
+            rm = pipeline_result.get("retrieval_meta") or {}
+            tap_outcome = {
+                "winner_bin": rm.get("tap_winner"),
+                "via": rm.get("tap_winner_via"),
+                "facade_match": rm.get("tap_facade_match"),
+                "prefilter": rm.get("tap_prefilter"),
+            }
             return {
                 "scan_id": scan_id, "matches": matches,
                 "show_picker": show_picker, "can_contribute": True,
                 "bail": pipeline_result.get("bail", False),
                 "verification_method": verification_method,
+                "tap_outcome": tap_outcome,
                 "processing_time_ms": total_time_ms,
                 "performance": {
                     "upload_ms": upload_time_ms,
