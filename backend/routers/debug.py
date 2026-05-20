@@ -209,45 +209,7 @@ async def test_image_comparison(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.get("/test-street-view")
-async def test_street_view(
-    lat: float = Query(..., description="Latitude"),
-    lng: float = Query(..., description="Longitude"),
-    bearing: float = Query(0, description="Camera bearing")
-):
-    """
-    Test Street View API availability and fetching
-    """
-    try:
-        from services.reference_images import (
-            check_street_view_availability,
-            fetch_street_view
-        )
-
-        # Check availability
-        available = await check_street_view_availability(lat, lng)
-
-        if not available:
-            return {
-                'available': False,
-                'message': 'No Street View imagery at this location'
-            }
-
-        # Fetch image
-        image_bytes = await fetch_street_view(lat, lng, bearing)
-
-        if image_bytes:
-            return {
-                'available': True,
-                'image_size_bytes': len(image_bytes),
-                'message': 'Successfully fetched Street View image'
-            }
-        else:
-            return {
-                'available': False,
-                'message': 'Failed to fetch Street View image'
-            }
-
-    except Exception as e:
-        logger.error(f"Test Street View failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+# test-street-view endpoint removed 2026-05-15 along with the
+# services/reference_images module — the production Street View fetcher
+# lives in services/clip_disambiguation.fetch_street_view_image. For
+# manual diagnostics use scripts/inspect_refs.py instead.

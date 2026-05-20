@@ -619,11 +619,12 @@ async def _try_grok_disambig(
     from services.grok import grok_vision_pick
     from services.reference_image_chain import fetch_reference_image
 
-    # Fetch reference image bytes for each candidate. Reuses the chain so we
-    # benefit from Mapillary first, Google only as fallback. Most BINs already
-    # have a cached embedding *image* in R2 — but we need raw bytes here, not
-    # the embedding. The chain re-fetches; on hot blocks this is a few hundred
-    # ms total across all candidates (Mapillary is fast for repeats).
+    # Backend-only Street View fetch. Used by Grok's vision pick so it has
+    # something visual to compare against the user photo when no tap mask is
+    # present (Grok read "121" on the Consulate awning this way). This is
+    # the last live path that talks to maps.googleapis.com — iOS purged GSV
+    # in Phase 8. Fires only on tap-less ambiguous scans, which should be
+    # a shrinking slice now that tap-to-pick autoconfirms cleanly.
     # Pull LPC-sourced landmark text for each candidate up front so Grok has
     # corroborating facts (year, architect, designation, history) and can't
     # invent stuff. The lore_generator already has this helper.

@@ -9,7 +9,6 @@ from typing import Optional, List
 import logging
 
 from models.database import Building
-from services import reference_images
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -83,10 +82,8 @@ async def get_building_images(
     Now uses BIN instead of BBL as the primary identifier
     """
     try:
-        # TODO: Query database
-        # images = await reference_images.get_all_reference_images_for_building(db, bin)
-
-        # Mock data
+        # Reference images are handled by the live scan pipeline
+        # (clip_disambiguation), not exposed via this REST endpoint.
         return {
             'bin': bin,
             'images': [],
@@ -212,13 +209,6 @@ async def get_database_stats(
     Get database statistics
     """
     try:
-        # TODO: Query database stats
-        # total_buildings = await db.scalar(select(func.count(Building.bbl)))
-        # total_landmarks = await db.scalar(
-        #     select(func.count(Building.bbl)).where(Building.is_landmark == True)
-        # )
-        # total_reference_images = await db.scalar(select(func.count(ReferenceImage.id)))
-
         return {
             'total_buildings': 0,
             'total_landmarks': 0,
