@@ -14,48 +14,6 @@ settings = get_settings()
 router = APIRouter()
 
 
-@router.get("/test-geospatial")
-async def test_geospatial(
-    lat: float = Query(..., description="Test latitude"),
-    lng: float = Query(..., description="Test longitude"),
-    bearing: float = Query(..., description="Test bearing (0-360)"),
-    pitch: float = Query(0, description="Test pitch (-90 to 90)"),
-    distance: float = Query(100, description="Max distance in meters")
-):
-    """
-    Test geospatial cone-of-vision logic
-
-    Example: /api/debug/test-geospatial?lat=40.7074&lng=-74.0113&bearing=180
-    """
-    try:
-        # Generate view cone WKT for visualization
-        cone_wkt = geospatial.create_view_cone_wkt(
-            lat, lng, bearing, distance, settings.cone_angle_degrees
-        )
-
-        # TODO: Get candidates from database
-        # candidates = await geospatial.get_candidate_buildings(
-        #     db, lat, lng, bearing, pitch, distance
-        # )
-
-        return {
-            'input': {
-                'lat': lat,
-                'lng': lng,
-                'bearing': bearing,
-                'pitch': pitch,
-                'distance': distance
-            },
-            'cone_wkt': cone_wkt,
-            'cone_angle': settings.cone_angle_degrees,
-            'candidates': [],  # Placeholder
-            'candidate_count': 0
-        }
-
-    except Exception as e:
-        logger.error(f"Test geospatial failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
 
 @router.get("/test-clip")
 async def test_clip():
