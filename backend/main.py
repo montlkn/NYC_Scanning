@@ -18,7 +18,7 @@ import posthog
 from models.config import get_settings
 from models.session import init_db, close_db
 from models.footprints_session import init_footprints_engine, close_footprints_db
-from routers import scan, scan_v2, buildings, debug, scan_phase1, confirm, contribute, stamps, vetting, similar_buildings, rag
+from routers import scan, buildings, debug, confirm, contribute, stamps, vetting, similar_buildings, rag
 
 # Configure logging
 logging.basicConfig(
@@ -159,28 +159,13 @@ async def health_check():
 
 
 # Include routers
-# V2 Scan system (footprint-based, bulletproof) - mounted at /api/v2
-# Use USE_SCAN_V2 env var to switch default scan endpoint to V2
-use_scan_v2 = os.getenv("USE_SCAN_V2", "false").lower() == "true"
-
-if use_scan_v2:
-    # V2 is the primary scan endpoint
-    app.include_router(scan_v2.router, prefix="/api", tags=["scan"])
-    app.include_router(scan.router, prefix="/api/v1", tags=["scan-v1"])  # V1 available at /api/v1/scan
-    logger.info("🚀 Using SCAN V2 (footprint-based) as primary")
-else:
-    # V1 is the primary scan endpoint (default for backwards compatibility)
-    app.include_router(scan.router, prefix="/api", tags=["scan"])
-    app.include_router(scan_v2.router, prefix="/api/v2", tags=["scan-v2"])  # V2 available at /api/v2/scan
-    logger.info("📌 Using SCAN V1 as primary, V2 available at /api/v2")
-
+app.include_router(scan.router, prefix="/api", tags=["scan"])
 app.include_router(buildings.router, prefix="/api", tags=["buildings"])
 app.include_router(contribute.router, prefix="/api", tags=["contribute"])
 app.include_router(stamps.router, prefix="/api", tags=["stamps"])
 app.include_router(vetting.router, prefix="/api", tags=["vetting"])
 app.include_router(similar_buildings.router, prefix="/api", tags=["similar-buildings"])
 app.include_router(rag.router, prefix="/api", tags=["rag"])
-app.include_router(scan_phase1.router, prefix="/api/phase1", tags=["phase1"])
 app.include_router(confirm.router, tags=["confirm"])
 
 # Debug endpoints (only in development)

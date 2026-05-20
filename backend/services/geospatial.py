@@ -1,88 +1,573 @@
 """
-Geospatial service for building candidate filtering
-Implements cone-of-vision logic using lat/lng bounding box calculations
+Geospatial V2 Service - Footprint-based Building Identification
+
+This service implements the bulletproof building identification system using
+PostGIS footprint intersection instead of centroid-based distance calculations.
+
+Key improvements over V1:
+- Uses actual building polygon footprints, not just centroids
+- Calculates visible facade area within view cone
+- Handles large buildings that span multiple view angles
+- 100% coverage of NYC buildings (1.08M)
+
+Usage:
+    candidates = await get_candidates_by_footprint(
+        db, lat, lng, bearing, pitch
+    )
 """
 
 import math
-from typing import List, Dict, Any, Optional
-from sqlalchemy import select, func, text, cast, Float
+from typing import List, Dict, Any, Optional, Tuple
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 import logging
 
-from models.database import Building
 from models.config import get_settings
+from models.footprints_session import get_footprints_db
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
-def create_view_cone_wkt(
+# Score thresholds for classification
+SINGLE_BUILDING_CONFIDENCE = 95.0
+CLEAR_WINNER_CONFIDENCE = 85.0
+AMBIGUITY_THRESHOLD = 15.0  # Score gap below which results are ambiguous
+
+
+async def get_candidates_by_footprint(
+    session: AsyncSession,
     lat: float,
     lng: float,
     bearing: float,
-    distance: float,
-    cone_angle: float
-) -> str:
+    pitch: float = 0,
+    max_distance: Optional[float] = None,
+    cone_angle: Optional[float] = None,
+    max_candidates: Optional[int] = None
+) -> Dict[str, Any]:
     """
-    Generate WKT (Well-Known Text) polygon representing user's view cone
+    Get buildings within user's view cone using footprint intersection.
+
+    This is the primary query for V2 scan system. Uses PostGIS to find
+    all building footprints that intersect with the user's view cone,
+    then scores them by visibility.
 
     Args:
-        lat: User latitude
-        lng: User longitude
+        session: AsyncIO database session
+        lat: User GPS latitude
+        lng: User GPS longitude
         bearing: Compass bearing (0-360, 0=North)
-        distance: Max distance in meters
-        cone_angle: Total cone angle in degrees
+        pitch: Phone pitch angle (-90 to 90)
+        max_distance: Maximum scan distance in meters (default from settings)
+        cone_angle: View cone angle in degrees (default from settings)
+        max_candidates: Maximum candidates to return (default from settings)
 
     Returns:
-        WKT string for the view cone polygon
+        Dictionary containing:
+        - candidates: List of building candidates with scores
+        - classification: 'single', 'clear_winner', 'ambiguous', or 'none'
+        - top_confidence: Confidence score for top match
+        - is_ambiguous: Whether CLIP disambiguation is needed
+        - query_time_ms: Database query time
     """
+    if max_distance is None:
+        max_distance = settings.max_scan_distance_meters
+    if cone_angle is None:
+        cone_angle = settings.cone_angle_degrees
+    if max_candidates is None:
+        max_candidates = settings.max_candidates
 
-    def destination_point(lat_deg: float, lng_deg: float, bearing_deg: float, dist_m: float) -> tuple:
-        """
-        Calculate destination point given start point, bearing, and distance
-        Using Haversine formula
-        """
-        R = 6371000  # Earth radius in meters
+    logger.info(
+        f"Footprint query at ({lat:.6f}, {lng:.6f}), "
+        f"bearing {bearing:.1f}°, pitch {pitch:.1f}°"
+    )
 
-        lat_rad = math.radians(lat_deg)
-        lng_rad = math.radians(lng_deg)
-        brng_rad = math.radians(bearing_deg)
+    # Adjust cone angle based on GPS accuracy if available
+    # Wider cone = more candidates but lower precision per candidate
+    effective_cone = cone_angle
 
-        lat2 = math.asin(
-            math.sin(lat_rad) * math.cos(dist_m / R) +
-            math.cos(lat_rad) * math.sin(dist_m / R) * math.cos(brng_rad)
+    # If user is looking up (pitch > 20), weight height more heavily
+    height_weight_boost = 1.0 if pitch <= 20 else 1.0 + (pitch - 20) / 70
+
+    try:
+        # Query the Railway footprints database
+        async with get_footprints_db() as footprints_db:
+            if footprints_db is None:
+                # Footprints DB not configured - fall back to V1
+                logger.warning("Footprints database not configured, falling back to V1")
+                return await fallback_centroid_query(
+                    session, lat, lng, bearing, pitch, max_distance, cone_angle, max_candidates
+                )
+
+            # Use the PostGIS function we created in the migration
+            result = await footprints_db.execute(
+                text("""
+                    SELECT
+                        bin,
+                        bbl,
+                        name,
+                        distance_meters,
+                        bearing_to_building,
+                        bearing_difference,
+                        visible_area,
+                        shape_area,
+                        height_roof,
+                        visibility_score
+                    FROM find_buildings_in_cone(
+                        :lat, :lng, :bearing, :max_distance, :cone_angle, :max_candidates
+                    )
+                """),
+                {
+                    'lat': lat,
+                    'lng': lng,
+                    'bearing': bearing,
+                    'max_distance': max_distance,
+                    'cone_angle': effective_cone,
+                    'max_candidates': max_candidates
+                }
+            )
+
+            rows = result.fetchall()
+
+        candidates = []
+        for row in rows:
+            # Apply height weight boost for looking-up scenarios
+            adjusted_score = row[9]  # visibility_score
+            if height_weight_boost > 1.0 and row[8]:  # height_roof
+                height_bonus = (row[8] / 200) * (height_weight_boost - 1.0) * 10
+                adjusted_score = min(100, adjusted_score + height_bonus)
+
+            candidates.append({
+                'bin': str(row[0]).replace('.0', '') if row[0] else None,
+                'bbl': str(row[1]).replace('.0', '') if row[1] else None,
+                'name': row[2],
+                'distance_meters': round(row[3], 2) if row[3] else None,
+                'bearing_to_building': round(row[4], 1) if row[4] else None,
+                'bearing_difference': round(row[5], 1) if row[5] else None,
+                'visible_area': round(row[6], 2) if row[6] else None,
+                'shape_area': round(row[7], 2) if row[7] else None,
+                'height_roof': round(row[8], 1) if row[8] else None,
+                'score': round(adjusted_score, 2),
+            })
+
+        # Classify the result
+        classification, top_confidence, is_ambiguous = classify_results(candidates)
+
+        logger.info(
+            f"Found {len(candidates)} candidates, "
+            f"classification: {classification}, "
+            f"top_confidence: {top_confidence:.1f}"
         )
 
-        lng2 = lng_rad + math.atan2(
-            math.sin(brng_rad) * math.sin(dist_m / R) * math.cos(lat_rad),
-            math.cos(dist_m / R) - math.sin(lat_rad) * math.sin(lat2)
+        return {
+            'candidates': candidates,
+            'classification': classification,
+            'top_confidence': top_confidence,
+            'is_ambiguous': is_ambiguous,
+            'num_candidates': len(candidates),
+        }
+
+    except Exception as e:
+        logger.error(f"Footprint query failed: {e}", exc_info=True)
+
+        # Fallback to V1 centroid-based query if footprint table not available
+        logger.warning("Falling back to V1 centroid-based query")
+        return await fallback_centroid_query(
+            session, lat, lng, bearing, pitch, max_distance, cone_angle, max_candidates
         )
 
-        return (math.degrees(lat2), math.degrees(lng2))
 
-    # Start point (user location)
-    points = [f"{lng} {lat}"]
+def classify_results(
+    candidates: List[Dict[str, Any]]
+) -> Tuple[str, float, bool]:
+    """
+    Classify scan results to determine verification method.
 
-    # Calculate left and right edges of cone
-    left_bearing = bearing - (cone_angle / 2)
-    right_bearing = bearing + (cone_angle / 2)
+    Returns:
+        Tuple of (classification, top_confidence, is_ambiguous)
+    """
+    if not candidates:
+        return ('none', 0.0, False)
 
-    # Generate arc points (more points = smoother cone)
-    num_arc_points = 12
-    for i in range(num_arc_points + 1):
-        angle = left_bearing + (cone_angle * i / num_arc_points)
-        pt = destination_point(lat, lng, angle, distance)
-        points.append(f"{pt[1]} {pt[0]}")
+    if len(candidates) == 1:
+        return ('single', SINGLE_BUILDING_CONFIDENCE, False)
 
-    # Close the polygon back to start
-    points.append(f"{lng} {lat}")
+    top_score = candidates[0]['score']
+    second_score = candidates[1]['score'] if len(candidates) > 1 else 0
 
-    return f"POLYGON(({', '.join(points)}))"
+    score_gap = top_score - second_score
+
+    # Check if top candidate is clearly the winner
+    if score_gap >= AMBIGUITY_THRESHOLD:
+        return ('clear_winner', top_score, False)
+
+    # Check if top candidates are too close (ambiguous)
+    # Additional check: both within close distance
+    both_close = (
+        candidates[0]['distance_meters'] is not None and
+        candidates[0]['distance_meters'] < 50 and
+        candidates[1]['distance_meters'] is not None and
+        candidates[1]['distance_meters'] < 50
+    )
+
+    if score_gap < AMBIGUITY_THRESHOLD and both_close:
+        return ('ambiguous', top_score, True)
+
+    # Default to clear winner if not close enough to be ambiguous
+    return ('clear_winner', top_score, False)
+
+
+async def fallback_centroid_query(
+    session: AsyncSession,
+    lat: float,
+    lng: float,
+    bearing: float,
+    pitch: float,
+    max_distance: float,
+    cone_angle: float,
+    max_candidates: int
+) -> Dict[str, Any]:
+    """
+    Fallback to V1 centroid-based query if footprint table unavailable.
+
+    This queries the buildings_full_merge_scanning table using point geometry.
+    Less accurate but provides backwards compatibility.
+    """
+    logger.warning("Using fallback centroid-based query (V1)")
+
+    # Import V1 geospatial
+    from services.geospatial import get_candidate_buildings
+
+    try:
+        v1_candidates = await get_candidate_buildings(
+            session, lat, lng, bearing, pitch, max_distance, max_candidates
+        )
+
+        # Convert V1 format to V2 format
+        candidates = []
+        for c in v1_candidates:
+            # Calculate approximate score from V1 data
+            distance_score = math.exp(-c.get('distance_meters', 100) / 30) * 40
+            bearing_score = max(0, 1 - c.get('bearing_difference', 90) / 30) * 30
+            score = distance_score + bearing_score + 20  # Base score
+
+            candidates.append({
+                'bin': c.get('bin'),
+                'bbl': c.get('bbl'),
+                'name': None,  # V1 doesn't have name
+                'distance_meters': c.get('distance_meters'),
+                'bearing_to_building': c.get('bearing_to_building'),
+                'bearing_difference': c.get('bearing_difference'),
+                'visible_area': None,  # Not available in V1
+                'shape_area': None,
+                'height_roof': None,
+                'score': round(score, 2),
+                'address': c.get('address'),  # V1 has address
+            })
+
+        # Sort by score descending
+        candidates.sort(key=lambda x: x['score'], reverse=True)
+
+        classification, top_confidence, is_ambiguous = classify_results(candidates)
+
+        return {
+            'candidates': candidates,
+            'classification': classification,
+            'top_confidence': top_confidence,
+            'is_ambiguous': is_ambiguous,
+            'num_candidates': len(candidates),
+            'fallback': True,  # Indicate V1 fallback was used
+        }
+
+    except Exception as e:
+        logger.error(f"Fallback query also failed: {e}", exc_info=True)
+        return {
+            'candidates': [],
+            'classification': 'none',
+            'top_confidence': 0.0,
+            'is_ambiguous': False,
+            'num_candidates': 0,
+            'error': str(e),
+        }
+
+
+async def get_building_metadata(
+    session: AsyncSession,
+    bins: List[str],
+    bbls: List[str] = None
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Fetch building metadata from buildings_full_merge_scanning and PLUTO.
+
+    Priority:
+    1. Check buildings_full_merge_scanning (notable buildings with rich data)
+    2. Fall back to PLUTO via Railway (basic data for all 857k buildings)
+
+    Args:
+        session: Database session (Supabase)
+        bins: List of Building Identification Numbers
+        bbls: List of BBLs for PLUTO fallback
+
+    Returns:
+        Dictionary mapping BIN to metadata dict
+    """
+    if not bins:
+        return {}
+
+    # Clean BINs (remove .0 suffix)
+    clean_bins = [str(b).replace('.0', '') for b in bins]
+    metadata = {}
+
+    # Step 1: Try buildings_full_merge_scanning (notable buildings)
+    try:
+        result = await session.execute(
+            text("""
+                SELECT
+                    REPLACE(bin, '.0', '') as bin,
+                    building_name,
+                    address,
+                    architect,
+                    style,
+                    year_built,
+                    landmark,
+                    mat_prim,
+                    height,
+                    num_floors,
+                    storytelling,
+                    primary_aesthetic,
+                    secondary_aesthetic,
+                    normalized_profile,
+                    geocoded_lat,
+                    geocoded_lng
+                FROM buildings_full_merge_scanning
+                WHERE REPLACE(bin, '.0', '') = ANY(:bins)
+            """),
+            {'bins': clean_bins}
+        )
+
+        for row in result:
+            bin_val = row[0]
+            # Filter out float-corrupted storytelling values
+            storytelling_raw = row[10]
+            try:
+                float(storytelling_raw)
+                storytelling_clean = None  # It's a float — corrupted
+            except (TypeError, ValueError):
+                storytelling_clean = storytelling_raw
+            metadata[bin_val] = {
+                'name': row[1],
+                'address': row[2],
+                'architect': row[3],
+                'style': row[4],
+                'year_built': row[5],
+                'is_landmark': row[6] is not None and row[6] != '',
+                'landmark_type': row[6],
+                'material': row[7],
+                'height': row[8],
+                'num_floors': row[9],
+                'storytelling': storytelling_clean,
+                'primary_aesthetic': row[11],
+                'secondary_aesthetic': row[12],
+                'normalized_profile': row[13],
+                'geocoded_lat': float(row[14]) if row[14] else None,
+                'geocoded_lng': float(row[15]) if row[15] else None,
+                'source': 'notable_buildings'
+            }
+
+    except Exception as e:
+        logger.error(f"Failed to fetch from buildings_full_merge_scanning: {e}")
+
+    # Step 2: For buildings not found, try PLUTO via Railway
+    missing_bins = [b for b in clean_bins if b not in metadata]
+    if missing_bins and bbls:
+        # Map BINs to BBLs for lookup
+        bin_to_bbl = {}
+        for i, b in enumerate(clean_bins):
+            if b in missing_bins and i < len(bbls) and bbls[i]:
+                bin_to_bbl[b] = str(bbls[i]).replace('.0', '')
+
+        if bin_to_bbl:
+            try:
+                async with get_footprints_db() as footprints_db:
+                    if footprints_db:
+                        bbl_list = list(bin_to_bbl.values())
+                        result = await footprints_db.execute(
+                            text("""
+                                SELECT
+                                    bbl,
+                                    address,
+                                    year_built,
+                                    num_floors,
+                                    bldg_class_desc,
+                                    owner_name,
+                                    bldg_area,
+                                    units_res,
+                                    zoning
+                                FROM pluto_buildings
+                                WHERE bbl = ANY(:bbls)
+                            """),
+                            {'bbls': bbl_list}
+                        )
+
+                        bbl_to_data = {}
+                        for row in result:
+                            bbl_to_data[row[0]] = {
+                                'address': row[1],
+                                'year_built': int(row[2]) if row[2] else None,
+                                'num_floors': int(row[3]) if row[3] else None,
+                                'building_type': row[4],
+                                'owner': row[5],
+                                'building_area': int(row[6]) if row[6] else None,
+                                'units': row[7],
+                                'zoning': row[8],
+                            }
+
+                        # Map back to BINs
+                        for bin_val, bbl in bin_to_bbl.items():
+                            if bbl in bbl_to_data:
+                                data = bbl_to_data[bbl]
+                                metadata[bin_val] = {
+                                    'name': data['address'],  # Use address as name for unknown buildings
+                                    'address': data['address'],
+                                    'architect': None,
+                                    'style': None,
+                                    'year_built': data['year_built'],
+                                    'is_landmark': False,
+                                    'landmark_type': None,
+                                    'material': None,
+                                    'height': None,
+                                    'num_floors': None,  # Don't need floors
+                                    'use': data['building_type'],  # e.g. "Two Family Dwelling"
+                                    'type': data['building_type'],
+                                    'source': 'pluto'
+                                }
+
+            except Exception as e:
+                logger.error(f"Failed to fetch from PLUTO: {e}")
+
+    logger.info(f"Fetched metadata for {len(metadata)}/{len(bins)} buildings")
+    return metadata
+
+
+async def enrich_candidates_with_metadata(
+    session: AsyncSession,
+    candidates: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """
+    Enrich footprint candidates with building metadata.
+
+    Fetches additional data from buildings_full_merge_scanning (notable)
+    and PLUTO (all buildings) and merges it into candidate dictionaries.
+    """
+    bins = [c['bin'] for c in candidates if c.get('bin')]
+    bbls = [c.get('bbl') for c in candidates]
+    metadata = await get_building_metadata(session, bins, bbls)
+
+    enriched = []
+    for candidate in candidates:
+        bin_val = candidate.get('bin')
+        if bin_val and bin_val in metadata:
+            # Merge metadata into candidate
+            candidate.update({
+                'address': metadata[bin_val].get('address'),
+                'building_name': metadata[bin_val].get('name') or candidate.get('name'),
+                'architect': metadata[bin_val].get('architect'),
+                'style': metadata[bin_val].get('style'),
+                'year_built': metadata[bin_val].get('year_built'),
+                'is_landmark': metadata[bin_val].get('is_landmark', False),
+                'use': metadata[bin_val].get('use'),
+                'type': metadata[bin_val].get('type'),
+                'materials': metadata[bin_val].get('material'),
+                'storytelling': metadata[bin_val].get('storytelling'),
+                'primary_aesthetic': metadata[bin_val].get('primary_aesthetic'),
+                'secondary_aesthetic': metadata[bin_val].get('secondary_aesthetic'),
+                'normalized_profile': metadata[bin_val].get('normalized_profile'),
+                'geocoded_lat': metadata[bin_val].get('geocoded_lat'),
+                'geocoded_lng': metadata[bin_val].get('geocoded_lng'),
+            })
+        enriched.append(candidate)
+
+    return enriched
+
+
+async def expand_search_radius(
+    session: AsyncSession,
+    lat: float,
+    lng: float,
+    bearing: float,
+    initial_radius: float = 100,
+    max_radius: float = 300,
+    step: float = 50
+) -> Dict[str, Any]:
+    """
+    Progressively expand search radius until buildings are found.
+
+    Used when initial cone search returns no results (parks, plazas, GPS drift).
+
+    Args:
+        session: Database session
+        lat: User latitude
+        lng: User longitude
+        bearing: Compass bearing
+        initial_radius: Starting radius (already tried)
+        max_radius: Maximum radius to try
+        step: Radius increment per attempt
+
+    Returns:
+        Search results with expanded radius info
+    """
+    current_radius = initial_radius + step
+
+    while current_radius <= max_radius:
+        logger.info(f"Expanding search radius to {current_radius}m")
+
+        result = await get_candidates_by_footprint(
+            session, lat, lng, bearing,
+            max_distance=current_radius,
+            cone_angle=90  # Wider cone for expanded search
+        )
+
+        if result['candidates']:
+            result['expanded_radius'] = current_radius
+            return result
+
+        current_radius += step
+
+    # No buildings found even at max radius
+    return {
+        'candidates': [],
+        'classification': 'none',
+        'top_confidence': 0.0,
+        'is_ambiguous': False,
+        'num_candidates': 0,
+        'expanded_radius': max_radius,
+        'message': 'No buildings found. Try moving closer to a building.'
+    }
+
+
+def calculate_bearing(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """
+    Calculate bearing from point 1 to point 2.
+
+    Returns bearing in degrees (0-360, 0=North).
+    """
+    lat1_rad = math.radians(lat1)
+    lat2_rad = math.radians(lat2)
+    lng_diff = math.radians(lng2 - lng1)
+
+    x = math.sin(lng_diff) * math.cos(lat2_rad)
+    y = (math.cos(lat1_rad) * math.sin(lat2_rad) -
+         math.sin(lat1_rad) * math.cos(lat2_rad) * math.cos(lng_diff))
+
+    bearing_rad = math.atan2(x, y)
+    bearing_deg = (math.degrees(bearing_rad) + 360) % 360
+
+    return bearing_deg
 
 
 def calculate_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     """
-    Calculate distance in meters between two points using Haversine formula
+    Calculate distance in meters between two points using Haversine formula.
     """
     R = 6371000  # Earth radius in meters
 
@@ -99,248 +584,30 @@ def calculate_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> fl
     return R * c
 
 
-def is_point_in_cone(
-    user_lat: float, user_lng: float,
-    point_lat: float, point_lng: float,
-    bearing: float, cone_angle: float, max_distance: float
-) -> bool:
+async def get_footprints_for_bins(bins: List[str]) -> Dict[str, str]:
+    """Fetch GeoJSON footprint for each BIN. Returns {bin: geojson_string}.
+
+    Used by the bail path so the iOS map picker can render polygons over the
+    map. Only fires when we've already decided to show the picker, so it's a
+    once-per-bail cost (5 BINs typical).
     """
-    Check if a point is within the user's view cone
-    """
-    distance = calculate_distance(user_lat, user_lng, point_lat, point_lng)
-    if distance > max_distance:
-        return False
-
-    point_bearing = calculate_bearing(user_lat, user_lng, point_lat, point_lng)
-    bearing_diff = abs(((point_bearing - bearing + 180) % 360) - 180)
-
-    return bearing_diff <= (cone_angle / 2)
-
-
-async def get_candidate_buildings(
-    session: AsyncSession,
-    lat: float,
-    lng: float,
-    bearing: float,
-    pitch: float = 0,
-    max_distance: Optional[float] = None,
-    max_candidates: Optional[int] = None
-) -> List[Dict[str, Any]]:
-    """
-    Get buildings within user's view cone, sorted by relevance
-
-    Args:
-        session: Database session
-        lat: User latitude
-        lng: User longitude
-        bearing: Compass bearing (0-360)
-        pitch: Phone pitch angle (-90 to 90)
-        max_distance: Max distance in meters (default from settings)
-        max_candidates: Max number to return (default from settings)
-
-    Returns:
-        List of candidate building dictionaries with metadata
-    """
-    if max_distance is None:
-        max_distance = settings.max_scan_distance_meters
-    if max_candidates is None:
-        max_candidates = settings.max_candidates
-
-    logger.info(f"Searching for buildings at ({lat}, {lng}), bearing {bearing}°, pitch {pitch}°")
-
-    # Calculate bounding box for initial filter (square around user)
-    # Approximate: 1 degree latitude ≈ 111km, 1 degree longitude ≈ 111km * cos(lat)
-    lat_delta = (max_distance / 111000) * 1.5  # Add 50% buffer
-    lng_delta = (max_distance / (111000 * math.cos(math.radians(lat)))) * 1.5
-
-    min_lat = lat - lat_delta
-    max_lat = lat + lat_delta
-    min_lng = lng - lng_delta
-    max_lng = lng + lng_delta
-
-    # Build query with bounding box filter
-    # Cast text columns to float for comparison
-    query = (
-        select(Building)
-        .where(cast(Building.latitude, Float) >= min_lat)
-        .where(cast(Building.latitude, Float) <= max_lat)
-        .where(cast(Building.longitude, Float) >= min_lng)
-        .where(cast(Building.longitude, Float) <= max_lng)
-        .where(Building.latitude != None)
-        .where(Building.longitude != None)
-        .where(Building.latitude != '')
-        .where(Building.longitude != '')
-    )
-
-    # Execute query
-    result = await session.execute(query)
-    buildings = result.scalars().all()
-
-    logger.info(f"Found {len(buildings)} buildings in bounding box")
-
-    # Filter buildings in view cone and calculate metadata
-    candidates = []
-
-    for building in buildings:
-        try:
-            # Parse lat/lng from text
-            b_lat = float(building.latitude) if building.latitude else None
-            b_lng = float(building.longitude) if building.longitude else None
-
-            if b_lat is None or b_lng is None:
-                continue
-
-            # Calculate distance
-            distance = calculate_distance(lat, lng, b_lat, b_lng)
-
-            # Check if in view cone
-            if not is_point_in_cone(lat, lng, b_lat, b_lng, bearing, settings.cone_angle_degrees, max_distance):
-                continue
-
-            # Calculate bearing from user to building
-            building_bearing = calculate_bearing(lat, lng, b_lat, b_lng)
-
-            # Calculate bearing difference (0-180)
-            bearing_diff = abs(((building_bearing - bearing + 180) % 360) - 180)
-
-            # Parse other fields
-            bin_val = str(building.bin).replace('.0', '') if building.bin else 'N/A'
-
-            # Skip public spaces
-            if bin_val == 'N/A':
-                continue
-
-            candidates.append({
-                'bin': bin_val,
-                'bbl': str(building.bbl).replace('.0', '') if building.bbl else None,
-                'address': building.address,
-                'borough': building.borough,
-                'latitude': b_lat,
-                'longitude': b_lng,
-                'distance_meters': round(distance, 2),
-                'bearing_to_building': round(building_bearing, 1),
-                'bearing_difference': round(bearing_diff, 1),
-            })
-        except (ValueError, TypeError) as e:
-            logger.warning(f"Skipping building due to parse error: {e}")
-            continue
-
-    logger.info(f"Found {len(candidates)} candidate buildings in view cone")
-
-    # Sort by combined relevance score
-    candidates.sort(key=lambda x: calculate_relevance_score(x), reverse=True)
-
-    return candidates[:max_candidates]
-
-
-def calculate_bearing(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-    """
-    Calculate bearing from point 1 to point 2
-    Returns bearing in degrees (0-360, 0=North)
-    """
-    lat1_rad = math.radians(lat1)
-    lat2_rad = math.radians(lat2)
-    lng_diff = math.radians(lng2 - lng1)
-
-    x = math.sin(lng_diff) * math.cos(lat2_rad)
-    y = math.cos(lat1_rad) * math.sin(lat2_rad) - \
-        math.sin(lat1_rad) * math.cos(lat2_rad) * math.cos(lng_diff)
-
-    bearing_rad = math.atan2(x, y)
-    bearing_deg = (math.degrees(bearing_rad) + 360) % 360
-
-    return bearing_deg
-
-
-def calculate_relevance_score(candidate: Dict[str, Any]) -> float:
-    """
-    Calculate relevance score for sorting candidates
-    Combines distance and bearing alignment
-    """
-    score = 0.0
-
-    # Distance score: exponential decay — 1.0 at 0m, 0.37 at 30m, 0.14 at 60m
-    distance = candidate.get('distance_meters', float('inf'))
-    distance_score = math.exp(-distance / 30.0)
-    score += distance_score * 1.5  # Weight distance more heavily than bearing
-
-    # Bearing alignment score (more aligned = better)
-    # 0-15°: 1.0, 15-30°: 0.5, 30+°: 0.2
-    bearing_diff = candidate.get('bearing_difference', 180)
-    if bearing_diff < 15:
-        score += 1.0
-    elif bearing_diff < 30:
-        score += 0.5
-    else:
-        score += 0.2
-
-    return score
-
-
-async def get_buildings_in_radius(
-    session: AsyncSession,
-    lat: float,
-    lng: float,
-    radius_meters: float = 50
-) -> List[Dict[str, Any]]:
-    """
-    Simple radius-based search (fallback if cone search fails)
-    """
-    # Calculate bounding box
-    lat_delta = (radius_meters / 111000) * 1.5
-    lng_delta = (radius_meters / (111000 * math.cos(math.radians(lat)))) * 1.5
-
-    min_lat = lat - lat_delta
-    max_lat = lat + lat_delta
-    min_lng = lng - lng_delta
-    max_lng = lng + lng_delta
-
-    # Query buildings in bounding box
-    query = (
-        select(Building)
-        .where(cast(Building.latitude, Float) >= min_lat)
-        .where(cast(Building.latitude, Float) <= max_lat)
-        .where(cast(Building.longitude, Float) >= min_lng)
-        .where(cast(Building.longitude, Float) <= max_lng)
-        .where(Building.latitude != None)
-        .where(Building.longitude != None)
-        .where(Building.latitude != '')
-        .where(Building.longitude != '')
-    )
-
-    result = await session.execute(query)
-    buildings = result.scalars().all()
-
-    # Filter by actual distance and prepare output
-    candidates = []
-    for building in buildings:
-        try:
-            b_lat = float(building.latitude) if building.latitude else None
-            b_lng = float(building.longitude) if building.longitude else None
-
-            if b_lat is None or b_lng is None:
-                continue
-
-            distance = calculate_distance(lat, lng, b_lat, b_lng)
-
-            if distance <= radius_meters:
-                bin_val = str(building.bin).replace('.0', '') if building.bin else 'N/A'
-
-                if bin_val == 'N/A':
-                    continue
-
-                candidates.append({
-                    'bin': bin_val,
-                    'bbl': str(building.bbl).replace('.0', '') if building.bbl else None,
-                    'address': building.address,
-                    'latitude': b_lat,
-                    'longitude': b_lng,
-                    'distance_meters': round(distance, 2),
-                })
-        except (ValueError, TypeError):
-            continue
-
-    # Sort by distance
-    candidates.sort(key=lambda x: x['distance_meters'])
-
-    return candidates[:settings.max_candidates]
+    if not bins:
+        return {}
+    clean = [str(b).replace(".0", "").strip() for b in bins if b]
+    if not clean:
+        return {}
+    try:
+        async with get_footprints_db() as db:
+            if db is None:
+                return {}
+            result = await db.execute(
+                text(
+                    "SELECT bin, ST_AsGeoJSON(footprint) AS geojson "
+                    "FROM building_footprints WHERE bin = ANY(:bins)"
+                ),
+                {"bins": clean},
+            )
+            return {row.bin: row.geojson for row in result.fetchall() if row.geojson}
+    except Exception as e:
+        logger.warning(f"get_footprints_for_bins failed: {e}")
+        return {}

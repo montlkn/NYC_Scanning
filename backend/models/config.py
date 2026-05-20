@@ -70,13 +70,12 @@ class Settings(BaseSettings):
     precache_top_n_buildings: int = 5000
     precache_cardinal_directions: list = [0, 90, 180, 270]
 
-    # V2 Scan System Configuration
-    use_scan_v2: bool = False  # Set to True to use footprint-based scanning
-    v2_ambiguity_threshold: float = 15.0  # Score gap below which CLIP is used
-    v2_single_building_confidence: float = 95.0  # Confidence for single building in cone
-    v2_clear_winner_confidence: float = 85.0  # Confidence for clear geometric winner
-    v2_expanded_radius_max: float = 300.0  # Max radius for expanded search (meters)
-    v2_expanded_radius_step: float = 50.0  # Step size for radius expansion
+    # Scan System Configuration (footprint-based)
+    v2_ambiguity_threshold: float = 15.0
+    v2_single_building_confidence: float = 95.0
+    v2_clear_winner_confidence: float = 85.0
+    v2_expanded_radius_max: float = 300.0
+    v2_expanded_radius_step: float = 50.0
 
     class Config:
         env_file = ".env"

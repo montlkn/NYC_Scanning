@@ -30,7 +30,7 @@ from models.footprints_session import get_footprints_db
 from models.session import AsyncSessionLocal
 from pipeline.config import PipelineConfig
 from services.clip_matcher import encode_photo, get_model
-from services.geospatial_v2 import calculate_bearing
+from services.geospatial import calculate_bearing
 
 logger = logging.getLogger(__name__)
 settings = get_settings()

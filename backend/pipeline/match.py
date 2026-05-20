@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from models.session import AsyncSessionLocal
 from pipeline import retrieval, scoring, telemetry
 from pipeline.config import get_pipeline_config
-from services.geospatial_v2 import enrich_candidates_with_metadata
+from services.geospatial import enrich_candidates_with_metadata
 from services import clip_disambiguation
 
 logger = logging.getLogger(__name__)
@@ -173,7 +173,7 @@ async def run(
     # original fetch at step 4 runs too late (after scoring) to feed them.
     if tap_x is not None and tap_y is not None:
         try:
-            from services.geospatial_v2 import get_footprints_for_bins
+            from services.geospatial import get_footprints_for_bins
             geom_by_bin = await get_footprints_for_bins(
                 [str(c.get("bin") or "") for c in enriched_cands[:20]]
             )
@@ -505,7 +505,7 @@ async def run(
     # picker can render polygons. Cheap query (~5 BINs by primary key).
     fetch_geom_task = None
     if bail or show_picker:
-        from services.geospatial_v2 import get_footprints_for_bins
+        from services.geospatial import get_footprints_for_bins
         fetch_geom_task = asyncio.create_task(
             get_footprints_for_bins([str(c.get("bin") or "") for c in out])
         )
