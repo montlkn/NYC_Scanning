@@ -28,7 +28,6 @@ from models.session import AsyncSessionLocal
 from pipeline import retrieval, scoring, telemetry
 from pipeline.config import get_pipeline_config
 from services.geospatial import enrich_candidates_with_metadata
-from services import clip_disambiguation
 
 logger = logging.getLogger(__name__)
 _cfg = get_pipeline_config()
@@ -117,6 +116,8 @@ async def run(
     tap_mask_w: int = 0,
     tap_mask_h: int = 0,
     tap_depth_m: Optional[float] = None,
+    nearest_poi: Optional[str] = None,
+    gps_source: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Execute the full matching pipeline.
@@ -138,35 +139,10 @@ async def run(
     if not raw_candidates:
         return _empty_response(retrieval_meta, t_start)
 
-    # ── 2. Enrich metadata + fast-path CLIP on top-3 (parallel) ────────────────
-    # Fast path: if the top-3 by visibility-score already has a clear visual
-    # winner, we skip ranking the rest of the cone. Saves latency on easy scans.
-    top3 = raw_candidates[:3]
-
-    async def _clip_top3():
-        async with AsyncSessionLocal() as clip_sess:
-            return await clip_disambiguation.disambiguate_candidates(
-                session=clip_sess,
-                user_photo_url=user_photo_url,
-                candidates=top3,
-                user_lat=lat,
-                user_lng=lng,
-                user_bearing=bearing,
-            )
-
-    enriched_cands, clip_result = await asyncio.gather(
-        enrich_candidates_with_metadata(session, raw_candidates),
-        _clip_top3(),
-    )
-
-    clip_cost = clip_result.get("cost_usd", 0.0)
-    clip_method = clip_result.get("method", "unknown")
-
-    # Merge top-3 CLIP scores back onto the enriched candidates.
-    clip_by_bin = {c["bin"]: c for c in clip_result.get("matches", [])}
-    for c in enriched_cands:
-        if c["bin"] in clip_by_bin:
-            c["clip_similarity"] = clip_by_bin[c["bin"]].get("clip_similarity", 0.0)
+    # ── 2. Enrich metadata (CLIP fully removed) ────────────────────────────────
+    enriched_cands = await enrich_candidates_with_metadata(session, raw_candidates)
+    clip_cost = 0.0
+    clip_method = "bypassed"
 
     # When tap is present, fetch footprints up front — both the IoU
     # pre-filter and the facade-edge matcher below need them, and the
@@ -314,49 +290,7 @@ async def run(
         except Exception as e:
             logger.warning(f"[{scan_id}] tap facade match failed (continuing): {e}")
 
-    # ── 2a. Fast-path check ───────────────────────────────────────────────────
-    # Inspect just the top-3 CLIP scores. If the leader is clearly winning,
-    # don't bother CLIP-ranking the rest of the cone.
-    top3_clip = sorted(
-        [c.get("clip_similarity", 0.0) for c in enriched_cands[:3]],
-        reverse=True,
-    )
-    fast_path = (
-        len(top3_clip) >= 2
-        and top3_clip[0] / 100.0 >= _cfg.fast_path_clip_threshold
-        and (top3_clip[0] - top3_clip[1]) / 100.0 >= _cfg.fast_path_clip_margin
-    )
-
-    retrieval_meta["fast_path"] = fast_path
-    if not fast_path:
-        # CLIP-rank the rest of the cone (the actual 555 Park fix). Most of
-        # these will hit cached embeddings from F1 so the cost is near-zero.
-        already_ranked = set(clip_by_bin.keys())
-        rest = [
-            c for c in enriched_cands
-            if c.get("bin") and c["bin"] not in already_ranked
-        ][: max(0, _cfg.full_cone_clip_pool - len(already_ranked))]
-        if rest:
-            logger.info(
-                f"Fast path skipped; CLIP-ranking {len(rest)} more cone candidates"
-            )
-            async with AsyncSessionLocal() as wide_sess:
-                wider = await clip_disambiguation.disambiguate_candidates(
-                    session=wide_sess,
-                    user_photo_url=user_photo_url,
-                    candidates=rest,
-                    user_lat=lat,
-                    user_lng=lng,
-                    user_bearing=bearing,
-                )
-            wider_by_bin = {c["bin"]: c for c in wider.get("matches", [])}
-            for c in enriched_cands:
-                if c["bin"] in wider_by_bin:
-                    c["clip_similarity"] = wider_by_bin[c["bin"]].get(
-                        "clip_similarity", 0.0
-                    )
-            clip_cost += wider.get("cost_usd", 0.0)
-            retrieval_meta["wide_clip_ranked"] = len(rest)
+    retrieval_meta["clip_bypassed"] = True
 
     # The tap is the new high-signal source — same role CLIP used to play,
     # except it's user-driven and grounded in PLUTO's authoritative city
@@ -410,7 +344,29 @@ async def run(
             retrieval_meta["tap_winner"] = _tap_winner_bin
             retrieval_meta["tap_winner_via"] = _tap_winner_via
 
-    # ── 3a. P4: Grok Vision disambig on close calls ──────────────────────────
+    # ── 3a. MapKit POI boost: landmark prior from client ─────────────────────
+    # The iOS client runs a MapKit POI search before each scan. If a named
+    # landmark is within 30m, its name is sent as `nearest_poi`. This is a
+    # near-certain identity signal — boost that candidate above the auto-confirm
+    # threshold so geometry ambiguity between same-block neighbors can't override.
+    if nearest_poi and candidates and not _tap_winner_bin:
+        poi_lower = nearest_poi.lower().strip()
+        for i, c in enumerate(candidates):
+            cname = (c.get("building_name") or c.get("name") or c.get("address") or "").lower()
+            caddr = (c.get("address") or "").lower()
+            if poi_lower and (poi_lower in cname or poi_lower in caddr
+                              or cname in poi_lower):
+                # Float to top with auto-confirm confidence.
+                c["confidence"] = max(c.get("confidence", 0.0), 0.85)
+                c["verification_method_override"] = "nearest_poi"
+                candidates = [c] + [x for j, x in enumerate(candidates) if j != i]
+                bail = False
+                show_picker = False
+                retrieval_meta["poi_winner"] = c.get("bin")
+                retrieval_meta["poi_name"] = nearest_poi
+                break
+
+    # ── 3b. P4: Grok Vision disambig on close calls ──────────────────────────
     # When CLIP can't separate the top candidates (which is the consulate /
     # row-house / 555-corner failure mode), ask a VLM that can read flags
     # and address numbers. Triggers only on ambiguous scans (~10-30% of total).

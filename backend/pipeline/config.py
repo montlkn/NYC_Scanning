@@ -41,8 +41,9 @@ class PipelineConfig:
     # than the actual target. Footprint geometry (distance + alignment) is the
     # right tiebreaker for those cases — buildings on the wrong block should
     # not win on CLIP alone. So footprint gets nontrivial weight.
-    w_footprint: float = float(os.environ.get("PIPELINE_W_FOOTPRINT", 0.45))
-    w_clip_image: float = float(os.environ.get("PIPELINE_W_CLIP_IMAGE", 0.55))
+    # CLIP fully bypassed — all weight on footprint signal.
+    w_footprint: float = float(os.environ.get("PIPELINE_W_FOOTPRINT", 1.0))
+    w_clip_image: float = float(os.environ.get("PIPELINE_W_CLIP_IMAGE", 0.0))
 
     # ─── Calibration ──────────────────────────────────────────────────────────
     softmax_temperature: float = float(os.environ.get("PIPELINE_TEMP", 0.25))

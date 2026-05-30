@@ -611,3 +611,105 @@ async def get_footprints_for_bins(bins: List[str]) -> Dict[str, str]:
     except Exception as e:
         logger.warning(f"get_footprints_for_bins failed: {e}")
         return {}
+
+
+async def find_by_address_tokens(
+    session: AsyncSession,
+    lat: float,
+    lng: float,
+    radius_m: float,
+    number_tokens: List[str],
+    name_tokens: List[str],
+    limit: int = 10,
+) -> List[Dict[str, Any]]:
+    """
+    OCR-driven widening: find buildings within radius_m of (lat, lng) whose
+    address starts with one of `number_tokens` OR whose building_name
+    contains any of `name_tokens`. Returns candidates in the same shape as
+    cone-retrieval rows so they merge cleanly into the pipeline.
+
+    Uses a bbox pre-filter in SQL + exact Haversine in Python — avoids
+    requiring the `earthdistance` Postgres extension.
+    """
+    if not number_tokens and not name_tokens:
+        return []
+
+    # bbox in degrees (1° ≈ 111km). Add 20% margin so we don't miss buildings
+    # right at the edge after Haversine refinement.
+    deg = (float(radius_m) * 1.2) / 111000.0
+    params: Dict[str, Any] = {
+        "min_lat": lat - deg, "max_lat": lat + deg,
+        "min_lng": lng - deg, "max_lng": lng + deg,
+    }
+    clauses = []
+    for i, num in enumerate(number_tokens):
+        key = f"num{i}"
+        params[key] = num
+        clauses.append(f"(address ILIKE :{key} || ' %' OR address ILIKE :{key} || '-%')")
+    for i, name in enumerate(name_tokens):
+        key = f"name{i}"
+        params[key] = f"%{name}%"
+        clauses.append(f"building_name ILIKE :{key}")
+    if not clauses:
+        return []
+    where_text = " OR ".join(clauses)
+
+    try:
+        result = await session.execute(
+            text(f"""
+                SELECT
+                    REPLACE(bin, '.0', '') AS bin,
+                    bbl,
+                    building_name,
+                    address,
+                    geocoded_lat,
+                    geocoded_lng
+                FROM buildings_full_merge_scanning
+                WHERE geocoded_lat IS NOT NULL
+                  AND geocoded_lng IS NOT NULL
+                  AND geocoded_lat::float BETWEEN :min_lat AND :max_lat
+                  AND geocoded_lng::float BETWEEN :min_lng AND :max_lng
+                  AND ({where_text})
+                LIMIT 100
+            """),
+            params,
+        )
+        rows = result.fetchall()
+    except Exception as e:
+        logger.warning(f"find_by_address_tokens query failed: {e}")
+        try:
+            await session.rollback()
+        except Exception:
+            pass
+        return []
+
+    # Refine: exact Haversine to drop bbox false-positives, sort by distance.
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            lat_f = float(row[4])
+            lng_f = float(row[5])
+        except (TypeError, ValueError):
+            continue
+        # Haversine in metres.
+        from math import radians, sin, cos, asin, sqrt
+        dlat = radians(lat_f - lat)
+        dlng = radians(lng_f - lng)
+        a = sin(dlat/2)**2 + cos(radians(lat)) * cos(radians(lat_f)) * sin(dlng/2)**2
+        dist_m = 2 * 6371000 * asin(sqrt(a))
+        if dist_m > float(radius_m):
+            continue
+        out.append({
+            "bin": str(row[0]) if row[0] else None,
+            "bbl": str(row[1]).replace(".0", "") if row[1] else None,
+            "name": row[2],
+            "building_name": row[2],
+            "address": row[3],
+            "geocoded_lat": lat_f,
+            "geocoded_lng": lng_f,
+            "distance_meters": round(dist_m, 2),
+            "footprint_score": 0.85,
+            "ocr_match": True,
+        })
+    out.sort(key=lambda c: c.get("distance_meters") or 0)
+    return out[:limit]

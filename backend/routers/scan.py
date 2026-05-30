@@ -22,11 +22,13 @@ import asyncio
 import uuid
 import logging
 import time
+import re
+import json
 
 from models.database import Scan
 from models.session import get_db, AsyncSessionLocal
 from models.config import get_settings
-from services import geospatial, clip_disambiguation
+from services import geospatial
 from services.lore_generator import generate_building_lore
 from services.analytics import track_scan, track_confirmation
 from services.user_images import process_confirmed_scan
@@ -106,6 +108,9 @@ async def scan_building_v2(
     tap_mask_w: int = Form(0, description="Width of tap_mask_b64 in pixels"),
     tap_mask_h: int = Form(0, description="Height of tap_mask_b64 in pixels"),
     tap_depth_m: float = Form(None, description="ARKit sceneDepth at tap pixel (metres). Absent → flat-ground fallback."),
+    nearest_poi: str = Form(None, description="Nearest MapKit POI name within 30m, if found. Strong landmark prior."),
+    gps_source: str = Form(None, description="GPS pose source: arkit_geo, live, smoothed, etc."),
+    ocr_hints: str = Form(None, description="JSON array of strings extracted from the scan image by on-device Apple Vision OCR. Used to widen retrieval when compass is unreliable."),
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -139,8 +144,36 @@ async def scan_building_v2(
 
         logger.info(
             f"[{scan_id}] V2 scan at ({gps_lat:.6f}, {gps_lng:.6f}), "
-            f"bearing {compass_bearing:.1f}°, pitch {phone_pitch:.1f}°"
+            f"bearing {compass_bearing:.1f}°, pitch {phone_pitch:.1f}°, "
+            f"gps_acc={gps_accuracy}m, heading_acc={heading_accuracy}°"
         )
+
+        # === POSE GATE ===
+        # Reject scans where the user is clearly not aimed at a building.
+        # 0° = phone upright pointing at building. -90° = lens at ground. +90° = lens at sky.
+        # Outside |pitch| <= 60° we have no directional signal worth widening for.
+        if abs(phone_pitch) > 60:
+            logger.info(f"[{scan_id}] pose_rejected: pitch {phone_pitch:.1f}° outside ±60°")
+            return JSONResponse(status_code=200, content={
+                "scan_id": scan_id,
+                "error": "pose_rejected",
+                "reason": "bad_pitch",
+                "message": "Hold the phone upright and point it at the building.",
+                "matches": [],
+                "verification_method": "pose_rejected",
+                "processing_time_ms": int((datetime.now() - start_time).total_seconds() * 1000),
+            })
+        if gps_accuracy is not None and gps_accuracy > 30:
+            logger.info(f"[{scan_id}] pose_rejected: gps_accuracy {gps_accuracy}m > 30m")
+            return JSONResponse(status_code=200, content={
+                "scan_id": scan_id,
+                "error": "pose_rejected",
+                "reason": "bad_gps",
+                "message": "GPS signal is too weak. Step outside or wait a moment.",
+                "matches": [],
+                "verification_method": "pose_rejected",
+                "processing_time_ms": int((datetime.now() - start_time).total_seconds() * 1000),
+            })
 
         # === STEP 1: Process and upload user photo ===
         photo_start = time.time()
@@ -174,13 +207,17 @@ async def scan_building_v2(
         image.save(buffer, format='JPEG', quality=85, optimize=True)
         photo_bytes = buffer.getvalue()
 
-        # Widen cone for poor GPS or ultra-wide lens
+        # Widen cone for poor GPS or ultra-wide lens. Hard cap at 110° —
+        # anything wider is no longer a "cone," it's a fan that ranks by
+        # noise. The pose gate above ensures pitch/GPS are good enough that
+        # we don't need to fall back to a 156° city-block sweep.
         effective_cone = settings.cone_angle_degrees
         if gps_accuracy and gps_accuracy > 15:
             extra_gps = min(30, (gps_accuracy - 15) * 1.5)
             effective_cone += extra_gps
         if lens_type == "ultrawide":
             effective_cone += 20
+        effective_cone = min(effective_cone, 110.0)
         if effective_cone > settings.cone_angle_degrees:
             logger.info(
                 f"[{scan_id}] Cone widened: {settings.cone_angle_degrees}° → {effective_cone:.1f}° "
@@ -208,6 +245,8 @@ async def scan_building_v2(
                 tap_mask_w=tap_mask_w,
                 tap_depth_m=tap_depth_m,
                 tap_mask_h=tap_mask_h,
+                nearest_poi=nearest_poi,
+                gps_source=gps_source,
             )
 
             if pipeline_result.get("error") == "no_candidates":
@@ -226,6 +265,110 @@ async def scan_building_v2(
             show_picker = pipeline_result["show_picker"]
             verification_method = pipeline_result["verification_method"]
             total_time_ms = pipeline_result["processing_time_ms"]
+
+            # Drop candidates the client can't render at all: a label must
+            # exist. Coords are nice-to-have but the map picker falls back
+            # to footprint centroid when geocoded coords are missing.
+            def _renderable(c):
+                # Reject labels that are just "BIN <number>" — those are our
+                # own ugly fallback, not real data. Also reject pure-digit
+                # labels (raw BINs in the name column).
+                label = (c.get("building_name") or c.get("name") or c.get("address") or "").strip()
+                if not label:
+                    return False
+                lab = label.upper()
+                if lab.startswith("BIN "):
+                    # Fall through: maybe we have address too.
+                    return bool((c.get("address") or "").strip()) and not (c.get("address") or "").strip().upper().startswith("BIN ")
+                if label.replace(".", "").isdigit():
+                    return False
+                return True
+            before = len(raw_matches)
+            raw_matches = [c for c in raw_matches if _renderable(c)]
+            if before != len(raw_matches):
+                logger.info(f"[{scan_id}] renderable filter dropped {before - len(raw_matches)} of {before}")
+
+            # === OCR + GEOMETRY MERGE ===
+            # Both signals run. The photo is ground truth; the compass is
+            # the unreliable layer. So when OCR and geometry agree, that's
+            # a strong confirm — boost the agreeing candidate to the top.
+            # When they disagree, OCR wins because it's reading the actual
+            # facade. When OCR returns nothing useful, geometry stands.
+            ocr_tokens_num: list = []
+            ocr_tokens_name: list = []
+            if ocr_hints:
+                try:
+                    hints_list = json.loads(ocr_hints) if isinstance(ocr_hints, str) else list(ocr_hints)
+                except Exception:
+                    hints_list = []
+                joined = " ".join(str(s) for s in hints_list if s)
+                ocr_tokens_num = list({m for m in re.findall(r"\b\d{1,5}\b", joined)})
+                # Building/landmark names: alpha-heavy tokens, length 4+.
+                # Skip generic words so we don't widen for "ENTER" or "OPEN".
+                STOP = {"THE","AVE","STREET","ROAD","BLVD","BANK","HOTEL","OPEN","ENTER","EXIT","CLOSED","PARK","WEST","EAST","NORTH","SOUTH"}
+                ocr_tokens_name = list({
+                    w.upper() for w in re.findall(r"[A-Za-z]{4,}", joined)
+                    if w.upper() not in STOP
+                })[:5]
+
+            widened: list = []
+            if ocr_tokens_num or ocr_tokens_name:
+                widened = await geospatial.find_by_address_tokens(
+                    db, gps_lat, gps_lng,
+                    radius_m=500,
+                    number_tokens=ocr_tokens_num,
+                    name_tokens=ocr_tokens_name,
+                    limit=10,
+                )
+
+            top_conf_before = (raw_matches[0].get("confidence") or 0.0) if raw_matches else 0.0
+            compass_bad = heading_accuracy is None or float(heading_accuracy) > 20
+            ocr_action = "none"
+
+            if widened:
+                geo_bins = {c.get("bin") for c in raw_matches if c.get("bin")}
+                # Agreement: OCR found something that geometry also has.
+                agreeing = [w for w in widened if w.get("bin") in geo_bins]
+                # Disagreement: OCR found something(s) geometry didn't have.
+                new_only = [w for w in widened if w.get("bin") not in geo_bins]
+
+                if agreeing:
+                    # Pull the agreed BIN(s) to the front of raw_matches.
+                    agreed_bins = [w["bin"] for w in agreeing]
+                    promoted = [c for c in raw_matches if c.get("bin") in agreed_bins]
+                    rest = [c for c in raw_matches if c.get("bin") not in agreed_bins]
+                    for c in promoted:
+                        c["ocr_match"] = True
+                        # Bump confidence to reflect dual-signal agreement.
+                        c["confidence"] = max(c.get("confidence") or 0.0, 0.85)
+                    raw_matches = promoted + rest
+                    ocr_action = f"agreed:{len(agreeing)}"
+                elif new_only:
+                    # Geometry vs OCR disagree. Trust OCR. But only inject
+                    # the top OCR candidate(s) — not all 10 — to avoid
+                    # spamming the picker with every "101" in midtown.
+                    # When OCR returns just 1-2, we're confident; when it
+                    # returns many (e.g. "101 E 38th, 101 E 39th, 101 Park"
+                    # — all match "101"), still inject all but with the
+                    # closest first so the user sees ranked options.
+                    inject = new_only[: min(3, len(new_only))]
+                    for c in inject:
+                        c["confidence"] = 0.75 if len(inject) == 1 else 0.6
+                    raw_matches = inject + raw_matches
+                    ocr_action = f"override:{len(inject)}"
+
+            # Structured one-liner for log-grep + dashboarding. Keep keys stable.
+            compass_state = (
+                "unknown" if heading_accuracy is None
+                else ("stale" if float(heading_accuracy) > 20 else "ok")
+            )
+            widened_flag = bool(widened) and ocr_action != "none"
+            logger.info(
+                f"[{scan_id}] scan_compass_quality compass={compass_state} "
+                f"heading_acc={heading_accuracy} ocr_tokens={len(ocr_tokens_num) + len(ocr_tokens_name)} "
+                f"ocr_matches={len(widened)} widened={str(widened_flag).lower()} "
+                f"action={ocr_action} conf_before={top_conf_before:.2f}"
+            )
 
             matches = [_format_match_v3(c) for c in raw_matches]
 
@@ -381,55 +524,19 @@ async def scan_building_v2(
                     }
                 )
 
-        # === STEP 4: Metadata enrichment + CLIP validation ===
-        # Always run CLIP on top 3 candidates — footprint is a fast pre-filter,
-        # CLIP is the final arbiter. In dense Manhattan blocks adjacent buildings
-        # may overlap in the footprint cone; CLIP catches those mismatches.
-        # disambiguate_candidates fetches cached embeddings first (free), then
-        # falls back to on-demand Street View ($0.007/image) and caches the result.
+        # === STEP 4: Metadata enrichment (CLIP fully bypassed) ===
+        # CLIP was a slow, expensive, frequently-wrong final arbiter that pulled
+        # Street View images and ran image embeddings. We now rank purely on
+        # footprint geometry + bearing + tap overlap; the VLM (Grok) handles
+        # disambiguation when the picker fires.
         clip_time_ms = 0
         clip_cost = 0.0
         verification_method = f'footprint_{classification}'
-        clip_start = time.time()
 
-        logger.info(f"[{scan_id}] Running CLIP on top {min(len(candidates), 3)} candidates (always-on)...")
-
-        async def _run_clip():
-            async with AsyncSessionLocal() as clip_session:
-                return await clip_disambiguation.disambiguate_candidates(
-                    session=clip_session,
-                    user_photo_url=user_photo_url,
-                    candidates=candidates[:3],
-                    user_lat=gps_lat,
-                    user_lng=gps_lng,
-                    user_bearing=compass_bearing
-                )
-
-        enriched_candidates, clip_result = await asyncio.gather(
-            geospatial.enrich_candidates_with_metadata(db, candidates),
-            _run_clip()
-        )
-        clip_time_ms = int((time.time() - clip_start) * 1000)
-
-        # Merge CLIP re-ranking back onto enriched candidates
-        clip_by_bin = {c['bin']: c for c in clip_result['matches']}
-        candidates = []
-        for c in enriched_candidates:
-            if c['bin'] in clip_by_bin:
-                c.update({k: v for k, v in clip_by_bin[c['bin']].items()
-                           if k not in ('address', 'building_name', 'architect',
-                                        'style', 'year_built', 'is_landmark', 'use', 'type', 'materials')})
-            candidates.append(c)
+        enriched_candidates = await geospatial.enrich_candidates_with_metadata(db, candidates)
+        candidates = enriched_candidates
         candidates.sort(key=lambda x: x.get('combined_score', x.get('score', 0)), reverse=True)
-
-        clip_cost = clip_result.get('cost_usd', 0)
-        clip_method = clip_result.get('method', 'unknown')
-        if clip_method != 'failed':
-            verification_method = f"clip_{clip_method}"
-        logger.info(
-            f"[{scan_id}] CLIP: method={clip_method}, "
-            f"cost ${clip_cost:.4f}, in {clip_time_ms}ms"
-        )
+        logger.info(f"[{scan_id}] CLIP bypassed; ranking by footprint only")
 
         # === STEP 5: Prepare response ===
         total_time_ms = int((datetime.now() - start_time).total_seconds() * 1000)
