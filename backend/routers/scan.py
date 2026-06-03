@@ -116,6 +116,9 @@ async def scan_building_v2(
     tap_ray_hit_lat: float = Form(None, description="ARKit-geo lat of raycast hit point at the tapped pixel."),
     tap_ray_hit_lng: float = Form(None, description="ARKit-geo lng of raycast hit point at the tapped pixel."),
     tap_ray_distance_m: float = Form(None, description="Camera-to-hit distance in metres. Informational; backend extends the ray past the hit anyway."),
+    ocr_poi_name: str = Form(None, description="Name of a MapKit POI matched against OCR text on iOS (e.g. 'Pret A Manger'). Informational; backend uses the lat/lng for footprint containment."),
+    ocr_poi_lat: float = Form(None, description="Lat of the matched POI's pin. ST_Contains against building_footprints identifies the host building."),
+    ocr_poi_lng: float = Form(None, description="Lng of the matched POI's pin."),
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -396,6 +399,82 @@ async def scan_building_v2(
                             else:
                                 logger.info(f"[{scan_id}] tap_ray: hit BIN {ray_winner_bin} but no metadata in buildings DB")
 
+            # === TENANT POI PROMOTION ===
+            # iOS resolved an OCR phrase (e.g. "PRET A MANGER") against
+            # MapKit and got back a POI coordinate. We find the building
+            # whose footprint contains that point. Tenant signage is far
+            # more readable than address plaques in NYC photos, so this
+            # is the most reliable signal short of a direct address match.
+            #
+            # Confidence tiers — never auto-confirms alone:
+            #   - 0.90 if POI building == tap_ray winner (two signals agree)
+            #   - 0.90 if POI building is in cone top-3 (geometry agrees)
+            #   - 0.80 otherwise (picker may fire; user disambiguates)
+            poi_winner_bin: Optional[str] = None
+            if ocr_poi_lat is not None and ocr_poi_lng is not None:
+                poi_hit = await geospatial.find_building_containing_point(
+                    lat=ocr_poi_lat, lng=ocr_poi_lng,
+                )
+                if poi_hit and poi_hit.get("bin"):
+                    poi_winner_bin = poi_hit["bin"]
+                    agrees_with_ray = (ray_winner_bin is not None and ray_winner_bin == poi_winner_bin)
+                    top3_bins = {c.get("bin") for c in raw_matches[:3] if c.get("bin")}
+                    in_cone = poi_winner_bin in top3_bins
+                    target_conf = 0.90 if (agrees_with_ray or in_cone) else 0.80
+
+                    existing = next((c for c in raw_matches if c.get("bin") == poi_winner_bin), None)
+                    if existing:
+                        # Only bump, never lower — a ray-promoted candidate
+                        # at 0.95 shouldn't get demoted by a POI lookup.
+                        existing["confidence"] = max(existing.get("confidence") or 0.0, target_conf)
+                        existing["ocr_poi_winner"] = True
+                        existing["ocr_poi_name"] = ocr_poi_name
+                        # Move to front if not already.
+                        raw_matches = [existing] + [c for c in raw_matches if c is not existing]
+                        logger.info(
+                            f"[{scan_id}] ocr_poi: promoted BIN {poi_winner_bin} "
+                            f"({ocr_poi_name!r}, agrees_ray={agrees_with_ray}, in_cone={in_cone}, conf={existing['confidence']})"
+                        )
+                    else:
+                        try:
+                            hydrate = await db.execute(text("""
+                                SELECT REPLACE(bin, '.0', '') AS bin, bbl, building_name, address,
+                                       geocoded_lat, geocoded_lng, architect, style, year_built,
+                                       mat_prim
+                                FROM buildings_full_merge_scanning
+                                WHERE REPLACE(bin, '.0', '') = :bin LIMIT 1
+                            """), {"bin": poi_winner_bin})
+                            row = hydrate.fetchone()
+                        except Exception as e:
+                            logger.warning(f"[{scan_id}] ocr_poi hydrate failed: {e}")
+                            await db.rollback()
+                            row = None
+                        if row:
+                            poi_candidate = {
+                                "bin": row.bin, "bbl": str(row.bbl).replace(".0", "") if row.bbl else None,
+                                "building_name": row.building_name, "name": row.building_name or row.address,
+                                "address": row.address,
+                                "geocoded_lat": float(row.geocoded_lat) if row.geocoded_lat else None,
+                                "geocoded_lng": float(row.geocoded_lng) if row.geocoded_lng else None,
+                                "architect": row.architect, "style": row.style,
+                                "year_built": row.year_built,
+                                "materials": row.mat_prim,
+                                "footprint_geojson": poi_hit.get("footprint_geojson"),
+                                "confidence": target_conf,
+                                "ocr_poi_winner": True,
+                                "ocr_poi_name": ocr_poi_name,
+                            }
+                            raw_matches = [poi_candidate] + raw_matches
+                            logger.info(
+                                f"[{scan_id}] ocr_poi: injected BIN {poi_winner_bin} "
+                                f"({ocr_poi_name!r}, conf={target_conf})"
+                            )
+                        else:
+                            logger.info(
+                                f"[{scan_id}] ocr_poi: hit BIN {poi_winner_bin} ({ocr_poi_name!r}) "
+                                f"but no metadata in buildings DB"
+                            )
+
             # === OCR + GEOMETRY MERGE ===
             # Both signals run. The photo is ground truth; the compass is
             # the unreliable layer. So when OCR and geometry agree, that's
@@ -489,7 +568,8 @@ async def scan_building_v2(
                 f"heading_acc={heading_accuracy} ocr_tokens={len(ocr_tokens_num) + len(ocr_tokens_name)} "
                 f"ocr_matches={len(widened)} widened={str(widened_flag).lower()} "
                 f"action={ocr_action} conf_before={top_conf_before:.2f} "
-                f"tap_ray_winner={ray_winner_bin or 'none'}"
+                f"tap_ray_winner={ray_winner_bin or 'none'} "
+                f"poi_winner={poi_winner_bin or 'none'}"
             )
 
             matches = [_format_match_v3(c) for c in raw_matches]

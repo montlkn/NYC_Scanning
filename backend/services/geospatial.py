@@ -613,6 +613,51 @@ async def get_footprints_for_bins(bins: List[str]) -> Dict[str, str]:
         return {}
 
 
+async def find_building_containing_point(
+    lat: float,
+    lng: float,
+) -> Optional[Dict[str, Any]]:
+    """
+    Plan-view ST_Contains against building_footprints. Used by tenant POI
+    matching — Apple's POI graph hands us a tenant's lat/lng (e.g. "Pret
+    A Manger at 40.75094, -73.97852"); we resolve the building hosting
+    that tenant by finding the footprint that contains the point.
+
+    Why this is its own helper instead of a generic point-query:
+    - Footprints are 2D polygons; ST_Contains is O(log n) via the GIST
+      index, no bbox prefilter needed.
+    - Returns at most one BIN (footprints don't overlap in NYC PLUTO).
+    - Distinct from find_building_by_ray's segment-vs-polygon math.
+    """
+    try:
+        async with get_footprints_db() as db:
+            if db is None:
+                return None
+            sql = text("""
+                SELECT
+                    REPLACE(bin, '.0', '') AS bin,
+                    ST_AsGeoJSON(footprint) AS footprint_geojson
+                FROM building_footprints
+                WHERE ST_Contains(
+                    footprint,
+                    ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)
+                )
+                LIMIT 1
+            """)
+            result = await db.execute(sql, {"lat": lat, "lng": lng})
+            row = result.fetchone()
+    except Exception as e:
+        logger.warning(f"find_building_containing_point failed: {e}")
+        return None
+
+    if not row or not row.bin:
+        return None
+    return {
+        "bin": str(row.bin),
+        "footprint_geojson": row.footprint_geojson,
+    }
+
+
 async def find_building_by_ray(
     origin_lat: float,
     origin_lng: float,
