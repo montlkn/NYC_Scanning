@@ -2,18 +2,24 @@
 RAG Router - Retrieves historical context from NYC Landmarks PDF chunks
 """
 
-from fastapi import APIRouter, Query
+import os
+
+from fastapi import APIRouter, HTTPException, Query
 from typing import List, Optional
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
 router = APIRouter(prefix="/rag", tags=["rag"])
 
-RAILWAY_URL = "postgres://postgres:FgefB6c14fGCGbG4EdEb2a3D2F4b4cEB@metro.proxy.rlwy.net:56050/railway"
-
 
 def get_connection():
-    return psycopg2.connect(RAILWAY_URL, cursor_factory=RealDictCursor)
+    url = os.environ.get("FOOTPRINTS_DB_URL")
+    if not url:
+        raise HTTPException(
+            status_code=503,
+            detail="RAG database not configured (FOOTPRINTS_DB_URL unset)",
+        )
+    return psycopg2.connect(url, cursor_factory=RealDictCursor)
 
 
 @router.get("/search")
