@@ -1,11 +1,15 @@
 import os
 import posthog
 
-posthog.project_api_key = os.getenv('POSTHOG_API_KEY')
+_posthog_key = os.getenv('POSTHOG_API_KEY')
+posthog.project_api_key = _posthog_key
 posthog.host = 'https://app.posthog.com'
+_enabled = bool(_posthog_key)
+
 
 def track_scan(scan_id: str, result: dict):
-    """Track scan events for analytics"""
+    if not _enabled:
+        return
     posthog.capture(
         distinct_id=scan_id,
         event='building_scan',
@@ -18,8 +22,10 @@ def track_scan(scan_id: str, result: dict):
         }
     )
 
+
 def track_confirmation(scan_id: str, confirmed_bin: str, was_top_match: bool):
-    """Track user confirmations"""
+    if not _enabled:
+        return
     posthog.capture(
         distinct_id=scan_id,
         event='scan_confirmed',
