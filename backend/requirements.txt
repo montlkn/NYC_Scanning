@@ -19,11 +19,8 @@ supabase>=2.3.0
 # geopandas==0.14.3  # Not needed - using PostGIS
 shapely==2.0.3  # Keep for WKT parsing if needed
 
-# Image Processing & ML
+# Image Processing
 pillow==10.2.0
-open-clip-torch==2.24.0
-torch==2.2.0
-torchvision==0.17.0
 
 # HTTP & Storage
 httpx>=0.24.0,<0.25.0

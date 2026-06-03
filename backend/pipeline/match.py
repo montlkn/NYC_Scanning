@@ -592,7 +592,7 @@ async def _try_grok_disambig(
         if lat is None or lng is None:
             return None
 
-        from services.clip_disambiguation import fetch_street_view_image
+        from services.street_view import fetch_street_view_image
 
         async def _google(la: float, ln: float) -> Optional[bytes]:
             return await fetch_street_view_image(la, ln, 0)

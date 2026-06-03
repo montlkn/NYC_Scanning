@@ -18,7 +18,7 @@ import posthog
 from models.config import get_settings
 from models.session import init_db, close_db
 from models.footprints_session import init_footprints_engine, close_footprints_db
-from routers import scan, buildings, debug, confirm, contribute, stamps, vetting, similar_buildings, rag
+from routers import scan, buildings, stamps, vetting, rag
 
 # Configure logging
 logging.basicConfig(
@@ -71,13 +71,6 @@ async def lifespan(app: FastAPI):
     # Initialize footprints database (Railway)
     logger.info("Initializing footprints database connection (Railway)...")
     init_footprints_engine()
-
-    # Pre-warm CLIP model so first scan request doesn't pay the load penalty
-    logger.info("⏳ Pre-warming CLIP model...")
-    import asyncio
-    from services.clip_matcher import get_model
-    await asyncio.to_thread(get_model)
-    logger.info("✅ CLIP model ready")
 
     yield
 
@@ -151,7 +144,6 @@ async def health_check():
         "timestamp": time.time(),
         "checks": {
             "api": "ok",
-            "clip_model": "ok",  # TODO: Add actual health checks
             "database": "ok",
             "redis": "ok",
         }
@@ -161,16 +153,9 @@ async def health_check():
 # Include routers
 app.include_router(scan.router, prefix="/api", tags=["scan"])
 app.include_router(buildings.router, prefix="/api", tags=["buildings"])
-app.include_router(contribute.router, prefix="/api", tags=["contribute"])
 app.include_router(stamps.router, prefix="/api", tags=["stamps"])
 app.include_router(vetting.router, prefix="/api", tags=["vetting"])
-app.include_router(similar_buildings.router, prefix="/api", tags=["similar-buildings"])
 app.include_router(rag.router, prefix="/api", tags=["rag"])
-app.include_router(confirm.router, tags=["confirm"])
-
-# Debug endpoints (only in development)
-if settings.debug:
-    app.include_router(debug.router, prefix="/api/debug", tags=["debug"])
 
 
 if __name__ == "__main__":

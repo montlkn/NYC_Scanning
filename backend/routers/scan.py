@@ -16,8 +16,9 @@ Key improvements:
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import update, select
+from sqlalchemy import update, select, text
 from datetime import datetime, timezone
+from typing import Optional
 import asyncio
 import uuid
 import logging
@@ -31,7 +32,6 @@ from models.config import get_settings
 from services import geospatial
 from services.lore_generator import generate_building_lore
 from services.analytics import track_scan, track_confirmation
-from services.user_images import process_confirmed_scan
 from services.building_contribution import reverse_geocode_google
 from utils.storage import upload_image
 import pipeline.match as pipeline_match
@@ -111,6 +111,11 @@ async def scan_building_v2(
     nearest_poi: str = Form(None, description="Nearest MapKit POI name within 30m, if found. Strong landmark prior."),
     gps_source: str = Form(None, description="GPS pose source: arkit_geo, live, smoothed, etc."),
     ocr_hints: str = Form(None, description="JSON array of strings extracted from the scan image by on-device Apple Vision OCR. Used to widen retrieval when compass is unreliable."),
+    tap_ray_origin_lat: float = Form(None, description="ARKit-geo lat of camera at shutter. Together with hit_lat/lng forms a compass-free ray we intersect against footprints."),
+    tap_ray_origin_lng: float = Form(None, description="ARKit-geo lng of camera at shutter."),
+    tap_ray_hit_lat: float = Form(None, description="ARKit-geo lat of raycast hit point at the tapped pixel."),
+    tap_ray_hit_lng: float = Form(None, description="ARKit-geo lng of raycast hit point at the tapped pixel."),
+    tap_ray_distance_m: float = Form(None, description="Camera-to-hit distance in metres. Informational; backend extends the ray past the hit anyway."),
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -288,6 +293,109 @@ async def scan_building_v2(
             if before != len(raw_matches):
                 logger.info(f"[{scan_id}] renderable filter dropped {before - len(raw_matches)} of {before}")
 
+            # === TAP RAY PROMOTION ===
+            # ARKit handed us two geo-anchored points (camera origin + raycast
+            # hit). Draw a line between them in plan view, intersect against
+            # footprints, take the building closest to the origin.
+            #
+            # Confidence policy is deliberately conservative — the ray CAN be
+            # wrong (mis-localized VPS, stale anchor after walking, glass
+            # facade reflections). Tiered so the ray never auto-confirms
+            # unless geometry OR OCR agrees:
+            #   - In cone top-3:           0.90 (geometry + ray agree)
+            #   - In cone (not top-3):     0.80
+            #   - Not in cone at all:      0.65 (below picker threshold —
+            #                                    picker will fire so user
+            #                                    can sanity check)
+            #   - Ray + OCR address match: 0.95 (two independent signals)
+            # Also: VPS sanity-gate — if ARKit's origin is >50m from raw GPS,
+            # the visual lock is suspect, skip the ray entirely.
+            ray_winner_bin: Optional[str] = None
+            ray_sanity_ok = True
+            if (
+                tap_ray_origin_lat is not None and tap_ray_origin_lng is not None
+                and tap_ray_hit_lat is not None and tap_ray_hit_lng is not None
+            ):
+                # VPS sanity check: if ARKit's reported origin is >50m from
+                # raw GPS, the visual lock is probably wrong (or stale after
+                # walking). Distrust the ray entirely in that case rather than
+                # confidently picking the wrong building.
+                from math import radians, sin, cos, asin, sqrt
+                dlat = radians(tap_ray_origin_lat - gps_lat)
+                dlng = radians(tap_ray_origin_lng - gps_lng)
+                a = sin(dlat/2)**2 + cos(radians(gps_lat)) * cos(radians(tap_ray_origin_lat)) * sin(dlng/2)**2
+                origin_gps_drift_m = 2 * 6371000 * asin(sqrt(a))
+                if origin_gps_drift_m > 50:
+                    ray_sanity_ok = False
+                    logger.info(
+                        f"[{scan_id}] tap_ray: ignored — ARKit origin {origin_gps_drift_m:.1f}m "
+                        f"from raw GPS, VPS likely mis-localized"
+                    )
+
+                if ray_sanity_ok:
+                    ray_hit = await geospatial.find_building_by_ray(
+                        origin_lat=tap_ray_origin_lat, origin_lng=tap_ray_origin_lng,
+                        hit_lat=tap_ray_hit_lat, hit_lng=tap_ray_hit_lng,
+                    )
+                    if ray_hit and ray_hit.get("bin"):
+                        ray_winner_bin = ray_hit["bin"]
+                        # Cone top-3 = the geometry-trusted set we cross-check against.
+                        top3_bins = {c.get("bin") for c in raw_matches[:3] if c.get("bin")}
+                        in_top3 = ray_winner_bin in top3_bins
+                        existing = next((c for c in raw_matches if c.get("bin") == ray_winner_bin), None)
+                        if existing:
+                            # Both signals point here — confident but not gospel.
+                            existing["confidence"] = 0.90 if in_top3 else 0.80
+                            existing["tap_ray_winner"] = True
+                            raw_matches = [existing] + [c for c in raw_matches if c is not existing]
+                            logger.info(
+                                f"[{scan_id}] tap_ray: promoted BIN {ray_winner_bin} "
+                                f"(in_top3={in_top3}, conf={existing['confidence']})"
+                            )
+                        else:
+                            # Geometry didn't surface this building. Inject at
+                            # 0.65 — deliberately below the 0.70 auto-confirm
+                            # floor so the picker always fires when the ray
+                            # disagrees with the cone. User gets to pick
+                            # between the ray-suggested building and whatever
+                            # the cone surfaced, which is the right UX when
+                            # VPS might be subtly wrong.
+                            try:
+                                hydrate = await db.execute(text("""
+                                    SELECT REPLACE(bin, '.0', '') AS bin, bbl, building_name, address,
+                                           geocoded_lat, geocoded_lng, architect, style, year_built,
+                                           mat_prim
+                                    FROM buildings_full_merge_scanning
+                                    WHERE REPLACE(bin, '.0', '') = :bin LIMIT 1
+                                """), {"bin": ray_winner_bin})
+                                row = hydrate.fetchone()
+                            except Exception as e:
+                                logger.warning(f"[{scan_id}] tap_ray hydrate failed: {e}")
+                                await db.rollback()
+                                row = None
+                            if row:
+                                ray_candidate = {
+                                    "bin": row.bin, "bbl": str(row.bbl).replace(".0", "") if row.bbl else None,
+                                    "building_name": row.building_name, "name": row.building_name or row.address,
+                                    "address": row.address,
+                                    "geocoded_lat": float(row.geocoded_lat) if row.geocoded_lat else None,
+                                    "geocoded_lng": float(row.geocoded_lng) if row.geocoded_lng else None,
+                                    "architect": row.architect, "style": row.style,
+                                    "year_built": row.year_built,
+                                    "materials": row.mat_prim,
+                                    "footprint_geojson": ray_hit.get("footprint_geojson"),
+                                    "distance_meters": ray_hit.get("distance_to_origin_m"),
+                                    "confidence": 0.65,
+                                    "tap_ray_winner": True,
+                                }
+                                raw_matches = [ray_candidate] + raw_matches
+                                logger.info(
+                                    f"[{scan_id}] tap_ray: injected BIN {ray_winner_bin} "
+                                    f"(not in cone, conf=0.65 — picker will fire)"
+                                )
+                            else:
+                                logger.info(f"[{scan_id}] tap_ray: hit BIN {ray_winner_bin} but no metadata in buildings DB")
+
             # === OCR + GEOMETRY MERGE ===
             # Both signals run. The photo is ground truth; the compass is
             # the unreliable layer. So when OCR and geometry agree, that's
@@ -357,6 +465,19 @@ async def scan_building_v2(
                     raw_matches = inject + raw_matches
                     ocr_action = f"override:{len(inject)}"
 
+            # === Ray + OCR cross-validation ===
+            # When the ray-picked building's address starts with one of the
+            # OCR number tokens, both independent signals agree — bump to
+            # 0.95. This is the only path where the ray alone gets a near-
+            # auto-confirm score, because the OCR address match is direct
+            # evidence the user is looking at *that* address.
+            if ray_winner_bin and ocr_tokens_num and raw_matches and raw_matches[0].get("bin") == ray_winner_bin:
+                addr = (raw_matches[0].get("address") or "").strip()
+                if addr and any(addr.startswith(num + " ") or addr.startswith(num + "-") for num in ocr_tokens_num):
+                    raw_matches[0]["confidence"] = 0.95
+                    raw_matches[0]["tap_ray_ocr_agreement"] = True
+                    logger.info(f"[{scan_id}] tap_ray + OCR agree on BIN {ray_winner_bin} — confidence 0.95")
+
             # Structured one-liner for log-grep + dashboarding. Keep keys stable.
             compass_state = (
                 "unknown" if heading_accuracy is None
@@ -367,7 +488,8 @@ async def scan_building_v2(
                 f"[{scan_id}] scan_compass_quality compass={compass_state} "
                 f"heading_acc={heading_accuracy} ocr_tokens={len(ocr_tokens_num) + len(ocr_tokens_name)} "
                 f"ocr_matches={len(widened)} widened={str(widened_flag).lower()} "
-                f"action={ocr_action} conf_before={top_conf_before:.2f}"
+                f"action={ocr_action} conf_before={top_conf_before:.2f} "
+                f"tap_ray_winner={ray_winner_bin or 'none'}"
             )
 
             matches = [_format_match_v3(c) for c in raw_matches]
@@ -747,29 +869,10 @@ async def confirm_building_v2(
 
         was_correct = scan.top_match_bin == confirmed_bin
 
-        # Process photo for re-embedding if in top 3
-        reembedding_result = None
-        if scan_id in _scan_cache and was_in_top_3:
-            cached_data = _scan_cache[scan_id]
-
-            reembedding_result = await process_confirmed_scan(
-                db=db,
-                scan_id=scan_id,
-                photo_bytes=cached_data['photo_bytes'],
-                user_photo_url=cached_data['user_photo_url'],
-                confirmed_bin=confirmed_bin,
-                gps_lat=cached_data['gps_lat'],
-                gps_lng=cached_data['gps_lng'],
-                compass_bearing=cached_data['compass_bearing'],
-                phone_pitch=cached_data.get('phone_pitch', 0.0),
-                user_id=cached_data.get('user_id'),
-            )
-
+        # Photo already lives in R2 from the initial scan upload (see scans/{scan_id}.jpg).
+        # A separate embeddings job will read R2 and write reference_embeddings.
+        if scan_id in _scan_cache:
             del _scan_cache[scan_id]
-            logger.info(f"[{scan_id}] Photo processed for re-embedding")
-        elif scan_id in _scan_cache:
-            del _scan_cache[scan_id]
-            logger.info(f"[{scan_id}] Photo discarded (not in top 3)")
 
         # Update scan record. verification_method is captured as gold-quality
         # signal for the flywheel — map_picker rows are user-tap-accurate ground
@@ -810,7 +913,7 @@ async def confirm_building_v2(
         )
 
         # Calculate rewards
-        if was_in_top_3 and reembedding_result and reembedding_result.get('added_to_references'):
+        if was_in_top_3:
             rewards = {'xp': 10, 'message': 'Photo contribution accepted! +10 XP'}
         elif was_correct:
             rewards = {'xp': 5, 'message': 'Confirmed! +5 XP'}
@@ -823,7 +926,7 @@ async def confirm_building_v2(
             'confirmed_bin': confirmed_bin,
             'was_in_top_3': was_in_top_3,
             'was_correct': was_correct,
-            'embedding_generated': was_in_top_3 and (reembedding_result is not None),
+            'embedding_generated': False,
             'rewards': rewards
         }
 

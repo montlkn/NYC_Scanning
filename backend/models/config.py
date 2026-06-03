@@ -60,11 +60,6 @@ class Settings(BaseSettings):
     street_view_pitch: int = 10
     street_view_fov: int = 60
 
-    # CLIP Model Configuration
-    clip_model_name: str = "ViT-B-32"
-    clip_pretrained: str = "openai"  # Must match the weights used to generate DB embeddings
-    clip_device: str = "auto"  # Auto-detects GPU; clip_matcher uses torch.cuda.is_available()
-
     # Cache Configuration
     cache_ttl_seconds: int = 86400  # 24 hours
     precache_top_n_buildings: int = 5000
