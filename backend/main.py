@@ -164,10 +164,14 @@ if __name__ == "__main__":
     # Never use reload in production - it doubles memory usage
     use_reload = settings.debug and not os.getenv("RENDER")
 
+    # Render (and most PaaS) assigns a dynamic port via $PORT. Honor it
+    # when present so the container actually binds where Render expects;
+    # without this, the process binds to settings.api_port (8000), the
+    # health-check fails, and Render keeps the previous revision serving.
     uvicorn.run(
         "main:app",
         host=settings.api_host,
-        port=settings.api_port,
+        port=int(os.getenv("PORT", settings.api_port)),
         reload=use_reload,
         log_level="info" if settings.debug else "warning"
     )

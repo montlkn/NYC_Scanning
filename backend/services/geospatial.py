@@ -613,6 +613,100 @@ async def get_footprints_for_bins(bins: List[str]) -> Dict[str, str]:
         return {}
 
 
+async def find_building_by_ray(
+    origin_lat: float,
+    origin_lng: float,
+    hit_lat: float,
+    hit_lng: float,
+    extend_m: float = 30.0,
+    max_distance_m: float = 200.0,
+) -> Optional[Dict[str, Any]]:
+    """
+    Plan-view ray vs footprints: ARKit gives us two geo-anchored points,
+    we draw the line origin → (hit extended `extend_m` past), and pick the
+    footprint it pierces closest to origin. Zero compass dependency.
+
+    Why extend past the hit:
+    - Raycast often lands a metre or two short of the actual facade plane
+      (depth confidence trims the leading edge).
+    - Pushing the segment 30m past the hit catches the building even when
+      the depth estimate is conservative, without spilling into the block
+      behind it (NYC blocks are ~80m on the short axis).
+
+    Returns: dict with bin, distance_to_origin_m, footprint_geojson, or
+    None when no footprint is hit. Caller then joins this BIN against
+    buildings_full_merge_scanning to populate name/address.
+    """
+    # Extend the segment past the hit point. Pure 2D extension in lat/lng —
+    # we drop altitude entirely because footprints are 2D polygons.
+    seg_dlat = hit_lat - origin_lat
+    seg_dlng = hit_lng - origin_lng
+    # Segment length in metres (rough; 1° lat ≈ 111km, 1° lng ≈ 111km·cos(lat)).
+    cos_lat = math.cos(math.radians(origin_lat))
+    seg_m = math.sqrt((seg_dlat * 111000) ** 2 + (seg_dlng * 111000 * cos_lat) ** 2)
+    if seg_m < 0.5:
+        return None
+    scale = (seg_m + extend_m) / seg_m
+    end_lat = origin_lat + seg_dlat * scale
+    end_lng = origin_lng + seg_dlng * scale
+
+    # bbox in degrees for the prefilter. Pad ~20m for footprint widths that
+    # cross the segment's axis-aligned bounds.
+    pad_deg = 20 / 111000.0
+    min_lat = min(origin_lat, end_lat) - pad_deg
+    max_lat = max(origin_lat, end_lat) + pad_deg
+    min_lng = min(origin_lng, end_lng) - pad_deg
+    max_lng = max(origin_lng, end_lng) + pad_deg
+
+    try:
+        async with get_footprints_db() as db:
+            if db is None:
+                return None
+            sql = text("""
+                WITH ray AS (
+                    SELECT ST_SetSRID(ST_MakeLine(
+                        ST_MakePoint(:o_lng, :o_lat),
+                        ST_MakePoint(:e_lng, :e_lat)
+                    ), 4326) AS line
+                )
+                SELECT
+                    REPLACE(bf.bin, '.0', '') AS bin,
+                    ST_AsGeoJSON(bf.footprint) AS footprint_geojson,
+                    ST_Distance(
+                        ST_SetSRID(ST_MakePoint(:o_lng, :o_lat), 4326)::geography,
+                        bf.footprint::geography
+                    ) AS dist_origin_m
+                FROM building_footprints bf, ray
+                WHERE bf.footprint && ST_MakeEnvelope(:min_lng, :min_lat, :max_lng, :max_lat, 4326)
+                  AND ST_Intersects(bf.footprint, ray.line)
+                ORDER BY dist_origin_m ASC
+                LIMIT 5
+            """)
+            result = await db.execute(sql, {
+                "o_lat": origin_lat, "o_lng": origin_lng,
+                "e_lat": end_lat, "e_lng": end_lng,
+                "min_lat": min_lat, "max_lat": max_lat,
+                "min_lng": min_lng, "max_lng": max_lng,
+            })
+            rows = result.fetchall()
+    except Exception as e:
+        logger.warning(f"find_building_by_ray failed: {e}")
+        return None
+
+    if not rows:
+        return None
+
+    top = rows[0]
+    dist = float(top.dist_origin_m or 0.0)
+    if dist > max_distance_m:
+        return None
+    return {
+        "bin": str(top.bin) if top.bin else None,
+        "distance_to_origin_m": round(dist, 2),
+        "footprint_geojson": top.footprint_geojson,
+    }
+
+
 async def find_by_address_tokens(
     session: AsyncSession,
     lat: float,
