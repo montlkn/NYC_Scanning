@@ -502,8 +502,47 @@ def compute_tap_overlap_score(
         except Exception:
             pass
 
-    # Fallback: is the tap point inside the projected polygon?
-    return 1.0 if _point_in_poly(tap_x, tap_y, poly) else 0.0
+    # Empty-mask path: user tapped on background (no foreground instance
+    # under the tap). Without segmentation we can't tell the user's intent
+    # from pixels — we only know which projected footprints CONTAIN the
+    # tap point. Multiple candidates can; previously we returned 1.0 for
+    # all containers and lost to whatever came first in the cone-sorted
+    # list (= the closest parcel, which is often a car-occupied tax lot
+    # between user and the actual building they meant).
+    #
+    # Fix: weight by footprint area (buildings are >500 m², cars/awnings
+    # are <50 m²) AND by distance (when ambiguous, prefer the FAR wall —
+    # that's what the user can actually see and meant to tap). Both
+    # signals point at "real building" vs "parked car parcel in front".
+    if _point_in_poly(tap_x, tap_y, poly):
+        area_m2 = candidate.get("shape_area") or 0
+        try:
+            area_m2 = float(area_m2)
+        except (TypeError, ValueError):
+            area_m2 = 0.0
+        # Area component saturates at 500 m² — anything bigger gets the
+        # full 1.0. Tiny things (cars ~10 m², awnings ~30 m²) get scored
+        # proportionally low; a real building scoring ≥500 m² gets 1.0.
+        area_factor = min(1.0, area_m2 / 500.0)
+
+        # Distance component: prefer further. Within 0–150m cone (cone-cap
+        # in routers/scan.py) we map distance to [0.5..1.0] so the far
+        # wall along the ray beats the near one but doesn't drown out
+        # area completely.
+        dist_m = candidate.get("distance_meters") or 0
+        try:
+            dist_m = float(dist_m)
+        except (TypeError, ValueError):
+            dist_m = 0.0
+        dist_factor = 0.5 + min(0.5, dist_m / 300.0)
+
+        # Combine: average so both signals contribute, never zero unless
+        # area_factor is zero (no shape_area on candidate — bail to 0.5).
+        if area_factor <= 0:
+            return dist_factor
+        return (area_factor + dist_factor) / 2.0
+
+    return 0.0
 
 
 async def rank_by_tap_overlap(
