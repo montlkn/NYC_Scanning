@@ -17,7 +17,6 @@ The router in routers/scan_v2.py is the only caller.
 
 import asyncio
 import logging
-import re
 import time
 from typing import Optional, Tuple, List, Dict, Any
 
@@ -31,71 +30,6 @@ from services.geospatial import enrich_candidates_with_metadata
 
 logger = logging.getLogger(__name__)
 _cfg = get_pipeline_config()
-
-
-_GROK_TEXT_EVIDENCE_KEYWORDS = (
-    "number", "address", "flag", "sign", "signage", "plaque",
-    "awning", "lettering", "letters", "inscribed", "written",
-    "consulate", "logo", "banner", "stencil", "name plate",
-    "nameplate", "engraved", "house number", "street number",
-)
-_GROK_DIGIT_RE = re.compile(r"\b\d{2,5}\b")
-
-# Rowhouse-cluster threshold: when 2+ candidates fall within this radius of
-# each other (centroid-to-centroid), geometry alone cannot tell them apart and
-# we should fire the VLM even if bail/picker hasn't tripped. Tuned to the NYC
-# rowhouse footprint (~6m wide x 18m deep → adjacent centroids ≈ 8-12m apart).
-_GROK_CLUSTER_RADIUS_M = 15.0
-
-
-def _candidates_clustered_within(
-    candidates: List[Dict[str, Any]],
-    radius_m: float,
-) -> bool:
-    """True if any two candidates' centroids are within `radius_m` of each other."""
-    import math
-
-    def latlng(c: Dict[str, Any]) -> Optional[tuple[float, float]]:
-        la = c.get("geocoded_lat") or c.get("latitude")
-        ln = c.get("geocoded_lng") or c.get("longitude")
-        if la is None or ln is None:
-            return None
-        try:
-            return float(la), float(ln)
-        except (TypeError, ValueError):
-            return None
-
-    points = [p for p in (latlng(c) for c in candidates) if p is not None]
-    if len(points) < 2:
-        return False
-
-    R = 6371000.0
-    for i in range(len(points)):
-        la1, ln1 = points[i]
-        p1 = math.radians(la1)
-        for j in range(i + 1, len(points)):
-            la2, ln2 = points[j]
-            p2 = math.radians(la2)
-            dp = math.radians(la2 - la1)
-            dl = math.radians(ln2 - ln1)
-            a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-            d = 2 * R * math.asin(math.sqrt(a))
-            if d <= radius_m:
-                return True
-    return False
-
-
-def _has_textual_evidence(reason: Optional[str]) -> bool:
-    """Grok's pick is trustworthy only when its reason cites readable marks
-    (numbers, flags, signage, plaques). Pure facade-similarity reasons are
-    the regression mode that loses 555 Park to a visually-similar neighbour."""
-    if not reason:
-        return False
-    r = reason.lower()
-    if any(k in r for k in _GROK_TEXT_EVIDENCE_KEYWORDS):
-        return True
-    # A standalone digit string in the reason ("121", "555") is strong evidence.
-    return bool(_GROK_DIGIT_RE.search(r))
 
 
 async def run(
@@ -366,82 +300,11 @@ async def run(
                 retrieval_meta["poi_name"] = nearest_poi
                 break
 
-    # ── 3b. P4: Grok Vision disambig on close calls ──────────────────────────
-    # When CLIP can't separate the top candidates (which is the consulate /
-    # row-house / 555-corner failure mode), ask a VLM that can read flags
-    # and address numbers. Triggers only on ambiguous scans (~10-30% of total).
-    grok_decision: Optional[str] = None
-    grok_reason: Optional[str] = None
-    # Trigger expanded 2026-05-15: bail/picker OR clustered candidates within
-    # ~15m. The rowhouse failure mode is geometrically indistinguishable
-    # centroids — we should fire the VLM there even when the top-1 confidence
-    # looks fine, because "looks fine" with twin neighbours is exactly when
-    # we get a confidently-wrong answer.
-    _grok_cluster_trigger = _candidates_clustered_within(
-        candidates[:5], _GROK_CLUSTER_RADIUS_M
-    )
-    # The user's tap is a higher-signal disambiguator than Grok's facade
-    # similarity — once the tap has named a winner we trust it and don't
-    # ask Grok to second-guess. Grok still fires when there's no tap and
-    # the geometry alone can't separate candidates.
-    if (
-        _cfg.grok_disambig_enabled
-        and _tap_winner_bin is None
-        and (bail or show_picker or _grok_cluster_trigger)
-        and len(candidates) >= 2
-    ):
-        if _grok_cluster_trigger and not (bail or show_picker):
-            retrieval_meta["grok_trigger"] = "cluster_15m"
-        try:
-            grok_decision, grok_reason = await _try_grok_disambig(
-                photo_bytes=photo_bytes,
-                top_candidates=candidates[:3],
-            )
-            if grok_decision is not None and grok_decision != "UNSURE":
-                # Gate: only trust the pick if Grok's reason cites readable
-                # evidence (numbers, flags, signage). Without that, Grok is
-                # matching facade similarity — same failure mode as CLIP, and
-                # exactly the 555 Park regression case.
-                if (
-                    _cfg.grok_require_textual_evidence
-                    and not _has_textual_evidence(grok_reason)
-                ):
-                    retrieval_meta["grok_pick"] = "GATED_GENERIC"
-                    retrieval_meta["grok_reason"] = grok_reason
-                    logger.info(
-                        f"Grok pick {grok_decision} gated (no textual evidence): {grok_reason!r}"
-                    )
-                else:
-                    idx = {"A": 0, "B": 1, "C": 2}.get(grok_decision)
-                    if idx is not None and idx < len(candidates):
-                        chosen = candidates[idx]
-                        # Bump bounded by config — 0.65 default. Lower than the
-                        # original 0.90 so a soft Grok pick doesn't drown out
-                        # the picker UX for ambiguous cases.
-                        chosen["confidence"] = max(
-                            chosen.get("confidence", 0.0), _cfg.grok_confidence_bump
-                        )
-                        chosen["grok_reason"] = grok_reason
-                        candidates = [chosen] + [
-                            c for i, c in enumerate(candidates) if i != idx
-                        ]
-                        # Recompute bail/picker against the bumped confidence.
-                        new_conf = chosen["confidence"]
-                        bail = new_conf < _cfg.no_confident_match_threshold
-                        show_picker = new_conf < _cfg.picker_abs_threshold
-                        retrieval_meta["grok_pick"] = grok_decision
-                        retrieval_meta["grok_reason"] = grok_reason
-                        logger.info(
-                            f"Grok Vision picked {grok_decision} ({grok_reason!r}) conf={new_conf:.2f}"
-                        )
-            elif grok_decision == "UNSURE":
-                retrieval_meta["grok_pick"] = "UNSURE"
-                retrieval_meta["grok_reason"] = grok_reason
-                logger.info(f"Grok Vision returned UNSURE ({grok_reason!r})")
-        except Exception as e:
-            logger.warning(f"Grok disambig failed (continuing with CLIP rank): {e}")
-    elif not _cfg.grok_disambig_enabled:
-        retrieval_meta["grok_pick"] = "DISABLED"
+    # Grok Vision disambig was removed 2026-06-04: the five rescue layers
+    # (pose gate, cone, OCR widening, tap-ray, tenant POI) handle every
+    # case Grok used to rescue, without a paid VLM round-trip or Google
+    # Street View dependency. Ambiguous scans now go straight to the
+    # picker so the user disambiguates in one tap.
 
     # ── 4. Resolve thumbnails ──────────────────────────────────────────────────
     # On bail or any picker situation return top-5 so the map picker has more
@@ -558,117 +421,6 @@ async def _resolve_one_thumbnail(c: Dict) -> None:
                 continue
 
     c["thumbnail_url"] = None
-
-
-async def _try_grok_disambig(
-    *,
-    photo_bytes: bytes,
-    top_candidates: List[Dict],
-) -> tuple[Optional[str], Optional[str]]:
-    """
-    Call Grok Vision with the user's photo + top candidate references.
-    Returns (choice, reason). Choice is "A"|"B"|"C"|"UNSURE" or None on failure.
-    On a confident pick, also attaches Grok-generated lore to the chosen
-    candidate's `storytelling` field — so the v2 router skips its separate
-    lore call (one Grok request, both jobs).
-    """
-    from services.grok import grok_vision_pick
-    from services.reference_image_chain import fetch_reference_image
-
-    # Backend-only Street View fetch. Used by Grok's vision pick so it has
-    # something visual to compare against the user photo when no tap mask is
-    # present (Grok read "121" on the Consulate awning this way). This is
-    # the last live path that talks to maps.googleapis.com — iOS purged GSV
-    # in Phase 8. Fires only on tap-less ambiguous scans, which should be
-    # a shrinking slice now that tap-to-pick autoconfirms cleanly.
-    # Pull LPC-sourced landmark text for each candidate up front so Grok has
-    # corroborating facts (year, architect, designation, history) and can't
-    # invent stuff. The lore_generator already has this helper.
-    from services.lore_generator import _get_raw_chunks
-
-    async def _cand_bytes(c: Dict) -> Optional[Dict]:
-        lat = c.get("geocoded_lat") or c.get("latitude")
-        lng = c.get("geocoded_lng") or c.get("longitude")
-        if lat is None or lng is None:
-            return None
-
-        from services.street_view import fetch_street_view_image
-
-        async def _google(la: float, ln: float) -> Optional[bytes]:
-            return await fetch_street_view_image(la, ln, 0)
-
-        # Fetch the reference image and the LPC chunks in parallel.
-        img_and_chunks = await asyncio.gather(
-            fetch_reference_image(
-                lat=float(lat), lng=float(lng), bbl=c.get("bbl"),
-                google_fallback=_google,
-            ),
-            _get_raw_chunks(str(c.get("bin") or ""), c.get("name") or c.get("address")),
-        )
-        (img, _src), chunks = img_and_chunks
-        if not img:
-            return None
-
-        # Compact fact sheet so Grok grounds lore in real metadata, not vibes.
-        facts = []
-        if c.get("year_built"): facts.append(f"built {c['year_built']}")
-        if c.get("style"): facts.append(str(c['style']))
-        if c.get("architect"): facts.append(f"architect {c['architect']}")
-        if c.get("use"): facts.append(str(c['use']))
-        if c.get("materials"): facts.append(str(c['materials']))
-        if c.get("is_landmark"): facts.append("NYC Landmark")
-        # Trim the LPC chunk to a reasonable size — Grok doesn't need 3000 chars.
-        chunk_excerpt = (chunks[:800] + "…") if chunks and len(chunks) > 800 else (chunks or "")
-
-        context_parts = []
-        if facts:
-            context_parts.append("; ".join(facts))
-        # If our buildings DB already has curated storytelling for this BIN,
-        # hand it to Grok as authoritative ground truth. Lore should be a
-        # refinement of this with visible-detail grounding, not a rewrite.
-        existing_story = c.get("storytelling")
-        if existing_story and isinstance(existing_story, str) and len(existing_story) > 20:
-            existing_excerpt = existing_story[:600] + ("…" if len(existing_story) > 600 else "")
-            context_parts.append(f"Supabase storytelling: {existing_excerpt}")
-        if chunk_excerpt:
-            context_parts.append(f"LPC notes: {chunk_excerpt}")
-        # Coordinate is the disambiguating ID — include it verbatim so Grok
-        # can web-search against the exact address.
-        context_parts.append(f"coords: ({float(lat):.5f}, {float(lng):.5f})")
-
-        return {
-            "address": c.get("name") or c.get("address"),
-            "image_bytes": img,
-            "building_context": " | ".join(context_parts),
-        }
-
-    cand_payloads = await asyncio.gather(
-        *(_cand_bytes(c) for c in top_candidates), return_exceptions=False
-    )
-    cand_payloads = [c for c in cand_payloads if c]
-    if len(cand_payloads) < 2:
-        return None, None
-
-    result = await grok_vision_pick(
-        user_photo_bytes=photo_bytes,
-        candidates=cand_payloads,
-    )
-    if not result:
-        return None, None
-
-    choice = result.get("choice")
-    reason = result.get("reason")
-    lore = result.get("lore") or ""
-
-    # If Grok picked a winner, stash its lore on the candidate so the v2 router
-    # uses it directly and skips a separate generic lore call.
-    if choice in ("A", "B", "C") and lore:
-        idx = {"A": 0, "B": 1, "C": 2}[choice]
-        if idx < len(top_candidates):
-            top_candidates[idx]["storytelling"] = lore
-            top_candidates[idx]["lore_source"] = "grok_vision_disambig"
-
-    return choice, reason
 
 
 def _empty_response(retrieval_meta: dict, t_start: float) -> Dict[str, Any]:

@@ -56,9 +56,6 @@ class Settings(BaseSettings):
 
     # Image Configuration
     reference_image_bearing_tolerance: int = 30  # degrees
-    street_view_size: str = "600x600"
-    street_view_pitch: int = 10
-    street_view_fov: int = 60
 
     # Cache Configuration
     cache_ttl_seconds: int = 86400  # 24 hours
