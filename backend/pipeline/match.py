@@ -117,22 +117,104 @@ async def run(
                 pitch_deg=pitch,
                 lens_type=lens_type,
             )
-            # Only apply pre-filter if at least one candidate overlapped.
+            # Two modes:
+            #   filter  — survivors fully replace candidates (default; precise tap)
+            #   rerank  — keep ALL candidates, but add a +0.15 bonus to overlappers
+            #
+            # Pick "rerank" when the tap-overlap signal can't be trusted as a hard
+            # gate. Two demote conditions, either is enough:
+            #   (a) cone was widened beyond 60° — compass is uncertain, so the
+            #       perspective projection used to test overlap is also uncertain
+            #       and may have placed the right building outside the tap.
+            #   (b) the dropped set contains a building much larger than every
+            #       survivor (>3× by shape_area) AND every survivor is tiny
+            #       (<200 m²) — the "small parcel between user and target"
+            #       failure mode the LIC courthouse hit.
+            #
+            # The bonus runs by mutating tap_overlap_score so downstream scoring
+            # sees the boost without needing a new field.
             nonzero = [c for c in filtered if c.get("tap_overlap_score", 0) > 0]
-            if nonzero:
+            cone_deg = retrieval_meta.get("cone_deg", _cfg.base_cone_deg)
+            mode = "filter"
+            reason = None
+
+            if nonzero and len(nonzero) < len(filtered):
+                wide_cone = cone_deg > 60.0
+                max_survivor_area = max((c.get("shape_area") or 0.0) for c in nonzero)
+                max_dropped_area = max(
+                    ((c.get("shape_area") or 0.0) for c in filtered if c.get("tap_overlap_score", 0) <= 0),
+                    default=0.0,
+                )
+                tiny_survivors = max_survivor_area < 200.0
+                much_larger_dropped = max_dropped_area > 3.0 * max(max_survivor_area, 1.0)
+
+                if wide_cone:
+                    mode, reason = "rerank", "cone_widened"
+                elif tiny_survivors and much_larger_dropped:
+                    mode, reason = "rerank", "tiny_survivors_vs_large_dropped"
+
+            if nonzero and mode == "filter":
                 enriched_cands = nonzero
                 retrieval_meta["tap_prefilter"] = {
+                    "mode": "filter",
                     "kept": len(nonzero),
                     "dropped": len(filtered) - len(nonzero),
                     "top_score": nonzero[0].get("tap_overlap_score"),
                     "top_bin": nonzero[0].get("bin"),
                 }
                 logger.info(
-                    f"[{scan_id}] tap pre-filter: kept {len(nonzero)}, "
-                    f"top BIN {nonzero[0].get('bin')} score {nonzero[0].get('tap_overlap_score'):.3f}"
+                    f"[{scan_id}] tap_prefilter mode=filter kept={len(nonzero)} "
+                    f"top_bin={nonzero[0].get('bin')} top_score={nonzero[0].get('tap_overlap_score'):.3f}"
+                )
+            elif nonzero and mode == "rerank":
+                # Rerank mode: the tap-overlap signal isn't trustworthy enough
+                # to gate, but it's still useful as a bonus. More importantly,
+                # the *reason* it's untrustworthy (wide cone, or tiny survivors)
+                # means downstream cone-bearing scoring also can't be trusted
+                # to pick the right building. Re-rank the full set by an
+                # area-weighted proximity signal: big buildings near (but not
+                # at) the camera beat small parcels touching the camera. This
+                # is the same intuition as the c7904ce empty-mask tie-break,
+                # applied at the candidate-set level rather than just the tap
+                # survivors.
+                #
+                # Formula matches services/footprint_projection.py:
+                #   area_factor = min(1.0, shape_area / 500.0)
+                #   dist_factor = 0.5 + min(0.5, distance_m / 300.0)
+                #   geom_score = (area_factor + dist_factor) / 2
+                # plus +0.15 if the tap overlapped the projected footprint.
+                for c in filtered:
+                    area = c.get("shape_area") or 0.0
+                    dist = c.get("distance_meters") or 0.0
+                    area_factor = min(1.0, area / 500.0)
+                    dist_factor = 0.5 + min(0.5, dist / 300.0)
+                    geom = (area_factor + dist_factor) / 2.0
+                    if c.get("tap_overlap_score", 0) > 0:
+                        geom = min(1.0, geom + 0.15)
+                    # Replace footprint_score so blend_scores carries this
+                    # through softmax calibration. Scale to 0-100 to match the
+                    # convention in scoring.blend_scores.
+                    c["footprint_score"] = round(geom * 100.0, 2)
+                    c["score_breakdown_rerank"] = {
+                        "area_factor": round(area_factor, 3),
+                        "dist_factor": round(dist_factor, 3),
+                        "tap_bonus": 0.15 if c.get("tap_overlap_score", 0) > 0 else 0.0,
+                    }
+                enriched_cands = filtered
+                retrieval_meta["tap_prefilter"] = {
+                    "mode": "rerank",
+                    "reason": reason,
+                    "overlappers": len(nonzero),
+                    "kept_total": len(filtered),
+                    "cone_deg": round(cone_deg, 1),
+                }
+                logger.info(
+                    f"[{scan_id}] tap_prefilter mode=rerank reason={reason} "
+                    f"overlappers={len(nonzero)} kept_total={len(filtered)} cone_deg={cone_deg:.1f}"
                 )
             else:
                 retrieval_meta["tap_prefilter"] = "no_overlap_fallthrough"
+                logger.info(f"[{scan_id}] tap_prefilter mode=fallthrough (no overlap)")
         except Exception as e:
             logger.warning(f"[{scan_id}] tap pre-filter failed (continuing): {e}")
 
