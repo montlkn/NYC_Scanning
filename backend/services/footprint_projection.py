@@ -560,13 +560,19 @@ async def rank_by_tap_overlap(
 ) -> list[dict]:
     """
     Score each candidate by footprint×mask overlap and attach
-    `tap_overlap_score`. Filter out zero-overlap candidates (hard pre-filter).
-    Preserves original order among tied candidates.
+    `tap_overlap_score`. Returns ALL candidates annotated — the caller
+    (match.py) decides whether to use the scores as a hard filter or a
+    soft re-rank based on cone width and candidate-size context.
 
-    Returns the filtered+annotated list (may be empty if no candidate
-    overlaps — in that case caller should skip the pre-filter).
+    The decision used to live here as "drop zero-score candidates," but
+    that hid the right answer from the caller when the compass was off
+    and the right building's projection landed outside the tap. The LIC
+    courthouse scan failed exactly this way.
     """
     scored = []
+    nonzero_count = 0
+    top_bin = None
+    top_score = 0.0
     for c in candidates:
         score = compute_tap_overlap_score(
             c, tap_x, tap_y, mask_b64, mask_w, mask_h,
@@ -575,20 +581,24 @@ async def rank_by_tap_overlap(
         c = dict(c)
         c["tap_overlap_score"] = score
         scored.append(c)
+        if score > 0:
+            nonzero_count += 1
+            if score > top_score:
+                top_score = score
+                top_bin = c.get("bin")
 
-    nonzero = [c for c in scored if c["tap_overlap_score"] > 0]
-    if not nonzero:
-        # No footprint projected into tap region — skip pre-filter, return
-        # all with scores attached so telemetry can log the miss.
+    # Sort overlappers to the front so callers that *do* filter still get
+    # the same ordering as before.
+    scored.sort(key=lambda c: c.get("tap_overlap_score", 0), reverse=True)
+
+    if nonzero_count == 0:
         logger.info(
-            f"tap_overlap: no candidates overlapped tap ({tap_x:.3f},{tap_y:.3f}); "
-            "skipping pre-filter"
+            f"tap_overlap: 0/{len(candidates)} candidates overlapped tap "
+            f"({tap_x:.3f},{tap_y:.3f}) — pre-filter will fall through"
         )
-        return scored
-
-    nonzero.sort(key=lambda c: c["tap_overlap_score"], reverse=True)
-    logger.info(
-        f"tap_overlap: {len(nonzero)}/{len(candidates)} candidates overlap tap; "
-        f"top score {nonzero[0]['tap_overlap_score']:.3f} (BIN {nonzero[0].get('bin')})"
-    )
-    return nonzero
+    else:
+        logger.info(
+            f"tap_overlap: {nonzero_count}/{len(candidates)} candidates overlap tap; "
+            f"top score {top_score:.3f} (BIN {top_bin})"
+        )
+    return scored
