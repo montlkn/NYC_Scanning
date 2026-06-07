@@ -585,6 +585,53 @@ async def scan_building_v2(
                         f"num_tokens={ocr_tokens_num} candidates_outside_cone={len(new_only)}"
                     )
 
+            # === OCR token soft re-rank over cone candidates ===
+            # Even when OCR tokens didn't trigger an override (rejected as
+            # low-quality, or matched only in-cone where the agreeing path
+            # already promoted), they still carry signal. Score each top-N
+            # cone candidate by how many OCR tokens appear in its
+            # building_name or address. The candidate with the most hits
+            # gets a confidence bump — proportional to hit count and capped
+            # so a single weak token can't beat geometry alone.
+            #
+            # This is what catches "BANK OF THE METROPOLIS" when OCR partly
+            # reads the carved entablature: even one matching token nudges
+            # that candidate above its neighbors, without the hard-override
+            # confidence inflation that broke FLIGHT-CLUB.
+            if (ocr_tokens_num or ocr_tokens_name) and raw_matches:
+                rerank_window = raw_matches[:10]
+                best_bin: Optional[str] = None
+                best_score = 0
+                for c in rerank_window:
+                    bn = (c.get("building_name") or c.get("name") or "").upper()
+                    addr = (c.get("address") or "").upper()
+                    haystack = f"{bn} {addr}"
+                    # Count distinct name tokens that appear as substrings.
+                    name_hits = sum(1 for t in ocr_tokens_name if t and t in haystack)
+                    # Count distinct address numbers that appear at a word boundary.
+                    num_hits = sum(1 for n in ocr_tokens_num if n and re.search(rf"\b{re.escape(n)}\b", haystack))
+                    score = name_hits + num_hits
+                    if score > 0:
+                        c["ocr_token_hits"] = {"name": name_hits, "num": num_hits}
+                        # Soft bump: +0.05 per hit, capped at +0.20 so a
+                        # single weak match can't flip ranking against
+                        # strong geometric agreement, but two-three hits
+                        # can lift a borderline candidate to top.
+                        bump = min(0.20, 0.05 * score)
+                        c["confidence"] = (c.get("confidence") or 0.0) + bump
+                        if score > best_score:
+                            best_score = score
+                            best_bin = c.get("bin")
+                if best_bin and best_score >= 2:
+                    # Move the highest-scoring OCR-bumped candidate to front.
+                    raw_matches = (
+                        [c for c in raw_matches if c.get("bin") == best_bin]
+                        + [c for c in raw_matches if c.get("bin") != best_bin]
+                    )
+                    logger.info(
+                        f"[{scan_id}] ocr_token_rerank winner BIN={best_bin} hits={best_score}"
+                    )
+
             # === Ray + OCR cross-validation ===
             # When the ray-picked building's address starts with one of the
             # OCR number tokens, both independent signals agree — bump to
