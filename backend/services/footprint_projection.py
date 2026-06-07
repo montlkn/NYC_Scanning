@@ -520,27 +520,33 @@ def compute_tap_overlap_score(
             area_m2 = float(area_m2)
         except (TypeError, ValueError):
             area_m2 = 0.0
-        # Area component saturates at 500 m² — anything bigger gets the
-        # full 1.0. Tiny things (cars ~10 m², awnings ~30 m²) get scored
-        # proportionally low; a real building scoring ≥500 m² gets 1.0.
-        area_factor = min(1.0, area_m2 / 500.0)
-
-        # Distance component: prefer further. Within 0–150m cone (cone-cap
-        # in routers/scan.py) we map distance to [0.5..1.0] so the far
-        # wall along the ray beats the near one but doesn't drown out
-        # area completely.
         dist_m = candidate.get("distance_meters") or 0
         try:
             dist_m = float(dist_m)
         except (TypeError, ValueError):
             dist_m = 0.0
-        dist_factor = 0.5 + min(0.5, dist_m / 300.0)
 
-        # Combine: average so both signals contribute, never zero unless
-        # area_factor is zero (no shape_area on candidate — bail to 0.5).
-        if area_factor <= 0:
-            return dist_factor
-        return (area_factor + dist_factor) / 2.0
+        # Log-scaled area: a 3000 m² courthouse-class landmark hits 1.0,
+        # a 500 m² typical building scores ~0.77, a 50 m² car parcel ~0.49.
+        # This is the slope the saturated min(area,500) formula lacked —
+        # the LIC courthouse and the adjacent car-parcel both scored 1.0
+        # before, so the tie went to whoever came first in the cone list.
+        clamped_area = max(area_m2, 50.0)
+        area_factor = min(1.0, math.log10(clamped_area) / math.log10(3000.0))
+
+        # Sweet-spot distance: [40, 150]m is "looking at that building over
+        # there." <20m is the wall in front of camera (usually not the
+        # target the user means). >200m is too far for the intentional tap.
+        if 40.0 <= dist_m <= 150.0:
+            dist_factor = 1.0
+        elif dist_m < 40.0:
+            dist_factor = max(0.0, dist_m / 40.0)
+        else:
+            dist_factor = max(0.0, 1.0 - (dist_m - 150.0) / 100.0)
+
+        # Area dominates (0.6) over distance (0.4) — the user wants a
+        # building, not a wall. Never returns 0 unless distance is way out.
+        return 0.6 * area_factor + 0.4 * dist_factor
 
     return 0.0
 

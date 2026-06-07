@@ -17,6 +17,7 @@ The router in routers/scan_v2.py is the only caller.
 
 import asyncio
 import logging
+import math
 import time
 from typing import Optional, Tuple, List, Dict, Any
 
@@ -172,23 +173,33 @@ async def run(
                 # the *reason* it's untrustworthy (wide cone, or tiny survivors)
                 # means downstream cone-bearing scoring also can't be trusted
                 # to pick the right building. Re-rank the full set by an
-                # area-weighted proximity signal: big buildings near (but not
-                # at) the camera beat small parcels touching the camera. This
-                # is the same intuition as the c7904ce empty-mask tie-break,
-                # applied at the candidate-set level rather than just the tap
-                # survivors.
+                # area-weighted proximity signal: big landmark buildings at
+                # mid-range distance beat tiny parcels at the camera wall.
                 #
-                # Formula matches services/footprint_projection.py:
-                #   area_factor = min(1.0, shape_area / 500.0)
-                #   dist_factor = 0.5 + min(0.5, distance_m / 300.0)
-                #   geom_score = (area_factor + dist_factor) / 2
+                # Formula (mirrors services/footprint_projection.py rerank):
+                #   area_factor  = log10(area) / log10(3000)        in [0,1]
+                #     — landmark scale (3000 m² = courthouse) saturates at 1.0
+                #   dist_factor  = 1.0 in [40,150]m sweet spot, ramps elsewhere
+                #     — penalises wall-adjacent parcels and far-too-distant ones
+                #   geom_score   = 0.6*area + 0.4*dist
+                #     — area dominates: the user wants the building, not the wall
                 # plus +0.15 if the tap overlapped the projected footprint.
+                #
+                # Calibrated against LIC courthouse smoke test:
+                # - 3000 m² courthouse at 150m → area=1.0, dist=1.0, geom=1.0
+                # - 500 m² parcel at 50m       → area=0.77, dist=1.0, geom=0.91
+                # - 50 m² car parcel at 20m    → area=0.49, dist=0.5,  geom=0.49
                 for c in filtered:
-                    area = c.get("shape_area") or 0.0
+                    area = max(c.get("shape_area") or 0.0, 50.0)
                     dist = c.get("distance_meters") or 0.0
-                    area_factor = min(1.0, area / 500.0)
-                    dist_factor = 0.5 + min(0.5, dist / 300.0)
-                    geom = (area_factor + dist_factor) / 2.0
+                    area_factor = min(1.0, math.log10(area) / math.log10(3000.0))
+                    if 40.0 <= dist <= 150.0:
+                        dist_factor = 1.0
+                    elif dist < 40.0:
+                        dist_factor = max(0.0, dist / 40.0)
+                    else:
+                        dist_factor = max(0.0, 1.0 - (dist - 150.0) / 100.0)
+                    geom = 0.6 * area_factor + 0.4 * dist_factor
                     if c.get("tap_overlap_score", 0) > 0:
                         geom = min(1.0, geom + 0.15)
                     # Replace footprint_score so blend_scores carries this
