@@ -515,9 +515,32 @@ async def scan_building_v2(
             if widened:
                 geo_bins = {c.get("bin") for c in raw_matches if c.get("bin")}
                 # Agreement: OCR found something that geometry also has.
+                # This is the strong signal — OCR and cone retrieval
+                # independently agree, so trust it fully.
                 agreeing = [w for w in widened if w.get("bin") in geo_bins]
                 # Disagreement: OCR found something(s) geometry didn't have.
                 new_only = [w for w in widened if w.get("bin") not in geo_bins]
+
+                # Token-quality gate for the disagree path. The failure mode
+                # we're hardening against is "FLIGHT" + "CLUB" matching a
+                # building outside the cone via ILIKE substring. Require
+                # either a numeric token (address fragments — high
+                # specificity, e.g. "1457" is rarely in a wrong row) OR
+                # multiple name tokens that all hit the same DB row
+                # (single-token name overrides are too loose). Adjacent
+                # tenant signage usually produces 1-2 short name tokens
+                # that ILIKE-hit unrelated rows.
+                has_numeric = bool(ocr_tokens_num)
+                # Count how many of the OCR name tokens appear in each
+                # widened row's building_name. A row needs ≥2 distinct
+                # name-token co-matches to be considered name-credible.
+                def _name_token_coverage(row: dict) -> int:
+                    bn = (row.get("building_name") or "").upper()
+                    if not bn:
+                        return 0
+                    return sum(1 for t in ocr_tokens_name if t in bn)
+                name_credible_new = [w for w in new_only if _name_token_coverage(w) >= 2]
+                ocr_credible_new = new_only if has_numeric else name_credible_new
 
                 if agreeing:
                     # Pull the agreed BIN(s) to the front of raw_matches.
@@ -530,19 +553,37 @@ async def scan_building_v2(
                         c["confidence"] = max(c.get("confidence") or 0.0, 0.85)
                     raw_matches = promoted + rest
                     ocr_action = f"agreed:{len(agreeing)}"
-                elif new_only:
-                    # Geometry vs OCR disagree. Trust OCR. But only inject
-                    # the top OCR candidate(s) — not all 10 — to avoid
-                    # spamming the picker with every "101" in midtown.
-                    # When OCR returns just 1-2, we're confident; when it
-                    # returns many (e.g. "101 E 38th, 101 E 39th, 101 Park"
-                    # — all match "101"), still inject all but with the
-                    # closest first so the user sees ranked options.
-                    inject = new_only[: min(3, len(new_only))]
+                elif ocr_credible_new:
+                    # Geometry vs OCR disagree, AND the OCR signal is
+                    # token-credible (numbers or multi-name-match). Inject
+                    # the top OCR candidate(s) — at most 3 — at a CAPPED
+                    # confidence of 0.45. This is deliberately below the
+                    # 70% picker line so the picker fires, but high enough
+                    # that the OCR candidate shows above raw cone candidates.
+                    # Never auto-confirms alone — protects against the
+                    # FLIGHT-CLUB failure (signage from an adjacent
+                    # building shouldn't end up as 60% auto-confirm).
+                    inject = ocr_credible_new[: min(3, len(ocr_credible_new))]
                     for c in inject:
-                        c["confidence"] = 0.75 if len(inject) == 1 else 0.6
+                        c["confidence"] = 0.45
                     raw_matches = inject + raw_matches
                     ocr_action = f"override:{len(inject)}"
+                    # Log token + matched name side-by-side for false-positive triage.
+                    for c in inject:
+                        logger.info(
+                            f"[{scan_id}] ocr_override BIN={c.get('bin')} "
+                            f"name={(c.get('building_name') or '')!r} "
+                            f"num_tokens={ocr_tokens_num} name_tokens={ocr_tokens_name}"
+                        )
+                elif new_only:
+                    # OCR found something but token quality is too weak to
+                    # override geometry. Log so we can see how often this
+                    # gate fires (and re-tune if it's too conservative).
+                    ocr_action = "rejected_low_quality"
+                    logger.info(
+                        f"[{scan_id}] ocr_override rejected — name_tokens={ocr_tokens_name} "
+                        f"num_tokens={ocr_tokens_num} candidates_outside_cone={len(new_only)}"
+                    )
 
             # === Ray + OCR cross-validation ===
             # When the ray-picked building's address starts with one of the
