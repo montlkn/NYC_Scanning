@@ -224,8 +224,60 @@ async def run(
                     f"overlappers={len(nonzero)} kept_total={len(filtered)} cone_deg={cone_deg:.1f}"
                 )
             else:
-                retrieval_meta["tap_prefilter"] = "no_overlap_fallthrough"
-                logger.info(f"[{scan_id}] tap_prefilter mode=fallthrough (no overlap)")
+                # No candidate's projected footprint contained the tap point.
+                # This happens when the user tapped on park/sky/street pixels
+                # (Scan C / Century Building: tap at (0.290, 0.572) landed in
+                # the Union Square greenmarket). The pre-filter falls through,
+                # but the tap is still telling us *direction* — even on the
+                # sky, "they tapped left of center" means the target is
+                # left-of-cone-axis. Re-rank by a combined geom + tap-bearing
+                # term so the user's tap direction nudges the cone ordering
+                # even when the tap pixel was on non-building.
+                #
+                # tap_x in [0,1]: 0.5 = center, 0 = far left, 1 = far right.
+                # Horizontal offset → bearing offset relative to cone axis,
+                # scaled by the lens HFOV. Standard rear lens ~65° HFOV; the
+                # full image span maps to ±32.5° from cone axis.
+                hfov_half_deg = 32.5 if lens_type != "ultrawide" else 50.0
+                tap_offset_deg = (tap_x - 0.5) * 2.0 * hfov_half_deg
+                tap_target_bearing = (bearing + tap_offset_deg) % 360.0
+                for c in filtered:
+                    area = max(c.get("shape_area") or 0.0, 50.0)
+                    dist = c.get("distance_meters") or 0.0
+                    bearing_to = c.get("bearing_to_building") or bearing
+                    area_factor = min(1.0, math.log10(area) / math.log10(3000.0))
+                    if 40.0 <= dist <= 150.0:
+                        dist_factor = 1.0
+                    elif dist < 40.0:
+                        dist_factor = max(0.0, dist / 40.0)
+                    else:
+                        dist_factor = max(0.0, 1.0 - (dist - 150.0) / 100.0)
+                    # Angular distance from tap-target bearing to this
+                    # candidate's bearing. 0° = bullseye, 60°+ = wrong cone side.
+                    delta = abs(bearing_to - tap_target_bearing) % 360.0
+                    if delta > 180.0:
+                        delta = 360.0 - delta
+                    # Tap-bearing factor: 1.0 at bullseye, 0.0 at 90°+.
+                    tap_bearing_factor = max(0.0, 1.0 - delta / 90.0)
+                    geom = 0.45 * area_factor + 0.25 * dist_factor + 0.30 * tap_bearing_factor
+                    c["footprint_score"] = round(geom * 100.0, 2)
+                    c["score_breakdown_rerank"] = {
+                        "area_factor": round(area_factor, 3),
+                        "dist_factor": round(dist_factor, 3),
+                        "tap_bearing_factor": round(tap_bearing_factor, 3),
+                        "tap_target_bearing": round(tap_target_bearing, 1),
+                    }
+                enriched_cands = filtered
+                retrieval_meta["tap_prefilter"] = {
+                    "mode": "tap_bearing_fallback",
+                    "overlappers": 0,
+                    "kept_total": len(filtered),
+                    "tap_target_bearing": round(tap_target_bearing, 1),
+                }
+                logger.info(
+                    f"[{scan_id}] tap_prefilter mode=tap_bearing_fallback "
+                    f"tap_target_bearing={tap_target_bearing:.1f}° kept={len(filtered)}"
+                )
         except Exception as e:
             logger.warning(f"[{scan_id}] tap pre-filter failed (continuing): {e}")
 
