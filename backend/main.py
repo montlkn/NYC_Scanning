@@ -18,7 +18,7 @@ import posthog
 from models.config import get_settings
 from models.session import init_db, close_db
 from models.footprints_session import init_footprints_engine, close_footprints_db
-from routers import scan, buildings, stamps, vetting, rag
+from routers import scan, scan_photo, buildings, stamps, vetting, rag
 
 # Configure logging
 logging.basicConfig(
@@ -152,6 +152,7 @@ async def health_check():
 
 # Include routers
 app.include_router(scan.router, prefix="/api", tags=["scan"])
+app.include_router(scan_photo.router, prefix="/api", tags=["scan"])
 app.include_router(buildings.router, prefix="/api", tags=["buildings"])
 app.include_router(stamps.router, prefix="/api", tags=["stamps"])
 app.include_router(vetting.router, prefix="/api", tags=["vetting"])
