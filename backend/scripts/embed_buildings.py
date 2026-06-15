@@ -30,6 +30,13 @@ from psycopg.rows import dict_row
 
 # Allow `from services...` when run as a script from backend/
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+# Load backend/.env so DATABASE_URL / FOOTPRINTS_DB_URL resolve when run directly
+# (mirrors how the FastAPI app loads settings — no manual `export` needed).
+from dotenv import load_dotenv  # noqa: E402
+
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+
 from services.text_embeddings import embed_texts  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
