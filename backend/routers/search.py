@@ -16,7 +16,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Query
 from sqlalchemy import text
 
-from models.footprints_session import get_footprints_db
+from models.search_session import get_search_db
 from services.text_embeddings import embed_query
 
 router = APIRouter(prefix="/search", tags=["search"])
@@ -60,15 +60,17 @@ async def search_buildings(
     if lat is not None and lng is not None:
         params["lat"] = lat
         params["lng"] = lng
-        geo_select = (
-            ", ST_Distance(geog, ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography) AS dist_m"
+        # Haversine (meters) — the search DB has no PostGIS. acos arg is clamped
+        # to [-1, 1] for numerical safety.
+        haversine = (
+            "6371000 * acos(GREATEST(-1, LEAST(1, "
+            "cos(radians(:lat)) * cos(radians(lat)) * cos(radians(lng) - radians(:lng)) "
+            "+ sin(radians(:lat)) * sin(radians(lat)))))"
         )
+        geo_select = f", {haversine} AS dist_m"
         if radius_m is not None:
             params["radius_m"] = radius_m
-            filters.append(
-                "geog IS NOT NULL AND ST_DWithin("
-                "geog, ST_SetSRID(ST_MakePoint(:lng, :lat), 4326)::geography, :radius_m)"
-            )
+            filters.append(f"lat IS NOT NULL AND lng IS NOT NULL AND {haversine} <= :radius_m")
 
     where = ("WHERE " + " AND ".join(filters)) if filters else ""
 

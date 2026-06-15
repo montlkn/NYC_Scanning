@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     # Database
     database_url: str
     footprints_db_url: Optional[str] = None  # Railway database for building footprints
+    search_db_url: Optional[str] = None  # Dedicated pgvector DB for the semantic search index
 
     # Redis (optional - can be disabled for initial deployment)
     redis_url: Optional[str] = None

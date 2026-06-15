@@ -11,7 +11,7 @@ are processed.
 
 Env:
   DATABASE_URL         Supabase Postgres (source of truth)         [required]
-  FOOTPRINTS_DB_URL    Railway Postgres (the search index lives here) [required]
+  SEARCH_DB_URL    Railway Postgres (the search index lives here) [required]
 
 Usage:
   python scripts/embed_buildings.py --dry-run        # preview text + counts, no writes
@@ -31,7 +31,7 @@ from psycopg.rows import dict_row
 # Allow `from services...` when run as a script from backend/
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-# Load backend/.env so DATABASE_URL / FOOTPRINTS_DB_URL resolve when run directly
+# Load backend/.env so DATABASE_URL / SEARCH_DB_URL resolve when run directly
 # (mirrors how the FastAPI app loads settings — no manual `export` needed).
 from dotenv import load_dotenv  # noqa: E402
 
@@ -155,9 +155,9 @@ def main():
     args = ap.parse_args()
 
     supa_url = os.environ.get("DATABASE_URL")
-    rail_url = os.environ.get("FOOTPRINTS_DB_URL")
+    rail_url = os.environ.get("SEARCH_DB_URL")
     if not supa_url or not rail_url:
-        logger.error("DATABASE_URL and FOOTPRINTS_DB_URL must both be set")
+        logger.error("DATABASE_URL and SEARCH_DB_URL must both be set")
         sys.exit(1)
 
     indexed = set() if args.rebuild else load_indexed_bins(rail_url)

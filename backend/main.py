@@ -18,6 +18,7 @@ import posthog
 from models.config import get_settings
 from models.session import init_db, close_db
 from models.footprints_session import init_footprints_engine, close_footprints_db
+from models.search_session import init_search_engine, close_search_db
 from routers import scan, scan_photo, buildings, stamps, vetting, rag, search
 
 # Configure logging
@@ -72,12 +73,17 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing footprints database connection (Railway)...")
     init_footprints_engine()
 
+    # Initialize search database (dedicated pgvector service)
+    logger.info("Initializing search database connection (pgvector)...")
+    init_search_engine()
+
     yield
 
     # Shutdown
     logger.info("Shutting down NYC Scan Backend...")
     await close_db()
     await close_footprints_db()
+    await close_search_db()
 
 
 # Initialize FastAPI app
