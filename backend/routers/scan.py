@@ -32,7 +32,7 @@ from models.config import get_settings
 from services import geospatial
 from services.lore_generator import generate_building_lore
 from services.analytics import track_scan, track_confirmation
-from services.building_contribution import reverse_geocode_google
+from services.building_contribution import reverse_geocode_nearby
 from utils.storage import upload_image
 import pipeline.match as pipeline_match
 from pipeline import telemetry as pipeline_telemetry
@@ -258,7 +258,7 @@ async def scan_building_v2(
             )
 
             if pipeline_result.get("error") == "no_candidates":
-                address_suggestions = await reverse_geocode_google(gps_lat, gps_lng)
+                address_suggestions = await reverse_geocode_nearby(gps_lat, gps_lng)
                 return JSONResponse(status_code=200, content={
                     "scan_id": scan_id,
                     "error": "no_candidates",
@@ -798,7 +798,7 @@ async def scan_building_v2(
                 classification = 'expanded_radius'
             else:
                 # Still no buildings - offer contribution
-                address_suggestions = await reverse_geocode_google(gps_lat, gps_lng)
+                address_suggestions = await reverse_geocode_nearby(gps_lat, gps_lng)
 
                 return JSONResponse(
                     status_code=200,

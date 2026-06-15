@@ -65,68 +65,24 @@ def load_building_data() -> pd.DataFrame:
     return _building_df
 
 
-async def reverse_geocode_google(lat: float, lng: float) -> List[Dict[str, str]]:
+async def reverse_geocode_nearby(lat: float, lng: float) -> List[Dict[str, str]]:
     """
-    Reverse geocode GPS coordinates to multiple address options using Google Maps API.
+    Reverse geocode GPS coordinates to candidate building addresses.
 
-    Returns list of address options sorted by relevance:
-    [
-        {
-            'address': '123 Main St, New York, NY 10001',
-            'formatted_address': '123 Main St',
-            'street_number': '123',
-            'street_name': 'Main St',
-            'zip_code': '10001',
-            'place_id': 'ChIJ...'
-        },
-        ...
-    ]
+    Returns a list of address options (same shape the scan/contribution flow
+    expects): [{'address', 'formatted_address', 'street_number', 'street_name',
+    'zip_code', 'place_id', 'lat', 'lng'}, ...]. Empty list = no suggestions
+    (the contribution UI falls back to manual address entry).
+
+    NOTE: Google Maps geocoding was removed (cost). This currently returns no
+    suggestions. TODO (follow-up task): replace with a free LOCAL lookup —
+    query Railway `building_footprints` for the nearest centroids to (lat,lng)
+    within ~60m (PostGIS `ST_Distance(bf.centroid::geography, point)` ordered
+    ASC, see pipeline/retrieval.py prox query), then resolve addresses for those
+    BINs via `get_building_metadata` (buildings_full_merge_scanning → PLUTO
+    fallback). No external API, more accurate for NYC.
     """
-    try:
-        url = "https://maps.googleapis.com/maps/api/geocode/json"
-        params = {
-            'latlng': f"{lat},{lng}",
-            'key': settings.google_maps_api_key,
-            'result_type': 'street_address|premise'  # Only building-level addresses
-        }
-
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(url, params=params)
-            response.raise_for_status()
-            data = response.json()
-
-        if data['status'] != 'OK':
-            logger.warning(f"Google Geocoding API returned status: {data['status']}")
-            return []
-
-        address_options = []
-        for result in data.get('results', [])[:5]:  # Top 5 results
-            address_components = {}
-            for component in result.get('address_components', []):
-                if 'street_number' in component['types']:
-                    address_components['street_number'] = component['long_name']
-                elif 'route' in component['types']:
-                    address_components['street_name'] = component['long_name']
-                elif 'postal_code' in component['types']:
-                    address_components['zip_code'] = component['long_name']
-
-            address_options.append({
-                'address': result['formatted_address'],
-                'formatted_address': result['formatted_address'].split(',')[0],  # Just street
-                'street_number': address_components.get('street_number', ''),
-                'street_name': address_components.get('street_name', ''),
-                'zip_code': address_components.get('zip_code', ''),
-                'place_id': result.get('place_id', ''),
-                'lat': result['geometry']['location']['lat'],
-                'lng': result['geometry']['location']['lng']
-            })
-
-        logger.info(f"Found {len(address_options)} address options for ({lat}, {lng})")
-        return address_options
-
-    except Exception as e:
-        logger.error(f"Error reverse geocoding ({lat}, {lng}): {e}", exc_info=True)
-        return []
+    return []
 
 
 def lookup_bin_from_gps(lat: float, lng: float, radius_meters: float = 50) -> Optional[Tuple[str, str]]:
