@@ -39,7 +39,7 @@ class Building(Base):
 
 class ReferenceImage(Base):
     """
-    Stores reference images (Street View, Mapillary, user-uploaded)
+    Stores reference images (Mapillary, user-uploaded)
     for building facade matching
     Now uses BIN (Building Identification Number) as foreign key instead of BBL
     """
@@ -53,7 +53,7 @@ class ReferenceImage(Base):
     thumbnail_url = Column(Text)
 
     # Image metadata
-    source = Column(String(20), nullable=False)  # 'street_view', 'mapillary', 'user'
+    source = Column(String(20), nullable=False)  # 'mapillary', 'user' (legacy rows: 'street_view')
     compass_bearing = Column(Float)  # Direction camera is facing (0-360)
     capture_lat = Column(Float)  # Where photo was taken from
     capture_lng = Column(Float)
@@ -163,7 +163,6 @@ class CacheStat(Base):
     total_cost_usd = Column(Float)
 
     # Source breakdown
-    street_view_count = Column(Integer)
     mapillary_count = Column(Integer)
     user_upload_count = Column(Integer)
 
@@ -223,11 +222,6 @@ class UserContributedBuilding(Base):
     enrichment_data = Column(JSON)
     enrichment_confidence = Column(Float)
     enrichment_completed_at = Column(TIMESTAMP)
-
-    # Street View images
-    street_view_images_fetched = Column(Boolean, default=False)
-    street_view_image_count = Column(Integer, default=0)
-    street_view_fetch_attempted_at = Column(TIMESTAMP)
 
     # Reference images
     reference_image_count = Column(Integer, default=0)
