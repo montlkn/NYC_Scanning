@@ -20,7 +20,7 @@ supabase>=2.3.0
 shapely==2.0.3  # Keep for WKT parsing if needed
 
 # Image Processing
-pillow==10.2.0
+pillow==10.4.0  # >=10.3.0 required by fastembed; 10.4 is a safe patch bump from 10.2
 
 # HTTP & Storage
 httpx>=0.24.0,<0.25.0
