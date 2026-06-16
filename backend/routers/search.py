@@ -74,11 +74,15 @@ async def search_buildings(
 
     where = ("WHERE " + " AND ".join(filters)) if filters else ""
 
+    # Use CAST(:qvec AS vector), NOT :qvec::vector — SQLAlchemy's text() parser
+    # treats `::` as the start of a named param and mangles the bound vector
+    # (psycopg then sees a literal ":qvec" and errors "syntax error at or near
+    # ':'"). CAST(...) is colon-free and binds cleanly.
     sql = f"""
-        SELECT bin, snippet, 1 - (embedding <=> :qvec::vector) AS score{geo_select}
+        SELECT bin, snippet, 1 - (embedding <=> CAST(:qvec AS vector)) AS score{geo_select}
         FROM building_search_index
         {where}
-        ORDER BY embedding <=> :qvec::vector
+        ORDER BY embedding <=> CAST(:qvec AS vector)
         LIMIT :limit
     """
 
