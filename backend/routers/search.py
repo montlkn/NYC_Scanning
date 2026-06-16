@@ -105,3 +105,88 @@ async def search_buildings(
         }
         for r in rows
     ]
+
+
+@router.get("/venues")
+async def search_venues(
+    q: str = Query(..., description="Natural-language venue query, e.g. 'dimly lit speakeasy'"),
+    limit: int = Query(20, ge=1, le=100),
+    lat: Optional[float] = Query(None, description="Center latitude for geo sort/filter"),
+    lng: Optional[float] = Query(None, description="Center longitude for geo sort/filter"),
+    radius_m: Optional[float] = Query(None, description="Geo radius filter in meters"),
+    year_from: Optional[int] = Query(None, description="Host-building earliest year_built"),
+    year_to: Optional[int] = Query(None, description="Host-building latest year_built"),
+) -> List[dict]:
+    """Semantic VENUE search over `venues` (FSQ places), returning the venue plus
+    its host-building provenance (bin/year). This is the moat: "original
+    midcentury bar" ranks high because each venue's embedding text carries its
+    building's era. Empty list on any failure (client falls back to MKLocalSearch)."""
+    try:
+        qvec = embed_query(q)
+    except Exception as e:
+        logger.error(f"[venues] query embedding failed: {e}", exc_info=True)
+        return []
+
+    params: dict = {"qvec": _vec_literal(qvec), "limit": limit}
+    filters: List[str] = []
+
+    # Era filter applies to the HOST BUILDING's year — "original midcentury bar".
+    if year_from is not None:
+        filters.append("building_year >= :year_from")
+        params["year_from"] = year_from
+    if year_to is not None:
+        filters.append("building_year <= :year_to")
+        params["year_to"] = year_to
+
+    geo_select = ""
+    if lat is not None and lng is not None:
+        params["lat"] = lat
+        params["lng"] = lng
+        haversine = (
+            "6371000 * acos(GREATEST(-1, LEAST(1, "
+            "cos(radians(:lat)) * cos(radians(lat)) * cos(radians(lng) - radians(:lng)) "
+            "+ sin(radians(:lat)) * sin(radians(lat)))))"
+        )
+        geo_select = f", {haversine} AS dist_m"
+        if radius_m is not None:
+            params["radius_m"] = radius_m
+            filters.append(f"lat IS NOT NULL AND lng IS NOT NULL AND {haversine} <= :radius_m")
+
+    where = ("WHERE " + " AND ".join(filters)) if filters else ""
+
+    sql = f"""
+        SELECT fsq_id, name, category, snippet,
+               1 - (embedding <=> CAST(:qvec AS vector)) AS score,
+               lat, lng, bin, bbl, building_year{geo_select}
+        FROM venues
+        {where}
+        ORDER BY embedding <=> CAST(:qvec AS vector)
+        LIMIT :limit
+    """
+
+    try:
+        async with get_search_db() as db:
+            if db is None:
+                logger.warning("[venues] search DB not configured (SEARCH_DB_URL)")
+                return []
+            result = await db.execute(text(sql), params)
+            rows = result.fetchall()
+    except Exception as e:
+        logger.error(f"[venues] query failed: {e}", exc_info=True)
+        return []
+
+    return [
+        {
+            "fsq_id": r[0],
+            "name": r[1],
+            "category": r[2],
+            "snippet": r[3],
+            "score": round(float(r[4]), 4) if r[4] is not None else None,
+            "lat": r[5],
+            "lng": r[6],
+            "bin": str(r[7]).replace(".0", "") if r[7] else None,
+            "bbl": str(r[8]).replace(".0", "") if r[8] else None,
+            "building_year": r[9],
+        }
+        for r in rows
+    ]
