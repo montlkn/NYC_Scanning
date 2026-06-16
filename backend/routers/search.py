@@ -190,3 +190,82 @@ async def search_venues(
         }
         for r in rows
     ]
+
+
+@router.get("/layers")
+async def search_layers(
+    q: str = Query(..., description="Natural-language query, e.g. '1977 blackout'"),
+    limit: int = Query(30, ge=1, le=100),
+    lat: Optional[float] = Query(None, description="Center latitude for geo sort/filter"),
+    lng: Optional[float] = Query(None, description="Center longitude for geo sort/filter"),
+    radius_m: Optional[float] = Query(None, description="Geo radius filter in meters"),
+    layer: Optional[str] = Query(None, description="Restrict to one layer: lore|plaque|contribution"),
+) -> List[dict]:
+    """Semantic search over the OTHER map layers (lore events, plaques, community
+    contributions) in `layer_search_index`. Returns prefixed ids + coords so the
+    iOS app can light up + filter the matching map layer. Empty list on any
+    failure (search simply doesn't surface those layers)."""
+    try:
+        qvec = embed_query(q)
+    except Exception as e:
+        logger.error(f"[layers] query embedding failed: {e}", exc_info=True)
+        return []
+
+    params: dict = {"qvec": _vec_literal(qvec), "limit": limit}
+    filters: List[str] = []
+
+    if layer:
+        filters.append("layer = :layer")
+        params["layer"] = layer
+
+    geo_select = ""
+    if lat is not None and lng is not None:
+        params["lat"] = lat
+        params["lng"] = lng
+        haversine = (
+            "6371000 * acos(GREATEST(-1, LEAST(1, "
+            "cos(radians(:lat)) * cos(radians(lat)) * cos(radians(lng) - radians(:lng)) "
+            "+ sin(radians(:lat)) * sin(radians(lat)))))"
+        )
+        geo_select = f", {haversine} AS dist_m"
+        if radius_m is not None:
+            params["radius_m"] = radius_m
+            filters.append(f"lat IS NOT NULL AND lng IS NOT NULL AND {haversine} <= :radius_m")
+
+    where = ("WHERE " + " AND ".join(filters)) if filters else ""
+
+    sql = f"""
+        SELECT id, layer, title, snippet,
+               1 - (embedding <=> CAST(:qvec AS vector)) AS score,
+               lat, lng, year, category{geo_select}
+        FROM layer_search_index
+        {where}
+        ORDER BY embedding <=> CAST(:qvec AS vector)
+        LIMIT :limit
+    """
+
+    try:
+        async with get_search_db() as db:
+            if db is None:
+                logger.warning("[layers] search DB not configured (SEARCH_DB_URL)")
+                return []
+            result = await db.execute(text(sql), params)
+            rows = result.fetchall()
+    except Exception as e:
+        logger.error(f"[layers] query failed: {e}", exc_info=True)
+        return []
+
+    return [
+        {
+            "id": r[0],
+            "layer": r[1],
+            "title": r[2],
+            "snippet": r[3],
+            "score": round(float(r[4]), 4) if r[4] is not None else None,
+            "lat": r[5],
+            "lng": r[6],
+            "year": r[7],
+            "category": r[8],
+        }
+        for r in rows
+    ]
