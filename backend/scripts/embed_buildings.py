@@ -48,8 +48,21 @@ SOURCE_COLUMNS = (
 )
 
 
+# Placeholder values the curated data uses for "we don't know" — embedding these
+# pollutes the vector with meaningless tokens, so we drop them from the text.
+_JUNK_VALUES = {
+    "not determined", "undetermined", "unknown", "n/a", "na", "none",
+    "not applicable", "not available", "tbd", "unspecified", "-", "0",
+}
+
+# Sentinel BINs the curated set reuses for non-building sites (cemeteries,
+# archaeological sites). They collide on upsert (ON CONFLICT bin), so skip them.
+_PLACEHOLDER_BINS = {"0", "5000000", "1000000", "2000000", "3000000", "4000000"}
+
+
 def _clean(v) -> str:
-    return str(v).strip() if v is not None else ""
+    s = str(v).strip() if v is not None else ""
+    return "" if s.lower() in _JUNK_VALUES else s
 
 
 def _parse_int(v):
@@ -111,8 +124,8 @@ def fetch_source_rows(supa_url: str, limit, rebuild: bool, indexed_bins: set) ->
         rows = cur.fetchall()
     out = []
     for r in rows:
-        bin_clean = _clean(r.get("bin")).removesuffix(".0")
-        if not bin_clean:
+        bin_clean = str(r.get("bin") or "").strip().removesuffix(".0")
+        if not bin_clean or bin_clean in _PLACEHOLDER_BINS:
             continue
         if not rebuild and bin_clean in indexed_bins:
             continue
