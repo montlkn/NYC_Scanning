@@ -83,9 +83,9 @@ async def search_buildings(
     """
 
     try:
-        async with get_footprints_db() as db:
+        async with get_search_db() as db:
             if db is None:
-                logger.warning("[search] footprints DB not configured (FOOTPRINTS_DB_URL)")
+                logger.warning("[search] search DB not configured (SEARCH_DB_URL)")
                 return []
             result = await db.execute(text(sql), params)
             rows = result.fetchall()
