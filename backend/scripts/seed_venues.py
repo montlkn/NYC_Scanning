@@ -160,14 +160,31 @@ def nearest_building(vlat, vlng, buildings, grid):
     return best
 
 
-def build_text(name, cat_leaf, address, byear) -> str:
+def building_style(snippet) -> str:
+    """Style phrase from a building_search_index snippet, e.g.
+    '1150 Grand Concourse — art deco with alterations' -> 'art deco with alterations'.
+    The snippet is '{name/address} — {style}'; take the part after the em dash.
+    Derived dynamically — never a hardcoded style list."""
+    if not snippet or "—" not in snippet:
+        return ""
+    style = snippet.split("—", 1)[1].strip()
+    return style if style.lower() not in ("", "unknown", "none") else ""
+
+
+def build_text(name, cat_leaf, address, byear, style="") -> str:
     parts = [name]
     if cat_leaf:
         parts.append(cat_leaf)
     if address:
         parts.append(address)
-    if byear:
+    # Fold the host building's architectural style into the embedding so style
+    # queries ("art deco bars") can match the venue, not just the building.
+    if byear and style:
+        parts.append(f"in a {byear} {style} building")
+    elif byear:
         parts.append(f"in a {byear} building")
+    elif style:
+        parts.append(f"in a {style} building")
     return ". ".join(parts)
 
 
@@ -206,14 +223,17 @@ def main():
         leaf = category_leaf(labels)
         b = nearest_building(lat, lng, buildings, grid)
         bin_ = bbl = byear = None
+        style = ""
         if b:
+            # b = (bin, bbl, year_built, snippet, lat, lng) — snippet carries style.
             bin_, bbl, byear = b[0], b[1], b[2]
+            style = building_style(b[3])
             joined += 1
         prepared.append({
             "fsq_id": fsq_id, "name": name, "lat": lat, "lng": lng,
             "category": leaf, "category_id": (cat_ids[0] if cat_ids else None),
             "address": address, "bin": bin_, "bbl": bbl, "byear": byear,
-            "text": build_text(name, leaf, address, byear),
+            "text": build_text(name, leaf, address, byear, style),
             "snippet": f"{name} — {leaf}" if leaf else name,
         })
 
