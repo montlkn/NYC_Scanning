@@ -175,9 +175,34 @@ def load_district_members(client: httpx.Client, limit: int | None) -> list[dict]
     return rows
 
 
+def connect_rail(rail_url: str):
+    """One long-lived connection with TCP keepalives — the ingest makes thousands
+    of small writes over minutes, and a connect-per-write to Railway times out
+    (66.33.22.250 dropped mid-run). Keepalives hold the socket open across the
+    slow PDF-fetch / Grok-synthesis gaps between writes."""
+    return psycopg.connect(
+        rail_url, connect_timeout=15, keepalives=1,
+        keepalives_idle=30, keepalives_interval=10, keepalives_count=5,
+    )
+
+
+def with_retry(fn, *, attempts: int = 3):
+    """Run a DB op, reconnecting on a dropped connection. Returns fn's result.
+    fn takes no args and uses the connection captured by the caller."""
+    last = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except (psycopg.OperationalError, psycopg.InterfaceError) as e:
+            last = e
+            logger.warning(f"  DB op failed (attempt {i+1}/{attempts}): {e}")
+            time.sleep(2 * (i + 1))
+    raise last
+
+
 def load_indexed(rail_url: str) -> set:
     """BINs that already have chunks — so a normal run only ingests new ones."""
-    with psycopg.connect(rail_url) as conn, conn.cursor() as cur:
+    with connect_rail(rail_url) as conn, conn.cursor() as cur:
         cur.execute("SELECT DISTINCT bin FROM landmark_chunks WHERE bin IS NOT NULL")
         return {r[0] for r in cur.fetchall()}
 
@@ -194,10 +219,47 @@ def fetch_pdf_text(url: str, client: httpx.Client) -> str | None:
         return None
 
 
-def replace_bin_chunks(rail_url: str, bin_: str, lp: str, name, address, chunks: list[str]):
+class RailWriter:
+    """Holds one reconnecting connection for the whole run. Reconnects on a
+    dropped socket so a single Railway hiccup no longer kills the job."""
+
+    def __init__(self, rail_url: str):
+        self.url = rail_url
+        self.conn = connect_rail(rail_url)
+
+    def _reconnect(self):
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+        self.conn = connect_rail(self.url)
+
+    def execute_write(self, work):
+        """work(cur) does the DELETE+INSERT; retried with a reconnect on drop."""
+        for i in range(3):
+            try:
+                with self.conn.cursor() as cur:
+                    work(cur)
+                self.conn.commit()
+                return
+            except (psycopg.OperationalError, psycopg.InterfaceError) as e:
+                logger.warning(f"  write failed (attempt {i+1}/3), reconnecting: {e}")
+                time.sleep(2 * (i + 1))
+                self._reconnect()
+        raise psycopg.OperationalError("write failed after 3 reconnects")
+
+    def close(self):
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+
+def replace_bin_chunks(writer: "RailWriter", bin_: str, lp: str, name, address, chunks: list[str]):
     """Idempotent: clear this BIN's existing chunks, then insert fresh ones."""
     src = lp_to_pdf_url(lp) or lp
-    with psycopg.connect(rail_url) as conn, conn.cursor() as cur:
+
+    def work(cur):
         cur.execute("DELETE FROM landmark_chunks WHERE bin = %s", (bin_,))
         cur.executemany(
             """
@@ -207,7 +269,7 @@ def replace_bin_chunks(rail_url: str, bin_: str, lp: str, name, address, chunks:
             """,
             [(name, bin_, None, address, c, i, src, None) for i, c in enumerate(chunks)],
         )
-        conn.commit()
+    writer.execute_write(work)
 
 
 async def synthesize_district_blurb(name: str, raw_chunks: list[str]) -> str | None:
@@ -241,12 +303,13 @@ async def synthesize_district_blurb(name: str, raw_chunks: list[str]) -> str | N
     return result.strip() if result and len(result) > 40 else None
 
 
-def write_district_blurb(rail_url: str, members: list[dict], lp: str, blurb: str):
+def write_district_blurb(writer: "RailWriter", members: list[dict], lp: str, blurb: str):
     """Fan ONE district blurb (single chunk) to every member BIN. Idempotent per
     BIN. One small row per building — not the full report duplicated."""
     src = lp_to_pdf_url(lp) or lp
-    with psycopg.connect(rail_url) as conn, conn.cursor() as cur:
-        bins = [m["bin"] for m in members]
+    bins = [m["bin"] for m in members]
+
+    def work(cur):
         cur.execute("DELETE FROM landmark_chunks WHERE bin = ANY(%s)", (bins,))
         cur.executemany(
             """
@@ -256,7 +319,7 @@ def write_district_blurb(rail_url: str, members: list[dict], lp: str, blurb: str
             """,
             [(m["building_name"], m["bin"], None, m["address"], blurb, src) for m in members],
         )
-        conn.commit()
+    writer.execute_write(work)
 
 
 async def amain():
@@ -297,6 +360,10 @@ async def amain():
         by_lp.setdefault(lm["lp_number"], []).append(lm)
     logger.info(f"individual: {len(todo)} BINs over {len(by_lp)} reports")
 
+    # One reconnecting writer for the whole run (not a connect-per-write — that
+    # timed out against Railway mid-job). None in dry-run.
+    writer = None if args.dry_run else RailWriter(rail_url)
+
     total_chunks = bins_done = pdf_misses = 0
     with httpx.Client() as client:
         for n, (lp, members) in enumerate(by_lp.items(), 1):
@@ -316,7 +383,7 @@ async def amain():
                 bins_done += len(members)
                 continue
             for lm in members:
-                replace_bin_chunks(rail_url, lm["bin"], lp, lm["building_name"], lm["address"], chunks)
+                replace_bin_chunks(writer, lm["bin"], lp, lm["building_name"], lm["address"], chunks)
                 bins_done += 1
                 total_chunks += len(chunks)
             if n % 50 == 0:
@@ -352,11 +419,14 @@ async def amain():
                 if not blurb:
                     dist_misses += 1
                     continue
-                write_district_blurb(rail_url, members, lp, blurb)
+                write_district_blurb(writer, members, lp, blurb)
                 dist_reports += 1
                 dist_bins += len(members)
                 if n % 20 == 0:
                     logger.info(f"  district {n}/{len(by_dist)} · {dist_bins} BINs blurbed")
+
+    if writer:
+        writer.close()
 
     if args.dry_run:
         logger.info(f"dry-run: individual ~{total_chunks} chunks over {bins_done} BINs "
