@@ -87,20 +87,19 @@ async def search_buildings(
     # Fusion weights: vector leads (0.7) so concept queries are unchanged; lexical
     # (0.3) is enough that a strong name/architect match overtakes a loosely-
     # related semantic neighbour. Requires pg_trgm + a GIN trigram index on
-    # `text` (see migration handed to the user) — without the extension this
+    # `text` (migration 20260619_hybrid_trigram.sql) — without the extension this
     # SELECT errors and the whole endpoint returns [] (client falls back), so the
     # extension MUST be present before deploy.
     params["q_lex"] = q
-    lex_score = "word_similarity(lower(text), lower(:q_lex))"
     fused = "(0.7 * (1 - (embedding <=> CAST(:qvec AS vector))) + 0.3 * lex)"
 
-    # Two-stage to keep the pgvector ANN index hot: the inner query pulls a
-    # candidate pool ordered by raw cosine (uses the embedding index), the outer
-    # re-ranks that pool by the fused score. Pool size = 4x limit (capped 200) so
-    # a proper-noun row that the lexical signal should lift is in the pool even
-    # if its cosine rank is mediocre — the failing queries still placed the right
-    # building in the top ~40, just not the top 5. A pure ORDER BY fused would
-    # force a full scan + sort of all rows on every query; this doesn't.
+    # Candidate pool = UNION of two recall paths, each using its own index:
+    #   • vector top-N  (HNSW)         — concept recall ("art deco lobbies")
+    #   • trigram top-N (GIN pg_trgm)  — proper-noun recall ("chrysler")
+    # A pure vector pool was the bug: the Chrysler Building's cosine is near the
+    # noise floor, so it never entered a cosine-ordered top-200 and the trigram
+    # boost couldn't reach it (its word_similarity is 1.0). Pulling a lexical
+    # candidate set in parallel guarantees a strong name match is always scored.
     pool = min(max(limit * 4, 40), 200)
     params["pool"] = pool
 
@@ -109,12 +108,24 @@ async def search_buildings(
     # (psycopg then sees a literal ":qvec" and errors "syntax error at or near
     # ':'"). CAST(...) is colon-free and binds cleanly.
     sql = f"""
-        WITH pool AS (
+        WITH vec_pool AS (
             SELECT bin, snippet, embedding, text{geo_select}
             FROM building_search_index
             {where}
             ORDER BY embedding <=> CAST(:qvec AS vector)
             LIMIT :pool
+        ),
+        lex_pool AS (
+            SELECT bin, snippet, embedding, text{geo_select}
+            FROM building_search_index
+            {where + (' AND ' if where else 'WHERE ')}lower(text) %% lower(:q_lex)
+            ORDER BY word_similarity(lower(text), lower(:q_lex)) DESC
+            LIMIT :pool
+        ),
+        pool AS (
+            SELECT * FROM vec_pool
+            UNION
+            SELECT * FROM lex_pool
         )
         SELECT bin, snippet,
                {fused} AS score{(', dist_m' if geo_select else '')}
