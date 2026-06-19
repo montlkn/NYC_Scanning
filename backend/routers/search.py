@@ -102,6 +102,12 @@ async def search_buildings(
     # candidate set in parallel guarantees a strong name match is always scored.
     pool = min(max(limit * 4, 40), 200)
     params["pool"] = pool
+    # word_similarity floor for the lexical candidate set. 0.3 admits a clear
+    # name match ("chrysler" → "Chrysler Building" scores ~1.0) while rejecting
+    # incidental trigram overlap. word_similarity(query, text) — arg order
+    # matters: it measures the SHORT query against the best substring of the
+    # LONG text, so a 1-word name isn't diluted by the surrounding description.
+    params["lex_floor"] = 0.3
 
     # Use CAST(:qvec AS vector), NOT :qvec::vector — SQLAlchemy's text() parser
     # treats `::` as the start of a named param and mangles the bound vector
@@ -118,8 +124,8 @@ async def search_buildings(
         lex_pool AS (
             SELECT bin, snippet, embedding, text{geo_select}
             FROM building_search_index
-            {where + (' AND ' if where else 'WHERE ')}lower(text) %% lower(:q_lex)
-            ORDER BY word_similarity(lower(text), lower(:q_lex)) DESC
+            {where + (' AND ' if where else 'WHERE ')}word_similarity(lower(:q_lex), lower(text)) > :lex_floor
+            ORDER BY word_similarity(lower(:q_lex), lower(text)) DESC
             LIMIT :pool
         ),
         pool AS (
@@ -130,7 +136,7 @@ async def search_buildings(
         SELECT bin, snippet,
                {fused} AS score{(', dist_m' if geo_select else '')}
         FROM (
-            SELECT *, word_similarity(lower(text), lower(:q_lex)) AS lex
+            SELECT *, word_similarity(lower(:q_lex), lower(text)) AS lex
             FROM pool
         ) scored
         ORDER BY score DESC
