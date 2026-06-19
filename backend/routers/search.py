@@ -57,16 +57,22 @@ async def search_buildings(
         params["year_to"] = year_to
 
     geo_select = ""
+    haversine_b = ""  # b-aliased (final SELECT); set when geo provided
     if lat is not None and lng is not None:
         params["lat"] = lat
         params["lng"] = lng
         # Haversine (meters) — the search DB has no PostGIS. acos arg is clamped
-        # to [-1, 1] for numerical safety.
-        haversine = (
-            "6371000 * acos(GREATEST(-1, LEAST(1, "
-            "cos(radians(:lat)) * cos(radians(lat)) * cos(radians(lng) - radians(:lng)) "
-            "+ sin(radians(:lat)) * sin(radians(lat)))))"
-        )
+        # to [-1, 1] for numerical safety. Two forms: unaliased for the CTE
+        # radius filter (queries `building_search_index` directly), b-aliased for
+        # the final SELECT's dist_m (joined as `b`).
+        def _hav(col_lat: str, col_lng: str) -> str:
+            return (
+                "6371000 * acos(GREATEST(-1, LEAST(1, "
+                f"cos(radians(:lat)) * cos(radians({col_lat})) * cos(radians({col_lng}) - radians(:lng)) "
+                f"+ sin(radians(:lat)) * sin(radians({col_lat})))))"
+            )
+        haversine = _hav("lat", "lng")
+        haversine_b = _hav("b.lat", "b.lng")
         geo_select = f", {haversine} AS dist_m"
         if radius_m is not None:
             params["radius_m"] = radius_m
@@ -91,7 +97,9 @@ async def search_buildings(
     # SELECT errors and the whole endpoint returns [] (client falls back), so the
     # extension MUST be present before deploy.
     params["q_lex"] = q
-    fused = "(0.7 * (1 - (embedding <=> CAST(:qvec AS vector))) + 0.3 * lex)"
+    # Columns are qualified for the final join: b.* = table row, wl.lex = lateral
+    # word_similarity. Keep in sync with the SELECT below.
+    fused = "(0.7 * (1 - (b.embedding <=> CAST(:qvec AS vector))) + 0.3 * wl.lex)"
 
     # Candidate pool = UNION of two recall paths, each using its own index:
     #   • vector top-N  (HNSW)         — concept recall ("art deco lobbies")
@@ -113,32 +121,36 @@ async def search_buildings(
     # treats `::` as the start of a named param and mangles the bound vector
     # (psycopg then sees a literal ":qvec" and errors "syntax error at or near
     # ':'"). CAST(...) is colon-free and binds cleanly.
+    # UNION the candidate BINs ONLY (not the rows) — UNION over the embedding
+    # vector column throws "could not identify an ordering operator for type
+    # vector" because pgvector has no hash/sort opclass for UNION's dedup. We
+    # collect distinct BINs from the two recall paths, then join back to the
+    # table once to fetch+score the row data.
     sql = f"""
         WITH vec_pool AS (
-            SELECT bin, snippet, embedding, text{geo_select}
+            SELECT bin
             FROM building_search_index
             {where}
             ORDER BY embedding <=> CAST(:qvec AS vector)
             LIMIT :pool
         ),
         lex_pool AS (
-            SELECT bin, snippet, embedding, text{geo_select}
+            SELECT bin
             FROM building_search_index
             {where + (' AND ' if where else 'WHERE ')}word_similarity(lower(:q_lex), lower(text)) > :lex_floor
             ORDER BY word_similarity(lower(:q_lex), lower(text)) DESC
             LIMIT :pool
         ),
         pool AS (
-            SELECT * FROM vec_pool
+            SELECT bin FROM vec_pool
             UNION
-            SELECT * FROM lex_pool
+            SELECT bin FROM lex_pool
         )
-        SELECT bin, snippet,
-               {fused} AS score{(', dist_m' if geo_select else '')}
-        FROM (
-            SELECT *, word_similarity(lower(:q_lex), lower(text)) AS lex
-            FROM pool
-        ) scored
+        SELECT b.bin, b.snippet,
+               {fused} AS score{(', ' + haversine_b + ' AS dist_m' if geo_select else '')}
+        FROM building_search_index b
+        JOIN pool USING (bin)
+        CROSS JOIN LATERAL (SELECT word_similarity(lower(:q_lex), lower(b.text)) AS lex) wl
         ORDER BY score DESC
         LIMIT :limit
     """
