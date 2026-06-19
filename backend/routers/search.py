@@ -74,15 +74,55 @@ async def search_buildings(
 
     where = ("WHERE " + " AND ".join(filters)) if filters else ""
 
+    # Hybrid ranking: fuse semantic cosine with a lexical (trigram) score over the
+    # indexed `text` column. Pure vector search is strong on style/material
+    # CONCEPTS but weak on PROPER NOUNS — "chrysler" returned RCA Building, "neil
+    # denari" returned unrelated brownstones, because bge-small weights a name
+    # equally with the surrounding spec-sheet tokens. `text` already contains the
+    # name + architect (it's the embedded string), so word_similarity() catches
+    # the proper noun and lifts the right row. word_similarity (not similarity)
+    # measures the query against the BEST-MATCHING substring of `text`, so a short
+    # name query isn't penalised by the long descriptive text around it.
+    #
+    # Fusion weights: vector leads (0.7) so concept queries are unchanged; lexical
+    # (0.3) is enough that a strong name/architect match overtakes a loosely-
+    # related semantic neighbour. Requires pg_trgm + a GIN trigram index on
+    # `text` (see migration handed to the user) — without the extension this
+    # SELECT errors and the whole endpoint returns [] (client falls back), so the
+    # extension MUST be present before deploy.
+    params["q_lex"] = q
+    lex_score = "word_similarity(lower(text), lower(:q_lex))"
+    fused = "(0.7 * (1 - (embedding <=> CAST(:qvec AS vector))) + 0.3 * lex)"
+
+    # Two-stage to keep the pgvector ANN index hot: the inner query pulls a
+    # candidate pool ordered by raw cosine (uses the embedding index), the outer
+    # re-ranks that pool by the fused score. Pool size = 4x limit (capped 200) so
+    # a proper-noun row that the lexical signal should lift is in the pool even
+    # if its cosine rank is mediocre — the failing queries still placed the right
+    # building in the top ~40, just not the top 5. A pure ORDER BY fused would
+    # force a full scan + sort of all rows on every query; this doesn't.
+    pool = min(max(limit * 4, 40), 200)
+    params["pool"] = pool
+
     # Use CAST(:qvec AS vector), NOT :qvec::vector — SQLAlchemy's text() parser
     # treats `::` as the start of a named param and mangles the bound vector
     # (psycopg then sees a literal ":qvec" and errors "syntax error at or near
     # ':'"). CAST(...) is colon-free and binds cleanly.
     sql = f"""
-        SELECT bin, snippet, 1 - (embedding <=> CAST(:qvec AS vector)) AS score{geo_select}
-        FROM building_search_index
-        {where}
-        ORDER BY embedding <=> CAST(:qvec AS vector)
+        WITH pool AS (
+            SELECT bin, snippet, embedding, text{geo_select}
+            FROM building_search_index
+            {where}
+            ORDER BY embedding <=> CAST(:qvec AS vector)
+            LIMIT :pool
+        )
+        SELECT bin, snippet,
+               {fused} AS score{(', dist_m' if geo_select else '')}
+        FROM (
+            SELECT *, word_similarity(lower(text), lower(:q_lex)) AS lex
+            FROM pool
+        ) scored
+        ORDER BY score DESC
         LIMIT :limit
     """
 
