@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import logging
 
 from models.config import get_settings
-from models.footprints_session import get_footprints_db
+from models.footprints_session import get_footprints_db, run_footprints_query
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -90,15 +90,21 @@ async def get_candidates_by_footprint(
     height_weight_boost = 1.0 if pitch <= 20 else 1.0 + (pitch - 20) / 70
 
     try:
-        # Query the Railway footprints database
-        async with get_footprints_db() as footprints_db:
-            if footprints_db is None:
-                # Footprints DB not configured - fall back to V1
-                logger.warning("Footprints database not configured, falling back to V1")
-                return await fallback_centroid_query(
-                    session, lat, lng, bearing, pitch, max_distance, cone_angle, max_candidates
-                )
+        # Query the Railway footprints database via the retry wrapper, so a
+        # transient connection drop reconnects and retries BEFORE we degrade to
+        # the less-accurate V1 centroid path below. `None` sentinel = DB not
+        # configured (wrapper returns the default), which falls back to V1.
+        _NOT_CONFIGURED = object()
+        cone_params = {
+            'lat': lat,
+            'lng': lng,
+            'bearing': bearing,
+            'max_distance': max_distance,
+            'cone_angle': effective_cone,
+            'max_candidates': max_candidates,
+        }
 
+        async def _run(footprints_db):
             # Use the PostGIS function we created in the migration
             result = await footprints_db.execute(
                 text("""
@@ -117,17 +123,17 @@ async def get_candidates_by_footprint(
                         :lat, :lng, :bearing, :max_distance, :cone_angle, :max_candidates
                     )
                 """),
-                {
-                    'lat': lat,
-                    'lng': lng,
-                    'bearing': bearing,
-                    'max_distance': max_distance,
-                    'cone_angle': effective_cone,
-                    'max_candidates': max_candidates
-                }
+                cone_params,
             )
+            return result.fetchall()
 
-            rows = result.fetchall()
+        rows = await run_footprints_query(_run, default=_NOT_CONFIGURED)
+        if rows is _NOT_CONFIGURED:
+            # Footprints DB not configured - fall back to V1
+            logger.warning("Footprints database not configured, falling back to V1")
+            return await fallback_centroid_query(
+                session, lat, lng, bearing, pitch, max_distance, cone_angle, max_candidates
+            )
 
         candidates = []
         for row in rows:

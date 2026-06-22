@@ -17,7 +17,7 @@ import posthog
 
 from models.config import get_settings
 from models.session import init_db, close_db
-from models.footprints_session import init_footprints_engine, close_footprints_db
+from models.footprints_session import init_footprints_engine, close_footprints_db, footprints_db_ok
 from models.search_session import init_search_engine, close_search_db
 from routers import scan, scan_photo, buildings, stamps, vetting, rag, search
 
@@ -98,8 +98,13 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, restrict to your app domain
-    allow_credentials=True,
+    allow_origins=["*"],
+    # The iOS client authenticates with bearer/anon keys in request HEADERS, not
+    # cookies — so credentials mode is unused. And `allow_origins=["*"]` WITH
+    # credentials is a CORS spec violation (browsers reject the response). Keeping
+    # it False makes the wildcard valid and is the correct posture for a token-
+    # in-header API.
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -144,16 +149,26 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """Detailed health check"""
-    return {
-        "status": "healthy",
+    """Detailed health check.
+
+    Actually probes the footprints DB (Railway) — the dependency that powers
+    scans and is the one that drops connections. Previously this returned a
+    hardcoded `"database": "ok"`, so the endpoint reported healthy even when
+    Railway was down, defeating the point of a probe. Returns HTTP 503 +
+    status "degraded" when the DB is unreachable so Render's probe and any
+    monitor see the real state; the API process itself is still "ok".
+    """
+    db_ok = await footprints_db_ok()
+    healthy = db_ok
+    body = {
+        "status": "healthy" if healthy else "degraded",
         "timestamp": time.time(),
         "checks": {
             "api": "ok",
-            "database": "ok",
-            "redis": "ok",
-        }
+            "footprints_db": "ok" if db_ok else "unreachable",
+        },
     }
+    return JSONResponse(status_code=200 if healthy else 503, content=body)
 
 
 # Include routers
