@@ -28,6 +28,31 @@ def _vec_literal(vec: List[float]) -> str:
     return "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
 
 
+# Filler words that carry no proper-noun / style signal. The LEXICAL (trigram)
+# pool only exists to recover names, architects, materials and styles, so prose
+# stopwords are pure noise there — and worse, they false-match building names
+# ("buildings that LOOK like wedding cakes" trigram-hit "Look Building"). We
+# strip them from q_lex ONLY; the vector path keeps the full query for semantics.
+_LEX_STOPWORDS = frozenset({
+    "a", "an", "the", "of", "in", "on", "at", "to", "for", "with", "and", "or",
+    "that", "this", "these", "those", "is", "are", "was", "were", "be", "been",
+    "it", "its", "as", "by", "from", "into", "like", "look", "looks", "looking",
+    "feel", "feels", "feeling", "kind", "sort", "type", "very", "really", "some",
+    "any", "all", "me", "show", "find", "buildings", "building", "place",
+    "places", "something", "somewhere", "near", "around",
+})
+
+
+def _lexical_query(q: str) -> str:
+    """Strip prose stopwords so the trigram pool keys on distinctive terms only.
+
+    Falls back to the full query if stripping leaves nothing (e.g. a query that
+    is entirely stopwords) so the lexical pool never goes empty.
+    """
+    kept = [w for w in q.split() if w.lower().strip(".,!?;:'\"") not in _LEX_STOPWORDS]
+    return " ".join(kept) if kept else q
+
+
 @router.get("")
 async def search_buildings(
     q: str = Query(..., description="Natural-language search query"),
@@ -96,7 +121,7 @@ async def search_buildings(
     # `text` (migration 20260619_hybrid_trigram.sql) — without the extension this
     # SELECT errors and the whole endpoint returns [] (client falls back), so the
     # extension MUST be present before deploy.
-    params["q_lex"] = q
+    params["q_lex"] = _lexical_query(q)
     # Columns are qualified for the final join: b.* = table row, wl.lex = lateral
     # word_similarity. Keep in sync with the SELECT below.
     fused = "(0.7 * (1 - (b.embedding <=> CAST(:qvec AS vector))) + 0.3 * wl.lex)"
