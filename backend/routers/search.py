@@ -142,6 +142,16 @@ async def search_buildings(
     # LONG text, so a 1-word name isn't diluted by the surrounding description.
     params["lex_floor"] = 0.3
 
+    # Typo tolerance: a misspelled proper noun ("chrylser", "guggenhiem") can
+    # fall under the word_similarity floor and miss the lexical pool entirely.
+    # A third recall path uses similarity() — full-string trigram overlap, which
+    # degrades gracefully under a transposition/typo — at a lower floor, and the
+    # fused score takes max(word_similarity, similarity) so a clean exact match
+    # is never penalised but a fuzzy one can still surface. Same GIN index, no
+    # re-embed. Floor 0.2 admits a 1-char typo on a short name while rejecting
+    # noise. The pool is small, so the extra CTE is cheap.
+    params["fuzzy_floor"] = 0.2
+
     # Use CAST(:qvec AS vector), NOT :qvec::vector — SQLAlchemy's text() parser
     # treats `::` as the start of a named param and mangles the bound vector
     # (psycopg then sees a literal ":qvec" and errors "syntax error at or near
@@ -166,16 +176,30 @@ async def search_buildings(
             ORDER BY word_similarity(lower(:q_lex), lower(text)) DESC
             LIMIT :pool
         ),
+        fuzzy_pool AS (
+            SELECT bin
+            FROM building_search_index
+            {where + (' AND ' if where else 'WHERE ')}similarity(lower(:q_lex), lower(text)) > :fuzzy_floor
+            ORDER BY similarity(lower(:q_lex), lower(text)) DESC
+            LIMIT :pool
+        ),
         pool AS (
             SELECT bin FROM vec_pool
             UNION
             SELECT bin FROM lex_pool
+            UNION
+            SELECT bin FROM fuzzy_pool
         )
         SELECT b.bin, b.snippet,
                {fused} AS score{(', ' + haversine_b + ' AS dist_m' if geo_select else '')}
         FROM building_search_index b
         JOIN pool USING (bin)
-        CROSS JOIN LATERAL (SELECT word_similarity(lower(:q_lex), lower(b.text)) AS lex) wl
+        CROSS JOIN LATERAL (
+            SELECT greatest(
+                word_similarity(lower(:q_lex), lower(b.text)),
+                similarity(lower(:q_lex), lower(b.text))
+            ) AS lex
+        ) wl
         ORDER BY score DESC
         LIMIT :limit
     """

@@ -251,6 +251,84 @@ async def _cache_storytelling(session: AsyncSession, bin_val: str, lore: str):
     except Exception as e:
         logger.warning(f"Failed to cache lore for BIN {bin_val}: {e}")
         await session.rollback()
+        return
+    # Item 4: fold the new lore into the search index immediately so the building
+    # becomes searchable by its story without waiting for a full re-embed. Best
+    # effort — a failure here must never break lore generation.
+    await _reindex_building(session, bin_val)
+
+
+async def _reindex_building(session: AsyncSession, bin_val: str):
+    """Re-embed a single building into building_search_index after its lore changes.
+
+    Reuses the batch embedder's build_text / build_snippet so the embedded prose
+    stays identical to scripts/embed_buildings.py. The storytelling column is the
+    LAST clause of build_text, so the freshly-cached lore is now part of the
+    vector. Pure local embed ($0); upsert mirrors the script's ON CONFLICT shape.
+    """
+    try:
+        # Pull the full source row (same columns the batch script embeds).
+        from scripts.embed_buildings import (
+            SOURCE_COLUMNS, build_text, build_snippet, _parse_int,
+            _parse_float, _clean,
+        )
+        from services.text_embeddings import embed_texts
+        from models.search_session import get_search_db
+
+        result = await session.execute(
+            text(f"""
+                SELECT {SOURCE_COLUMNS}
+                FROM buildings_full_merge_scanning
+                WHERE REPLACE(bin, '.0', '') = :bin
+                LIMIT 1
+            """),
+            {'bin': bin_val},
+        )
+        row = result.mappings().first()
+        if not row:
+            return
+        row = dict(row)
+
+        txt = build_text(row)
+        if not txt:
+            return
+        vec = embed_texts([txt])[0]
+        vec_literal = "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
+        landmark = _clean(row.get("landmark"))
+
+        async with get_search_db() as sdb:
+            if sdb is None:
+                return
+            await sdb.execute(
+                text("""
+                    INSERT INTO building_search_index
+                        (bin, bbl, text, snippet, embedding, year_built,
+                         is_landmark, lat, lng, updated_at)
+                    VALUES (:bin, :bbl, :text, :snippet, CAST(:embedding AS vector),
+                            :year_built, :is_landmark, :lat, :lng, now())
+                    ON CONFLICT (bin) DO UPDATE SET
+                        bbl = EXCLUDED.bbl, text = EXCLUDED.text,
+                        snippet = EXCLUDED.snippet, embedding = EXCLUDED.embedding,
+                        year_built = EXCLUDED.year_built,
+                        is_landmark = EXCLUDED.is_landmark,
+                        lat = EXCLUDED.lat, lng = EXCLUDED.lng, updated_at = now()
+                """),
+                {
+                    'bin': bin_val,
+                    'bbl': (_clean(row.get("bbl")).removesuffix(".0") or None),
+                    'text': txt,
+                    'snippet': build_snippet(row),
+                    'embedding': vec_literal,
+                    'year_built': _parse_int(row.get("year_built")),
+                    'is_landmark': bool(landmark and landmark != "0"),
+                    'lat': _parse_float(row.get("geocoded_lat")),
+                    'lng': _parse_float(row.get("geocoded_lng")),
+                },
+            )
+            await sdb.commit()
+        logger.info(f"Re-indexed BIN {bin_val} into search index after lore update")
+    except Exception as e:
+        logger.warning(f"Search re-index skipped for BIN {bin_val}: {e}")
 
 
 async def generate_building_lore(
