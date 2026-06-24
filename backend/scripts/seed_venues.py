@@ -27,6 +27,7 @@ import argparse
 import logging
 import os
 import sys
+from typing import Optional
 
 import duckdb
 import psycopg
@@ -112,7 +113,8 @@ def fetch_venues(bboxes: list, shards: int, token: str) -> list:
     file_list = ", ".join(f"'{f}'" for f in local_files)
     sql = f"""
         SELECT fsq_place_id, name, latitude, longitude, address,
-               fsq_category_ids, fsq_category_labels
+               fsq_category_ids, fsq_category_labels,
+               instagram, website, tel
         FROM read_parquet([{file_list}])
         WHERE date_closed IS NULL
           AND name IS NOT NULL
@@ -130,6 +132,29 @@ def category_leaf(labels) -> str:
     # Pick the longest (deepest) label, take its leaf segment.
     deepest = max(labels, key=lambda s: s.count(">"))
     return deepest.split(">")[-1].strip()
+
+
+def normalize_instagram(raw) -> Optional[str]:
+    """Bare IG handle from whatever FSQ stored (URL, @handle, or handle). The app
+    deep-links `instagram://user?username=<handle>`, so strip URL/@/slashes."""
+    if not raw:
+        return None
+    h = str(raw).strip()
+    if not h:
+        return None
+    low = h.lower()
+    if "instagram.com/" in low:
+        h = h[low.index("instagram.com/") + len("instagram.com/"):]
+    h = h.strip("@/ ")
+    h = h.split("/")[0].split("?")[0]
+    return h or None
+
+
+def clean_text(raw) -> Optional[str]:
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    return s or None
 
 
 def load_buildings(rail_url: str) -> list:
@@ -219,7 +244,7 @@ def main():
     prepared = []
     joined = 0
     for r in rows:
-        fsq_id, name, lat, lng, address, cat_ids, labels = r
+        fsq_id, name, lat, lng, address, cat_ids, labels, instagram, website, tel = r
         leaf = category_leaf(labels)
         b = nearest_building(lat, lng, buildings, grid)
         bin_ = bbl = byear = None
@@ -233,6 +258,8 @@ def main():
             "fsq_id": fsq_id, "name": name, "lat": lat, "lng": lng,
             "category": leaf, "category_id": (cat_ids[0] if cat_ids else None),
             "address": address, "bin": bin_, "bbl": bbl, "byear": byear,
+            "instagram": normalize_instagram(instagram),
+            "website": clean_text(website), "tel": clean_text(tel),
             "text": build_text(name, leaf, address, byear, style),
             "snippet": f"{name} — {leaf}" if leaf else name,
         })
@@ -257,6 +284,7 @@ def main():
                     p["text"], p["snippet"],
                     "[" + ",".join(f"{x:.6f}" for x in v) + "]",
                     p["lat"], p["lng"], p["bin"], p["bbl"], p["byear"], None,
+                    p["instagram"], p["website"], p["tel"],
                 )
                 for p, v in zip(chunk, vectors)
             ]
@@ -264,15 +292,17 @@ def main():
                 """
                 INSERT INTO venues
                     (fsq_id, name, category, category_id, text, snippet, embedding,
-                     lat, lng, bin, bbl, building_year, building_style, updated_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s::vector,%s,%s,%s,%s,%s,%s, now())
+                     lat, lng, bin, bbl, building_year, building_style,
+                     instagram, website, tel, updated_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s::vector,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
                 ON CONFLICT (fsq_id) DO UPDATE SET
                     name=EXCLUDED.name, category=EXCLUDED.category,
                     category_id=EXCLUDED.category_id, text=EXCLUDED.text,
                     snippet=EXCLUDED.snippet, embedding=EXCLUDED.embedding,
                     lat=EXCLUDED.lat, lng=EXCLUDED.lng, bin=EXCLUDED.bin,
                     bbl=EXCLUDED.bbl, building_year=EXCLUDED.building_year,
-                    updated_at=now()
+                    instagram=EXCLUDED.instagram, website=EXCLUDED.website,
+                    tel=EXCLUDED.tel, updated_at=now()
                 """,
                 batch,
             )

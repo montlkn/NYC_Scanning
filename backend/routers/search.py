@@ -275,7 +275,8 @@ async def search_venues(
     sql = f"""
         SELECT fsq_id, name, category, snippet,
                1 - (embedding <=> CAST(:qvec AS vector)) AS score,
-               lat, lng, bin, bbl, building_year{geo_select}
+               lat, lng, bin, bbl, building_year,
+               instagram, website, tel{geo_select}
         FROM venues
         {where}
         ORDER BY embedding <=> CAST(:qvec AS vector)
@@ -305,6 +306,9 @@ async def search_venues(
             "bin": str(r[7]).replace(".0", "") if r[7] else None,
             "bbl": str(r[8]).replace(".0", "") if r[8] else None,
             "building_year": r[9],
+            "instagram": r[10],
+            "website": r[11],
+            "tel": r[12],
         }
         for r in rows
     ]
