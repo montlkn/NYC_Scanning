@@ -70,26 +70,40 @@ def _tokens(q: str) -> List[str]:
 
 def classify_intent(q: str) -> str:
     """Deterministic rules cascade. Order matters — more specific first."""
+    intent, _noun = classify_intent_detailed(q)
+    return intent
+
+
+def classify_intent_detailed(q: str) -> tuple:
+    """Same cascade as classify_intent, but also returns the detected POI noun
+    (singular form, e.g. "bar" for "bars") when intent == "poi", else None.
+    Split out so routers/search.py can use the noun for category-family
+    ranking without re-running the classifier or duplicating _POI_NOUNS."""
     q = (q or "").strip()
     if not q:
-        return "prose"
+        return "prose", None
 
     if _ADDRESS_RE.match(q):
-        return "address"
+        return "address", None
 
     toks = _tokens(q)
     tokset = set(toks)
 
     if tokset & _EVENT_VOCAB:
-        return "event"
+        return "event", None
     if tokset & _LORE_VOCAB:
-        return "lore"
+        return "lore", None
     if tokset & _ARCHITECT_MARKERS:
-        return "architect"
-    if tokset & _POI_NOUNS:
-        return "poi"
+        return "architect", None
+    poi_hit = tokset & _POI_NOUNS
+    if poi_hit:
+        # Prefer the noun in the order it appears in the query (deterministic,
+        # not set-iteration order) so "art deco bar" -> "bar", not whichever
+        # hash order the set produces.
+        noun = next((t for t in toks if t in poi_hit), None)
+        return "poi", _singularize_poi_noun(noun)
     if tokset & _STYLE_VOCAB:
-        return "style"
+        return "style", None
 
     # Short, capitalized, name-like query (e.g. "Chrysler Building", "The Dakota")
     # and NOT a full sentence: <= 5 words, no verb-ish trailing punctuation.
@@ -97,12 +111,107 @@ def classify_intent(q: str) -> str:
     if len(words) <= 5:
         cap_words = [w for w in words if w[:1].isupper()]
         if len(cap_words) >= max(1, len(words) - 1):  # almost every word capitalized
-            return "name"
+            return "name", None
 
     if len(words) <= 6:
-        return "name"
+        return "name", None
 
-    return "prose"
+    return "prose", None
+
+
+# Plural -> singular map for the handful of _POI_NOUNS with an 's' plural, so
+# the exposed noun can key straight into _POI_CATEGORY_FAMILIES below without
+# needing every plural spelled out there too.
+_POI_NOUN_SINGULAR: Dict[str, str] = {
+    "bars": "bar", "cafes": "cafe", "restaurants": "restaurant",
+    "clubs": "club", "theaters": "theater", "theatres": "theater",
+    "theatre": "theater", "diners": "diner", "speakeasies": "speakeasy",
+    "bakeries": "bakery", "pizzerias": "pizzeria", "breweries": "brewery",
+    "bookstores": "bookstore", "galleries": "gallery", "museums": "museum",
+    "shops": "shop", "markets": "market", "pubs": "pub", "lounges": "lounge",
+    "hotels": "hotel", "delis": "deli", "venues": "venue",
+}
+
+
+def _singularize_poi_noun(noun: Optional[str]) -> Optional[str]:
+    if noun is None:
+        return None
+    return _POI_NOUN_SINGULAR.get(noun, noun)
+
+
+# ---------------------------------------------------------------------------
+# POI category-family alignment (poi intent only). Maps a detected POI noun
+# to the family of FSQ `category` substrings that count as a match, for a
+# mild rank boost/demotion in routers/search.py's venues leg. Kept minimal —
+# only families with real ambiguity risk in the venues corpus need entries;
+# a noun with no entry here just gets no boost/demotion (neutral).
+# ---------------------------------------------------------------------------
+
+POI_CATEGORY_FAMILIES: Dict[str, frozenset] = {
+    "bar": frozenset({"bar", "pub", "lounge", "speakeasy", "cocktail", "gastropub", "tavern"}),
+    "pub": frozenset({"bar", "pub", "lounge", "speakeasy", "cocktail", "gastropub", "tavern"}),
+    "lounge": frozenset({"bar", "pub", "lounge", "speakeasy", "cocktail", "gastropub"}),
+    "speakeasy": frozenset({"bar", "pub", "lounge", "speakeasy", "cocktail"}),
+    "cafe": frozenset({"cafe", "coffee", "espresso"}),
+    "coffee": frozenset({"cafe", "coffee", "espresso"}),
+    "restaurant": frozenset({"restaurant", "diner", "steakhouse", "bistro", "grill", "eatery"}),
+    "diner": frozenset({"diner", "restaurant"}),
+    "club": frozenset({"club", "nightclub", "lounge"}),
+    "theater": frozenset({"theater", "theatre", "cinema", "playhouse"}),
+    "bakery": frozenset({"bakery", "patisserie"}),
+    "pizzeria": frozenset({"pizza"}),
+    "brewery": frozenset({"brewery", "beer"}),
+    "bookstore": frozenset({"bookstore", "book"}),
+    "gallery": frozenset({"art gallery", "gallery"}),
+    "museum": frozenset({"museum"}),
+    "market": frozenset({"market", "grocery"}),
+    "hotel": frozenset({"hotel", "inn"}),
+    "deli": frozenset({"deli", "sandwich"}),
+}
+
+# Category-word families that must NOT count toward a POI family, even though
+# they share a substring with a family keyword (e.g. "Publisher"/"Public Art"
+# contain "pub"). Checked as whole words via POI_CATEGORY_MATCH_RE, so this
+# set exists only for the demotion side: a category made ENTIRELY of these
+# non-family words (e.g. "Art Gallery" vs a "bar" query) still demotes.
+_POI_DEMOTE_UNRELATED = frozenset({
+    "art gallery", "antique store", "gallery", "sushi restaurant", "furniture and home store",
+})
+
+W_POI_CATEGORY_MATCH = 0.08   # boost when venue category matches the detected POI family
+W_POI_CATEGORY_MISMATCH = -0.05  # demotion when category is a different, unrelated POI family
+
+
+def _category_word_hit(category: Optional[str], keywords: frozenset) -> bool:
+    """Whole-word (not substring) match of any keyword against category text.
+    Guards against "Publisher"/"Public Art" false-matching "pub", etc."""
+    if not category:
+        return False
+    cat_l = category.lower()
+    cat_words = set(re.split(r"[^\w]+", cat_l))
+    for kw in keywords:
+        if " " in kw:
+            if kw in cat_l:
+                return True
+        elif kw in cat_words:
+            return True
+    return False
+
+
+def poi_category_adjustment(category: Optional[str], poi_noun: Optional[str]) -> float:
+    """Rank nudge for a venue hit under poi intent. Returns 0.0 when there's
+    no detected noun, no category, or no family entry for the noun (neutral —
+    never a hard filter, just an additive adjustment on the fused score)."""
+    if not poi_noun or not category:
+        return 0.0
+    family = POI_CATEGORY_FAMILIES.get(poi_noun)
+    if not family:
+        return 0.0
+    if _category_word_hit(category, family):
+        return W_POI_CATEGORY_MATCH
+    if category.strip().lower() in _POI_DEMOTE_UNRELATED:
+        return W_POI_CATEGORY_MISMATCH
+    return 0.0
 
 
 # Per-intent corpus weights for RRF fusion. Keys: buildings / venues / layers.
@@ -137,6 +246,133 @@ W_PERSONALIZATION = 0.05
 W_PROXIMITY = 0.05
 W_NOVELTY = 0.02
 PROXIMITY_DECAY_M = 1500.0  # nudge decays to ~0 by this distance
+
+
+# Intents where "near me" is core to the request — radius_m stays a hard
+# filter for these (poi/name/address/event). For the rest (style/architect/
+# lore/prose) radius is a SOFT signal only: relevance dominates, but a
+# proximity bonus still favors closer results among otherwise-similar hits.
+# Verbatim requirement: "surface results close to you but city-wide shouldn't
+# be out of the question if it's closer to the search term."
+HARD_RADIUS_INTENTS = frozenset({"poi", "name", "address", "event"})
+
+# Soft-radius proximity bonus (separate from apply_nudges' W_PROXIMITY, which
+# is a tiny universal tie-break) — exponential decay so nearby results get a
+# real lift without a hard cutoff. Small relative to a real relevance gap.
+PROXIMITY_DECAY_WEIGHT = 0.06
+PROXIMITY_DECAY_SCALE_M = 3000.0
+
+# Rank boost for landmark-flagged buildings (building_search_index.is_landmark,
+# already populated by embed_buildings.py from the curated `landmark` column —
+# no schema change needed) on intents where "fame" should break ties in favor
+# of icon-tier buildings, e.g. "art deco" surfacing the Chrysler Building over
+# an obscure art-deco-tagged row house. Buildings only (venues/layers have no
+# landmark concept in this schema).
+LANDMARK_BOOST_INTENTS = frozenset({"style", "prose", "name", "architect"})
+W_LANDMARK_BOOST = 0.07
+
+
+def proximity_decay_bonus(dist_m: Optional[float]) -> float:
+    """Exponential proximity bonus for SOFT-radius intents. 0.0 when dist_m is
+    None/negative (no location signal, or hit has no lat/lng)."""
+    if dist_m is None or dist_m < 0:
+        return 0.0
+    import math
+    return PROXIMITY_DECAY_WEIGHT * math.exp(-dist_m / PROXIMITY_DECAY_SCALE_M)
+
+
+def landmark_boost(intent: str, is_landmark: Optional[bool]) -> float:
+    """Small rank boost for landmark buildings on intents where fame should
+    matter. 0.0 for non-landmark hits, non-boosted intents, or hits with no
+    landmark flag (None — e.g. venues/layers, or pre-migration rows)."""
+    if intent not in LANDMARK_BOOST_INTENTS:
+        return 0.0
+    return W_LANDMARK_BOOST if is_landmark else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Dedup near-identical hits — same normalized name AND within DEDUPE_DIST_M
+# of each other (e.g. "Court Name: Roosevelt" repeated across adjacent BINs
+# of one housing development). Keeps the highest-scored of each cluster.
+# ---------------------------------------------------------------------------
+
+DEDUPE_DIST_M = 150.0
+
+
+def _normalize_name_for_dedupe(name: Optional[str]) -> str:
+    if not name:
+        return ""
+    n = name.lower().strip()
+    n = re.sub(r"[^\w\s]", "", n)
+    n = re.sub(r"\s+", " ", n)
+    return n
+
+
+def _haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    import math
+    r = 6371000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lng2 - lng1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlambda / 2) ** 2
+    return 2 * r * math.asin(min(1.0, math.sqrt(a)))
+
+
+def dedupe_near_identical(
+    hits: List[Dict[str, Any]],
+    *,
+    dist_m: float = DEDUPE_DIST_M,
+    score_key: str = "score",
+) -> List[Dict[str, Any]]:
+    """Collapse hits sharing the same normalized name AND within `dist_m` of
+    each other, keeping the highest-scored per cluster. Order-preserving on
+    the SURVIVORS (first occurrence position of the kept hit), so callers that
+    already sorted by score keep that order. Hits missing lat/lng or name are
+    never merged with anything (can't establish proximity/identity), so they
+    always survive untouched — this function only removes hits it's SURE are
+    duplicates of a kept hit.
+    """
+    n = len(hits)
+    if n <= 1:
+        return list(hits)
+
+    kept_idx: List[int] = []
+    absorbed: set = set()
+
+    for i in range(n):
+        if i in absorbed:
+            continue
+        name_i = _normalize_name_for_dedupe(hits[i].get("name"))
+        lat_i, lng_i = hits[i].get("lat"), hits[i].get("lng")
+        if not name_i or lat_i is None or lng_i is None:
+            kept_idx.append(i)
+            continue
+
+        cluster = [i]
+        for j in range(i + 1, n):
+            if j in absorbed:
+                continue
+            name_j = _normalize_name_for_dedupe(hits[j].get("name"))
+            lat_j, lng_j = hits[j].get("lat"), hits[j].get("lng")
+            if not name_j or lat_j is None or lng_j is None:
+                continue
+            if name_j != name_i:
+                continue
+            if _haversine_m(lat_i, lng_i, lat_j, lng_j) <= dist_m:
+                cluster.append(j)
+
+        if len(cluster) == 1:
+            kept_idx.append(i)
+            continue
+
+        best = max(cluster, key=lambda k: hits[k].get(score_key) or 0.0)
+        kept_idx.append(best)
+        for k in cluster:
+            if k != best:
+                absorbed.add(k)
+
+    kept_idx_sorted = sorted(set(kept_idx))
+    return [hits[i] for i in kept_idx_sorted]
 
 
 @dataclass
@@ -212,6 +448,53 @@ def apply_nudges(
     if is_novel:
         score += W_NOVELTY
     return score
+
+
+# ---------------------------------------------------------------------------
+# matched_field inference — the buildings/venues/layers legs previously
+# hardcoded "name/architect"/"name"/"title" any time the trigram lex_score
+# beat 0.5, even when the actual overlapping token was a STYLE word ("art
+# deco bar" -> style match on a random art-deco-tagged row house showed
+# "matched: name/architect", which is simply wrong). Infer from which parsed
+# field the query tokens actually overlap, comparing q_lex tokens against
+# each candidate field's tokens — cheap, deterministic, no new DB round trip.
+# ---------------------------------------------------------------------------
+
+def infer_matched_field(
+    q_lex: str,
+    *,
+    name: Optional[str] = None,
+    style: Optional[str] = None,
+    architect: Optional[str] = None,
+    category: Optional[str] = None,
+    default: str = "semantic",
+) -> str:
+    """Pick the best-labeled matched_field by token overlap between q_lex and
+    each candidate field, preferring the more specific label on a tie
+    (name > architect > style > category) since a name hit is the strongest
+    signal a human reads as "found it". Falls back to `default` (typically
+    "semantic") when no field shares a token with the query."""
+    q_toks = {t for t in _tokens(q_lex) if len(t) >= 3}
+    if not q_toks:
+        return default
+
+    candidates = [
+        ("name", name),
+        ("architect", architect),
+        ("style", style),
+        ("category", category),
+    ]
+    best_label = default
+    best_overlap = 0
+    for label, field in candidates:
+        if not field:
+            continue
+        field_toks = {t for t in _tokens(field) if len(t) >= 3}
+        overlap = len(q_toks & field_toks)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_label = label
+    return best_label
 
 
 # ---------------------------------------------------------------------------

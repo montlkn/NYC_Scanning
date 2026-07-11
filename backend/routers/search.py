@@ -28,8 +28,13 @@ from services.unified_search import (
     build_header,
     build_why,
     classify_intent,
+    classify_intent_detailed,
     corpus_weights,
+    dedupe_near_identical,
+    infer_matched_field,
+    poi_category_adjustment,
     profile_similarity,
+    proximity_decay_bonus,
     reciprocal_rank_fusion,
 )
 
@@ -65,6 +70,43 @@ def _lexical_query(q: str) -> str:
     """
     kept = [w for w in q.split() if w.lower().strip(".,!?;:'\"") not in _LEX_STOPWORDS]
     return " ".join(kept) if kept else q
+
+
+# word_similarity()/similarity() alone false-match short generic tokens as
+# SUBSTRINGS: "bar" trigram-hits "decoy", "deco" hits "decorating"/"Decoy
+# workspace". Confirmed live against the venues table (word_similarity(lower
+# ('deco'), ...) scores "High Style Deco" AND "Decoration Day" both >= 0.3).
+# Fix: require at least one WHOLE WORD from q_lex to appear in the matched
+# text (Postgres \m...\M word-boundary regex), in addition to the similarity
+# floor. This is an extra AND-ed predicate, not a replacement — similarity
+# still ranks within the whole-word-filtered set so multi-word queries keep
+# their fuzzy/typo tolerance on the OTHER tokens.
+_WORD_BOUNDARY_MIN_LEN = 3  # tokens shorter than this (e.g. "a", "16") are too
+# short to build a meaningful word-boundary predicate and are skipped when
+# constructing the pattern; if ALL tokens are short, the whole-word filter is
+# omitted entirely (see _word_boundary_pattern's None return) rather than
+# blocking legitimate short-name queries.
+
+
+def _word_boundary_pattern(q_lex: str) -> Optional[str]:
+    """Build a Postgres regex alternation of \\m<token>\\M for each q_lex token
+    with len >= _WORD_BOUNDARY_MIN_LEN. Returns None if no token qualifies
+    (caller should skip the whole-word predicate in that case)."""
+    import re as _re
+    toks = [t for t in q_lex.split() if len(t) >= _WORD_BOUNDARY_MIN_LEN]
+    if not toks:
+        return None
+    return "|".join(rf"\m{_re.escape(t.lower())}\M" for t in toks)
+
+
+# Raised from 0.3: a bare word_similarity floor of 0.3 still admits a single
+# short token (e.g. "bar", "deco") matching an unrelated substring at scores
+# up to 1.0 (see comment above) — the word-boundary regex is the real fix,
+# but a higher floor also helps on the LONGER end (fewer weak multi-word
+# partial matches slipping into the candidate pool). 0.45 keeps the confirmed
+# multi-word matches (e.g. "art deco bar" -> "Patricia Shea Fine Art" 0.615,
+# "Art Deco Building" 0.77) while cutting the previous single-short-token noise.
+LEX_FLOOR = 0.45
 
 
 @router.get("")
@@ -431,6 +473,7 @@ async def _leg_buildings(
     material: Optional[str] = None,
     style_family: Optional[str] = None,
     user_vec_lit: Optional[str] = None,
+    soft_radius: bool = False,
 ) -> List[dict]:
     """Buildings leg for /unified — mirrors search_buildings()'s hybrid CTE but
     also returns name/style/year/landmark fields needed for `why`/header/facets.
@@ -438,7 +481,14 @@ async def _leg_buildings(
     embedded string and `snippet` is "{name/address} — {style}" by convention
     (see scripts/seed_venues.py::building_style for the same parsing pattern
     used on venues). We reuse that convention here rather than inventing a join
-    to a table this DB doesn't have."""
+    to a table this DB doesn't have.
+
+    soft_radius: when True (style/architect/lore/prose intents — see
+    HARD_RADIUS_INTENTS in unified_search.py), radius_m is NOT applied as a
+    WHERE filter — dist_m is still computed/returned for the caller to apply
+    proximity_decay_bonus() as a soft scoring nudge instead. "surface results
+    close to you but city-wide shouldn't be out of the question if it's
+    closer to the search term" — a hard radius filter can't express that."""
     params: dict = {"qvec": qvec_lit, "limit": limit, "q_lex": q_lex}
     filters: List[str] = []
     if year_from is not None:
@@ -462,7 +512,7 @@ async def _leg_buildings(
             )
         haversine = _hav("lat", "lng")
         haversine_b = _hav("b.lat", "b.lng")
-        if radius_m is not None:
+        if radius_m is not None and not soft_radius:
             params["radius_m"] = radius_m
             filters.append(f"lat IS NOT NULL AND lng IS NOT NULL AND {haversine} <= :radius_m")
 
@@ -488,9 +538,19 @@ async def _leg_buildings(
 
     pool = min(max(limit * 4, 40), 200)
     params["pool"] = pool
-    params["lex_floor"] = 0.3
+    params["lex_floor"] = LEX_FLOOR
     params["fuzzy_floor"] = 0.2
     fused = "(0.7 * (1 - (b.embedding <=> CAST(:qvec AS vector))) + 0.3 * wl.lex)"
+
+    # Word-boundary guard on the lex_pool (proper-noun recall) ONLY — see
+    # _word_boundary_pattern's docstring. fuzzy_pool intentionally skips this:
+    # it exists specifically for typo tolerance ("chrylser"), where a whole-
+    # word match by definition won't be found.
+    word_boundary = _word_boundary_pattern(q_lex)
+    lex_word_boundary_clause = ""
+    if word_boundary:
+        params["lex_wb"] = word_boundary
+        lex_word_boundary_clause = " AND lower(text) ~ :lex_wb"
 
     # Personalization dot product computed IN SQL via pgvector's negative
     # inner-product operator (<#>): dot(a,b) = -(a <#> b). Only meaningful when
@@ -517,7 +577,7 @@ async def _leg_buildings(
         ),
         lex_pool AS (
             SELECT bin FROM building_search_index
-            {where + (' AND ' if where else 'WHERE ')}word_similarity(lower(:q_lex), lower(text)) > :lex_floor
+            {where + (' AND ' if where else 'WHERE ')}word_similarity(lower(:q_lex), lower(text)) > :lex_floor{lex_word_boundary_clause}
             ORDER BY word_similarity(lower(:q_lex), lower(text)) DESC LIMIT :pool
         ),
         fuzzy_pool AS (
@@ -577,6 +637,10 @@ async def _leg_buildings(
         snippet = r[2] or ""
         name = snippet.split("—", 1)[0].strip() if "—" in snippet else snippet
         parsed_style = snippet.split("—", 1)[1].strip() if "—" in snippet else None
+        # Architect isn't a separate SELECTed column here (only lives in the
+        # embedded `text`, not `snippet`), so infer_matched_field's architect
+        # slot is left None — name/style/category are the fields we can
+        # actually attribute a token match to for this leg.
         extra_offset = 9  # index of first enriched column, when present
         style_family = r[extra_offset] if enriched else None
         borough_val = r[extra_offset + 1] if enriched else None
@@ -600,7 +664,10 @@ async def _leg_buildings(
             "lat": r[5],
             "lng": r[6],
             "score": float(r[7]) if r[7] is not None else 0.0,
-            "matched_field": "name/architect" if (r[8] or 0) > 0.5 else "semantic",
+            "matched_field": (
+                infer_matched_field(q_lex, name=name, style=style_family or parsed_style)
+                if (r[8] or 0) > 0.5 else "semantic"
+            ),
             "dist_m": round(float(r[dist_idx]), 1) if geo and len(r) > dist_idx and r[dist_idx] is not None else None,
             "photo_url": photo_url,
             "lore_status": None,
@@ -613,12 +680,16 @@ async def _leg_venues(
     qvec_lit: str, q_lex: str, limit: int,
     lat: Optional[float], lng: Optional[float], radius_m: Optional[float],
     year_from: Optional[int], year_to: Optional[int],
+    soft_radius: bool = False,
 ) -> List[dict]:
     """Venues leg. Trigram fusion mirrors the buildings CTE, reading migration
     20260710_unified_search.sql's GIN index on name||snippet. If that migration
     hasn't run yet, word_similarity()/similarity() still work (pg_trgm was
     already installed by 20260619) just without the index — slower, not
-    broken — so no fallback branch is needed here."""
+    broken — so no fallback branch is needed here.
+
+    soft_radius: see _leg_buildings' docstring — radius_m skips the WHERE
+    filter and dist_m becomes a scoring-only signal instead."""
     params: dict = {"qvec": qvec_lit, "limit": limit, "q_lex": q_lex}
     filters: List[str] = []
     if year_from is not None:
@@ -637,14 +708,14 @@ async def _leg_venues(
             "cos(radians(:lat)) * cos(radians(lat)) * cos(radians(lng) - radians(:lng)) "
             "+ sin(radians(:lat)) * sin(radians(lat)))))"
         )
-        if radius_m is not None:
+        if radius_m is not None and not soft_radius:
             params["radius_m"] = radius_m
             filters.append(f"lat IS NOT NULL AND lng IS NOT NULL AND {haversine} <= :radius_m")
 
     where = ("WHERE " + " AND ".join(filters)) if filters else ""
     pool = min(max(limit * 4, 40), 200)
     params["pool"] = pool
-    params["lex_floor"] = 0.3
+    params["lex_floor"] = LEX_FLOOR
     fused = "(0.7 * (1 - (v.embedding <=> CAST(:qvec AS vector))) + 0.3 * wl.lex)"
     haversine_v = ""
     if geo:
@@ -653,6 +724,16 @@ async def _leg_venues(
             "cos(radians(:lat)) * cos(radians(v.lat)) * cos(radians(v.lng) - radians(:lng)) "
             "+ sin(radians(:lat)) * sin(radians(v.lat)))))"
         )
+
+    # Word-boundary guard — see _word_boundary_pattern's docstring and
+    # _leg_buildings' identical pattern. Venues has no separate fuzzy/typo
+    # pool, so this is the ONLY trigram recall path here; skip the guard
+    # entirely (None) when q_lex has no token long enough to build one.
+    word_boundary = _word_boundary_pattern(q_lex)
+    lex_word_boundary_clause = ""
+    if word_boundary:
+        params["lex_wb"] = word_boundary
+        lex_word_boundary_clause = "AND lower(name || ' ' || coalesce(snippet, '')) ~ :lex_wb"
 
     sql = f"""
         WITH vec_pool AS (
@@ -663,6 +744,7 @@ async def _leg_venues(
             SELECT fsq_id FROM venues
             {where + (' AND ' if where else 'WHERE ')}
             word_similarity(lower(:q_lex), lower(name || ' ' || coalesce(snippet, ''))) > :lex_floor
+            {lex_word_boundary_clause}
             ORDER BY word_similarity(lower(:q_lex), lower(name || ' ' || coalesce(snippet, ''))) DESC
             LIMIT :pool
         ),
@@ -693,7 +775,7 @@ async def _leg_venues(
         # — either way, graceful degradation to the pure-vector leg (no
         # photo_url, no trigram fusion) rather than a 500.
         logger.warning(f"[unified/venues] hybrid query failed ({e}); falling back to pure vector")
-        return await _leg_venues_vector_only(qvec_lit, limit, lat, lng, radius_m, year_from, year_to)
+        return await _leg_venues_vector_only(qvec_lit, limit, lat, lng, radius_m, year_from, year_to, soft_radius=soft_radius)
 
     hits = []
     for r in rows:
@@ -711,7 +793,10 @@ async def _leg_venues(
             "lat": r[4],
             "lng": r[5],
             "score": float(r[11]) if r[11] is not None else 0.0,
-            "matched_field": "name" if (r[12] or 0) > 0.5 else "semantic",
+            "matched_field": (
+                infer_matched_field(q_lex, name=r[1], style=r[9], category=r[2])
+                if (r[12] or 0) > 0.5 else "semantic"
+            ),
             "dist_m": round(float(r[13]), 1) if geo and len(r) > 13 and r[13] is not None else None,
             "photo_url": r[10],
             "lore_status": None,
@@ -723,6 +808,7 @@ async def _leg_venues_vector_only(
     qvec_lit: str, limit: int,
     lat: Optional[float], lng: Optional[float], radius_m: Optional[float],
     year_from: Optional[int], year_to: Optional[int],
+    soft_radius: bool = False,
 ) -> List[dict]:
     """Fallback path if the hybrid trigram migration hasn't run (pg_trgm/index
     missing) — pure vector, matching the pre-existing /search/venues shape."""
@@ -743,7 +829,7 @@ async def _leg_venues_vector_only(
             "cos(radians(:lat)) * cos(radians(lat)) * cos(radians(lng) - radians(:lng)) "
             "+ sin(radians(:lat)) * sin(radians(lat)))))"
         )
-        if radius_m is not None:
+        if radius_m is not None and not soft_radius:
             params["radius_m"] = radius_m
             filters.append(f"lat IS NOT NULL AND lng IS NOT NULL AND {haversine} <= :radius_m")
     where = ("WHERE " + " AND ".join(filters)) if filters else ""
@@ -776,17 +862,30 @@ async def _leg_venues_vector_only(
     ]
 
 
+def _layer_matched_field(q_lex: str, *, title: Optional[str], category: Optional[str]) -> str:
+    """Layers leg equivalent of infer_matched_field, but labels a title hit
+    "title" (not "name") to match this corpus's existing field name, and
+    falls back to "title" (not "semantic") on no-overlap since this branch
+    only runs when the lex_score already cleared 0.5 — some field DID match,
+    title is just the best guess when token attribution is ambiguous."""
+    label = infer_matched_field(q_lex, name=title, category=category, default="title")
+    return "title" if label == "name" else label
+
+
 async def _leg_layers(
     qvec_lit: str, q_lex: str, limit: int,
     lat: Optional[float], lng: Optional[float], radius_m: Optional[float],
     layer: Optional[str],
+    soft_radius: bool = False,
 ) -> List[dict]:
     """Lore/plaque/contribution leg. `layer_search_index.category` doubles as
     both a lore category and lore_status carrier in some ingests — inspected
     the migration (20260617_layers.sql) and it has no dedicated lore_status
     column, so lore_status is populated from `category` only when it looks
     like a status token (extant/demolished/unbuilt/transformed per
-    forgotten_city_layer memory); otherwise left null rather than guessed."""
+    forgotten_city_layer memory); otherwise left null rather than guessed.
+
+    soft_radius: see _leg_buildings' docstring."""
     params: dict = {"qvec": qvec_lit, "limit": limit, "q_lex": q_lex}
     filters: List[str] = []
     if layer:
@@ -802,14 +901,14 @@ async def _leg_layers(
             "cos(radians(:lat)) * cos(radians(lat)) * cos(radians(lng) - radians(:lng)) "
             "+ sin(radians(:lat)) * sin(radians(lat)))))"
         )
-        if radius_m is not None:
+        if radius_m is not None and not soft_radius:
             params["radius_m"] = radius_m
             filters.append(f"lat IS NOT NULL AND lng IS NOT NULL AND {haversine} <= :radius_m")
 
     where = ("WHERE " + " AND ".join(filters)) if filters else ""
     pool = min(max(limit * 4, 40), 200)
     params["pool"] = pool
-    params["lex_floor"] = 0.3
+    params["lex_floor"] = LEX_FLOOR
     fused = "(0.7 * (1 - (l.embedding <=> CAST(:qvec AS vector))) + 0.3 * wl.lex)"
     haversine_l = ""
     if geo:
@@ -818,6 +917,13 @@ async def _leg_layers(
             "cos(radians(:lat)) * cos(radians(l.lat)) * cos(radians(l.lng) - radians(:lng)) "
             "+ sin(radians(:lat)) * sin(radians(l.lat)))))"
         )
+
+    # Word-boundary guard — see _word_boundary_pattern's docstring.
+    word_boundary = _word_boundary_pattern(q_lex)
+    lex_word_boundary_clause = ""
+    if word_boundary:
+        params["lex_wb"] = word_boundary
+        lex_word_boundary_clause = "AND lower(coalesce(title,'') || ' ' || coalesce(snippet,'')) ~ :lex_wb"
 
     sql = f"""
         WITH vec_pool AS (
@@ -828,6 +934,7 @@ async def _leg_layers(
             SELECT id FROM layer_search_index
             {where + (' AND ' if where else 'WHERE ')}
             word_similarity(lower(:q_lex), lower(coalesce(title,'') || ' ' || coalesce(snippet,''))) > :lex_floor
+            {lex_word_boundary_clause}
             ORDER BY word_similarity(lower(:q_lex), lower(coalesce(title,'') || ' ' || coalesce(snippet,''))) DESC
             LIMIT :pool
         ),
@@ -856,7 +963,7 @@ async def _leg_layers(
         # Covers the pre-existing trigram-migration-missing case AND a
         # not-yet-migrated lore_status/photo_url column (20260710_index_enrich.sql).
         logger.warning(f"[unified/layers] hybrid query failed ({e}); falling back to pure vector")
-        return await _leg_layers_vector_only(qvec_lit, limit, lat, lng, radius_m, layer)
+        return await _leg_layers_vector_only(qvec_lit, limit, lat, lng, radius_m, layer, soft_radius=soft_radius)
 
     _STATUS_TOKENS = {"extant", "demolished", "unbuilt", "transformed"}
     hits = []
@@ -882,7 +989,10 @@ async def _leg_layers(
             "lat": r[4],
             "lng": r[5],
             "score": float(r[10]) if r[10] is not None else 0.0,
-            "matched_field": "title" if (r[11] or 0) > 0.5 else "semantic",
+            "matched_field": (
+                _layer_matched_field(q_lex, title=r[2], category=category)
+                if (r[11] or 0) > 0.5 else "semantic"
+            ),
             "dist_m": round(float(r[12]), 1) if geo and len(r) > 12 and r[12] is not None else None,
             "photo_url": r[9],
             "lore_status": lore_status,
@@ -894,6 +1004,7 @@ async def _leg_layers_vector_only(
     qvec_lit: str, limit: int,
     lat: Optional[float], lng: Optional[float], radius_m: Optional[float],
     layer: Optional[str],
+    soft_radius: bool = False,
 ) -> List[dict]:
     params: dict = {"qvec": qvec_lit, "limit": limit}
     filters: List[str] = []
@@ -909,7 +1020,7 @@ async def _leg_layers_vector_only(
             "cos(radians(:lat)) * cos(radians(lat)) * cos(radians(lng) - radians(:lng)) "
             "+ sin(radians(:lat)) * sin(radians(lat)))))"
         )
-        if radius_m is not None:
+        if radius_m is not None and not soft_radius:
             params["radius_m"] = radius_m
             filters.append(f"lat IS NOT NULL AND lng IS NOT NULL AND {haversine} <= :radius_m")
     where = ("WHERE " + " AND ".join(filters)) if filters else ""
@@ -1062,8 +1173,13 @@ async def search_unified(
     normalized taxonomy exists), never exact-match.
     """
     start = time.monotonic()
-    intent = classify_intent(q)
+    intent, poi_noun = classify_intent_detailed(q)
     weights = corpus_weights(intent)
+    # HARD_RADIUS_INTENTS (poi/name/address/event): radius_m stays a hard
+    # WHERE filter — "near me" is core to those queries. Everything else
+    # (style/architect/lore/prose) treats radius as a soft proximity signal
+    # only, so a better match further away can still surface.
+    soft_radius = intent not in HARD_RADIUS_INTENTS
 
     try:
         qvec = embed_query(q)
@@ -1094,10 +1210,10 @@ async def search_unified(
     buildings_task = _leg_buildings(
         qvec_lit, q_lex, leg_limit, lat, lng, radius_m, year_from, year_to,
         borough=borough, material=material, style_family=style_family,
-        user_vec_lit=user_vec_lit,
+        user_vec_lit=user_vec_lit, soft_radius=soft_radius,
     )
-    venues_task = _leg_venues(qvec_lit, q_lex, leg_limit, lat, lng, radius_m, year_from, year_to)
-    layers_task = _leg_layers(qvec_lit, q_lex, leg_limit, lat, lng, radius_m, layer_filter)
+    venues_task = _leg_venues(qvec_lit, q_lex, leg_limit, lat, lng, radius_m, year_from, year_to, soft_radius=soft_radius)
+    layers_task = _leg_layers(qvec_lit, q_lex, leg_limit, lat, lng, radius_m, layer_filter, soft_radius=soft_radius)
 
     buildings_hits, venues_hits, layers_hits = await asyncio.gather(
         buildings_task, venues_task, layers_task, return_exceptions=False
@@ -1124,6 +1240,19 @@ async def search_unified(
     if lore_status:
         layers_hits = [h for h in layers_hits if h.get("lore_status") == lore_status]
 
+    if intent == "poi" and poi_noun:
+        # Category-family rank adjustment (poi_category_adjustment, see
+        # unified_search.py): a mild boost when the venue's category matches
+        # the detected POI noun's family (bar/pub/lounge/... for "bar"), mild
+        # demotion for a category that's clearly a DIFFERENT, unrelated
+        # family (Antique Store / Art Gallery for a "bar" query). Never a
+        # hard filter — applied to `score` BEFORE re-sorting, so it also
+        # shifts each venue's rank within its own corpus (which RRF then
+        # reads), not just the final fused score.
+        for h in venues_hits:
+            h["score"] = (h.get("score") or 0.0) + poi_category_adjustment(h.get("category"), poi_noun)
+        venues_hits.sort(key=lambda h: h.get("score") or 0.0, reverse=True)
+
     # Build RankedHit lists (rank = position in each corpus's own score order;
     # legs already ORDER BY score DESC in SQL).
     legs = {
@@ -1137,8 +1266,12 @@ async def search_unified(
     if scanned_bins:
         scanned = {b.strip() for b in scanned_bins.split(",") if b.strip()}
 
-    hits: List[Dict[str, Any]] = []
-    for gk, score, ranked_hit in fused[: limit if limit else 30]:
+    # Build the FULL nudged/scored list first (not truncated to `limit` yet):
+    # dedupe_near_identical needs to see the whole candidate set to find
+    # near-duplicate clusters, and truncating before dedup could keep two
+    # duplicates while dropping a genuinely-different lower-ranked hit.
+    all_hits: List[Dict[str, Any]] = []
+    for gk, score, ranked_hit in fused:
         h = dict(ranked_hit.payload)
         # personalization_dot is set only on buildings hits, only when the
         # enriched `profile` column exists AND a user_vector param was passed
@@ -1152,6 +1285,17 @@ async def search_unified(
             dist_m=h.get("dist_m"),
             is_novel=is_novel,
         )
+        # Soft-radius proximity: for style/architect/lore/prose intents,
+        # radius_m was never applied as a WHERE filter (see soft_radius
+        # above), so dist_m may be large or None — add a decaying bonus
+        # instead of a cutoff, only when the caller actually supplied a
+        # location (dist_m is only ever populated when lat/lng were given).
+        if soft_radius and h.get("dist_m") is not None:
+            nudged += proximity_decay_bonus(h.get("dist_m"))
+        # Landmark/fame boost: buildings only, only on intents where fame
+        # should break ties (see LANDMARK_BOOST_INTENTS) — lets an icon-tier
+        # building (Chrysler etc.) beat an obscure same-style row house.
+        nudged += landmark_boost(intent, h.get("landmark"))
         why = build_why(
             matched_field=h.get("matched_field"),
             year=h.get("year"),
@@ -1159,7 +1303,7 @@ async def search_unified(
             category=h.get("category"),
             fallback_snippet=h.get("snippet"),
         )
-        hits.append({
+        all_hits.append({
             "type": h.get("type"),
             "id": h.get("id"),
             "score": round(float(nudged), 5),
@@ -1177,8 +1321,15 @@ async def search_unified(
             "lore_status": h.get("lore_status"),
             "snippet": h.get("snippet"),
         })
-        if len(hits) >= limit:
-            break
+
+    # Re-sort after the soft-radius/landmark nudges (both applied AFTER the
+    # RRF-order `fused` list was built, so they can reorder within it), then
+    # dedupe near-identical hits (e.g. repeated "Court Name: Roosevelt" rows
+    # across adjacent BINs of one development — same name, <150m apart),
+    # THEN truncate to `limit`.
+    all_hits.sort(key=lambda h: h["score"], reverse=True)
+    deduped = dedupe_near_identical(all_hits)
+    hits = deduped[:limit]
 
     header = build_header(hits, intent)
     facets = build_facets({

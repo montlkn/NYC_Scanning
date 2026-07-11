@@ -19,8 +19,14 @@ from services.unified_search import (  # noqa: E402
     build_header,
     build_why,
     classify_intent,
+    classify_intent_detailed,
     corpus_weights,
+    dedupe_near_identical,
+    infer_matched_field,
+    landmark_boost,
+    poi_category_adjustment,
     profile_similarity,
+    proximity_decay_bonus,
     reciprocal_rank_fusion,
 )
 
@@ -258,3 +264,233 @@ def test_live_search_db_connection_placeholder():
     # Placeholder for future integration tests against a real SEARCH_DB_URL.
     # Intentionally not exercising network here — kept skip-gated per spec.
     assert os.environ.get("SEARCH_DB_URL")
+
+
+# ---------------------------------------------------------------------------
+# classify_intent_detailed — POI noun exposure
+# ---------------------------------------------------------------------------
+
+def test_classify_intent_detailed_exposes_poi_noun():
+    intent, noun = classify_intent_detailed("art deco bar")
+    assert intent == "poi"
+    assert noun == "bar"
+
+
+def test_classify_intent_detailed_singularizes_plural_noun():
+    intent, noun = classify_intent_detailed("best bars in brooklyn")
+    assert intent == "poi"
+    assert noun == "bar"
+
+
+def test_classify_intent_detailed_prefers_first_matching_token():
+    # Query mentions two POI nouns; the FIRST one in query order wins
+    # (deterministic, not set-iteration order).
+    intent, noun = classify_intent_detailed("cafe with a bar")
+    assert intent == "poi"
+    assert noun == "cafe"
+
+
+def test_classify_intent_detailed_non_poi_intent_has_no_noun():
+    intent, noun = classify_intent_detailed("Chrysler Building")
+    assert intent == "name"
+    assert noun is None
+
+
+def test_classify_intent_still_matches_classify_intent_detailed():
+    # classify_intent must stay a thin wrapper — no behavior drift.
+    for q, _ in INTENT_CASES:
+        assert classify_intent(q) == classify_intent_detailed(q)[0]
+
+
+# ---------------------------------------------------------------------------
+# poi_category_adjustment — category-family rank nudge
+# ---------------------------------------------------------------------------
+
+def test_poi_category_adjustment_boosts_matching_family():
+    assert poi_category_adjustment("Cocktail Bar", "bar") > 0
+    assert poi_category_adjustment("Speakeasy", "bar") > 0
+    assert poi_category_adjustment("Pub", "bar") > 0
+
+
+def test_poi_category_adjustment_demotes_unrelated_family():
+    assert poi_category_adjustment("Art Gallery", "bar") < 0
+    assert poi_category_adjustment("Antique Store", "bar") < 0
+
+
+def test_poi_category_adjustment_neutral_when_no_noun_or_category():
+    assert poi_category_adjustment("Cocktail Bar", None) == 0.0
+    assert poi_category_adjustment(None, "bar") == 0.0
+
+
+def test_poi_category_adjustment_neutral_for_unmapped_noun():
+    # A POI noun with no _POI_CATEGORY_FAMILIES entry is neutral, not an error.
+    assert poi_category_adjustment("Cocktail Bar", "venue") == 0.0
+
+
+def test_poi_category_adjustment_does_not_false_match_substring():
+    # "Publisher"/"Public Art" contain "pub" as a substring but aren't in the
+    # bar family — word-boundary matching must not treat them as a hit.
+    assert poi_category_adjustment("Publisher", "bar") == 0.0
+    assert poi_category_adjustment("Public Art", "bar") == 0.0
+
+
+def test_poi_category_adjustment_demotes_confirmed_junk_case():
+    # "Andy Leong Sushi Bar" (category "Sushi Restaurant") was one of the
+    # reported junk hits for q="art deco bar" — confirm it demotes.
+    assert poi_category_adjustment("Sushi Restaurant", "bar") < 0
+
+
+def test_poi_category_adjustment_neutral_for_category_outside_demote_list():
+    # A category that's neither in the family nor the explicit demote list
+    # stays neutral — the demotion list is deliberately small/explicit, not
+    # "everything else".
+    assert poi_category_adjustment("Bookstore", "bar") == 0.0
+
+
+def test_poi_category_adjustment_magnitude_is_small():
+    # Never large enough to be a de-facto hard filter.
+    assert abs(poi_category_adjustment("Art Gallery", "bar")) < 0.2
+    assert poi_category_adjustment("Cocktail Bar", "bar") < 0.2
+
+
+# ---------------------------------------------------------------------------
+# infer_matched_field — attributes a lexical hit to the field that actually
+# overlaps the query, instead of a hardcoded "name/architect" label.
+# ---------------------------------------------------------------------------
+
+def test_infer_matched_field_picks_style_when_only_style_overlaps():
+    label = infer_matched_field("art deco bar", name="123 Random St", style="Art Deco")
+    assert label == "style"
+
+
+def test_infer_matched_field_picks_name_over_style_on_tie_preference():
+    # "Deco" overlaps both a name and a style field equally (1 token each) —
+    # name wins as the more specific/stronger signal.
+    label = infer_matched_field("deco", name="Deco Tower", style="Deco Revival")
+    assert label == "name"
+
+
+def test_infer_matched_field_prefers_field_with_more_overlap():
+    label = infer_matched_field("art deco bar", name="The Deco", style="Art Deco Revival Bar Building")
+    assert label == "style"
+
+
+def test_infer_matched_field_falls_back_to_default_on_no_overlap():
+    label = infer_matched_field("gothic revival", name="Sunset Diner", style="Art Deco", default="semantic")
+    assert label == "semantic"
+
+
+def test_infer_matched_field_empty_query_returns_default():
+    assert infer_matched_field("", name="Chrysler Building") == "semantic"
+
+
+def test_infer_matched_field_category_is_lowest_priority():
+    label = infer_matched_field("bar", name="bar none", category="Bar")
+    # "bar" overlaps both name ("bar none") and category ("Bar") with 1 token
+    # each; name wins per the name > architect > style > category ordering.
+    assert label == "name"
+
+
+# ---------------------------------------------------------------------------
+# proximity_decay_bonus / landmark_boost — soft-radius + fame nudges
+# ---------------------------------------------------------------------------
+
+def test_proximity_decay_bonus_closer_is_larger():
+    assert proximity_decay_bonus(100) > proximity_decay_bonus(3000)
+    assert proximity_decay_bonus(0) > proximity_decay_bonus(100)
+
+
+def test_proximity_decay_bonus_none_or_negative_is_zero():
+    assert proximity_decay_bonus(None) == 0.0
+    assert proximity_decay_bonus(-5) == 0.0
+
+
+def test_proximity_decay_bonus_far_away_decays_toward_zero():
+    assert proximity_decay_bonus(50_000) == pytest.approx(0.0, abs=1e-3)
+
+
+def test_proximity_decay_bonus_is_small():
+    assert proximity_decay_bonus(0) < 0.1
+
+
+def test_landmark_boost_applies_only_on_boosted_intents():
+    assert landmark_boost("style", True) > 0.0
+    assert landmark_boost("poi", True) == 0.0  # not in LANDMARK_BOOST_INTENTS
+
+
+def test_landmark_boost_zero_for_non_landmark():
+    assert landmark_boost("style", False) == 0.0
+    assert landmark_boost("style", None) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# dedupe_near_identical — collapse same-name, near-coincident hits
+# ---------------------------------------------------------------------------
+
+def _hit(name, lat, lng, score, **extra):
+    return {"name": name, "lat": lat, "lng": lng, "score": score, **extra}
+
+
+def test_dedupe_collapses_same_name_within_distance_keeping_highest_score():
+    hits = [
+        _hit("Court Name: Roosevelt", 40.7468, -73.9163, 0.5),
+        _hit("Court Name: Roosevelt", 40.7469, -73.9164, 0.8),  # ~15m away, higher score
+    ]
+    out = dedupe_near_identical(hits)
+    assert len(out) == 1
+    assert out[0]["score"] == 0.8
+
+
+def test_dedupe_keeps_same_name_far_apart():
+    hits = [
+        _hit("Roosevelt House", 40.70, -73.90, 0.5),
+        _hit("Roosevelt House", 40.80, -74.00, 0.6),  # far away, different building
+    ]
+    out = dedupe_near_identical(hits)
+    assert len(out) == 2
+
+
+def test_dedupe_keeps_different_names_even_if_close():
+    hits = [
+        _hit("Chrysler Building", 40.7516, -73.9755, 0.9),
+        _hit("Chanin Building", 40.7517, -73.9756, 0.8),
+    ]
+    out = dedupe_near_identical(hits)
+    assert len(out) == 2
+
+
+def test_dedupe_normalizes_name_case_and_punctuation():
+    hits = [
+        _hit("Court Name: Roosevelt", 40.7468, -73.9163, 0.5),
+        _hit("court name roosevelt", 40.7469, -73.9164, 0.9),
+    ]
+    out = dedupe_near_identical(hits)
+    assert len(out) == 1
+    assert out[0]["score"] == 0.9
+
+
+def test_dedupe_leaves_hits_without_coords_untouched():
+    hits = [
+        _hit("Some Layer Event", None, None, 0.5),
+        _hit("Some Layer Event", None, None, 0.4),
+    ]
+    out = dedupe_near_identical(hits)
+    # No lat/lng -> can't establish proximity -> both survive.
+    assert len(out) == 2
+
+
+def test_dedupe_empty_and_single_hit_lists():
+    assert dedupe_near_identical([]) == []
+    one = [_hit("X", 0.0, 0.0, 1.0)]
+    assert dedupe_near_identical(one) == one
+
+
+def test_dedupe_clusters_more_than_two_duplicates():
+    hits = [
+        _hit("Court Name: Roosevelt", 40.7468, -73.9163, 0.3),
+        _hit("Court Name: Roosevelt", 40.7469, -73.9164, 0.9),
+        _hit("Court Name: Roosevelt", 40.74685, -73.91635, 0.5),
+    ]
+    out = dedupe_near_identical(hits)
+    assert len(out) == 1
+    assert out[0]["score"] == 0.9
