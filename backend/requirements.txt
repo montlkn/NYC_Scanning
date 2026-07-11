@@ -50,3 +50,7 @@ posthog==3.5.0
 # Lazy-loaded on first /search; see services/text_embeddings.py.
 fastembed>=0.3.6,<1.0
 pypdf>=5.0  # LPC designation report text extraction (scripts/ingest_landmark_reports.py)
+
+# Testing
+pytest>=7.4,<8.0
+pytest-asyncio>=0.21,<0.22

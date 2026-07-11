@@ -278,13 +278,16 @@ def main():
         for i in range(0, len(prepared), args.batch_size):
             chunk = prepared[i : i + args.batch_size]
             vectors = embed_texts([p["text"] for p in chunk])
+            # photo_url: FSQ Open Source Places (fsq-os-places, dt=2024-12-03) has
+            # NO photo/image field in its schema (verified against the parquet
+            # columns actually read in fetch_venues()) — left NULL, not invented.
             batch = [
                 (
                     p["fsq_id"], p["name"], p["category"], p["category_id"],
                     p["text"], p["snippet"],
                     "[" + ",".join(f"{x:.6f}" for x in v) + "]",
                     p["lat"], p["lng"], p["bin"], p["bbl"], p["byear"], None,
-                    p["instagram"], p["website"], p["tel"],
+                    p["instagram"], p["website"], p["tel"], None,
                 )
                 for p, v in zip(chunk, vectors)
             ]
@@ -293,8 +296,8 @@ def main():
                 INSERT INTO venues
                     (fsq_id, name, category, category_id, text, snippet, embedding,
                      lat, lng, bin, bbl, building_year, building_style,
-                     instagram, website, tel, updated_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s::vector,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
+                     instagram, website, tel, photo_url, updated_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s::vector,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
                 ON CONFLICT (fsq_id) DO UPDATE SET
                     name=EXCLUDED.name, category=EXCLUDED.category,
                     category_id=EXCLUDED.category_id, text=EXCLUDED.text,
@@ -302,7 +305,7 @@ def main():
                     lat=EXCLUDED.lat, lng=EXCLUDED.lng, bin=EXCLUDED.bin,
                     bbl=EXCLUDED.bbl, building_year=EXCLUDED.building_year,
                     instagram=EXCLUDED.instagram, website=EXCLUDED.website,
-                    tel=EXCLUDED.tel, updated_at=now()
+                    tel=EXCLUDED.tel, photo_url=EXCLUDED.photo_url, updated_at=now()
                 """,
                 batch,
             )

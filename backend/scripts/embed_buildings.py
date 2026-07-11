@@ -21,9 +21,11 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import os
 import sys
+from typing import Optional
 
 import psycopg
 from psycopg.rows import dict_row
@@ -46,7 +48,7 @@ SOURCE_COLUMNS = (
     "bin, bbl, building_name, wiki_name, address, architect, style, style_secondary, "
     "building_type, use_original, year_built, era, borough_name, historic_district, "
     "landmark, mat_primary, colloquial_names_text, primary_aesthetic, secondary_aesthetic, "
-    "storytelling, geocoded_lat, geocoded_lng"
+    "storytelling, geocoded_lat, geocoded_lng, normalized_profile, hero_image_url"
 )
 
 
@@ -203,6 +205,35 @@ def build_snippet(row: dict) -> str:
     return f"{name} — {style}" if style else name
 
 
+# Archetype key order MUST match AestheticProfile's 9-vector layout (Jink_Swift
+# Models/AestheticProfile.swift) so building_search_index.profile is directly
+# dot-product-comparable against a user_vector param built the same way.
+_ARCHETYPE_ORDER = (
+    "classicist", "romantic", "stylist", "modernist", "industrialist",
+    "visionary", "pop_culturalist", "vernacularist", "austerist",
+)
+
+
+def _parse_profile_vector(raw) -> Optional[str]:
+    """`normalized_profile` is a JSON object keyed by archetype name (e.g.
+    {"classicist": 0.1, ...}). Returns a pgvector literal '[..]' in
+    _ARCHETYPE_ORDER, or None if the field is missing/unparseable/wrong shape —
+    never invents scores for missing archetypes."""
+    if not raw:
+        return None
+    try:
+        data = raw if isinstance(raw, dict) else json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    try:
+        vals = [float(data[k]) for k in _ARCHETYPE_ORDER]
+    except (KeyError, TypeError, ValueError):
+        return None
+    return "[" + ",".join(f"{x:.6f}" for x in vals) + "]"
+
+
 def fetch_source_rows(supa_url: str, limit, rebuild: bool, indexed_bins: set) -> list:
     with psycopg.connect(supa_url) as conn, conn.cursor(row_factory=dict_row) as cur:
         sql = f"SELECT {SOURCE_COLUMNS} FROM buildings_full_merge_scanning WHERE bin IS NOT NULL"
@@ -229,17 +260,30 @@ def load_indexed_bins(rail_url: str) -> set:
 
 
 def upsert(rail_url: str, batch: list):
-    """batch: list of (bin, bbl, text, snippet, vec_literal, year, is_landmark, lat, lng)."""
+    """batch: list of (bin, bbl, text, snippet, vec_literal, year, is_landmark, lat, lng,
+    style_family, borough, material, profile_vec_literal_or_None, photo_url).
+
+    style_family/borough/material/photo_url/profile are cheap columns we always
+    refresh on conflict (no re-embed needed), per Step 3 of the enrichment task —
+    even rows skipped for re-embedding (already indexed, --rebuild not passed)
+    still get these refreshed since fetch_source_rows only skips ALREADY-embedded
+    bins from the re-embed set; this upsert only runs for rows actually fetched.
+    """
     with psycopg.connect(rail_url) as conn, conn.cursor() as cur:
         cur.executemany(
             """
             INSERT INTO building_search_index
-                (bin, bbl, text, snippet, embedding, year_built, is_landmark, lat, lng, updated_at)
-            VALUES (%s, %s, %s, %s, %s::vector, %s, %s, %s, %s, now())
+                (bin, bbl, text, snippet, embedding, year_built, is_landmark, lat, lng,
+                 style_family, borough, material, profile, photo_url, updated_at)
+            VALUES (%s, %s, %s, %s, %s::vector, %s, %s, %s, %s,
+                    %s, %s, %s, %s::vector, %s, now())
             ON CONFLICT (bin) DO UPDATE SET
                 bbl = EXCLUDED.bbl, text = EXCLUDED.text, snippet = EXCLUDED.snippet,
                 embedding = EXCLUDED.embedding, year_built = EXCLUDED.year_built,
                 is_landmark = EXCLUDED.is_landmark, lat = EXCLUDED.lat, lng = EXCLUDED.lng,
+                style_family = EXCLUDED.style_family, borough = EXCLUDED.borough,
+                material = EXCLUDED.material, profile = EXCLUDED.profile,
+                photo_url = EXCLUDED.photo_url,
                 updated_at = now()
             """,
             batch,
@@ -293,6 +337,11 @@ def main():
                 bool(landmark and landmark != "0"),
                 _parse_float(r.get("geocoded_lat")),
                 _parse_float(r.get("geocoded_lng")),
+                _clean(r.get("style")) or None,
+                _clean(r.get("borough_name")) or None,
+                _clean(r.get("mat_primary")) or None,
+                _parse_profile_vector(r.get("normalized_profile")),
+                _clean(r.get("hero_image_url")) or None,
             ))
         upsert(rail_url, batch)
         total += len(batch)

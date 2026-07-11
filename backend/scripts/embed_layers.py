@@ -31,6 +31,7 @@ import argparse
 import logging
 import os
 import sys
+from typing import Optional
 
 import psycopg
 from psycopg.rows import dict_row
@@ -59,32 +60,48 @@ def _join(*parts) -> str:
 
 
 # --- Per-layer source config. Each entry: SQL + a row→(text, title, snippet,
-#     lat, lng, year, category) mapper. id is prefixed with the layer name. ---
+#     lat, lng, year, category, lore_status, photo_url) mapper. id is prefixed
+#     with the layer name. ---
+
+# Recognized lore_events.status values (extant/demolished/unbuilt/transformed
+# per forgotten_city_layer memory). Only these pass through to
+# layer_search_index.lore_status; anything else is left NULL rather than
+# guessed.
+_STATUS_TOKENS = {"extant", "demolished", "unbuilt", "transformed"}
+
+
+def _lore_status(raw) -> Optional[str]:
+    v = _clean(raw).lower()
+    return v if v in _STATUS_TOKENS else None
+
 
 def _lore_text(r):
     text = _join(r.get("title"), r.get("summary"), r.get("category"),
                  r.get("address"), r.get("year"))
     return text, _clean(r.get("title")), _clean(r.get("title")) or _clean(r.get("summary"))[:80], \
-        r.get("lat"), r.get("lng"), r.get("year"), _clean(r.get("category")) or None
+        r.get("lat"), r.get("lng"), r.get("year"), _clean(r.get("category")) or None, \
+        _lore_status(r.get("status")), _clean(r.get("image_url")) or None
 
 
 def _plaque_text(r):
     text = _join(r.get("title"), r.get("inscription"), r.get("subject"),
                  r.get("address"), r.get("year"))
     return text, _clean(r.get("title")), _clean(r.get("title")) or _clean(r.get("subject")), \
-        r.get("lat"), r.get("lng"), r.get("year"), _clean(r.get("series")) or None
+        r.get("lat"), r.get("lng"), r.get("year"), _clean(r.get("series")) or None, \
+        None, None  # plaques has no status/image column
 
 
 def _contribution_text(r):
     text = _join(r.get("place_name"), r.get("caption"))
     title = _clean(r.get("place_name")) or _clean(r.get("caption"))[:60]
     return text, title, title, \
-        r.get("latitude"), r.get("longitude"), None, None
+        r.get("latitude"), r.get("longitude"), None, None, \
+        None, None  # community_posts has no status/image column exposed here
 
 
 LAYERS = {
     "lore": {
-        "sql": "SELECT id, title, summary, category, lat, lng, address, year "
+        "sql": "SELECT id, title, summary, category, lat, lng, address, year, status, image_url "
                "FROM lore_events WHERE title IS NOT NULL",
         "map": _lore_text,
     },
@@ -111,12 +128,13 @@ def fetch_rows(supa_url, layer, cfg, rebuild, indexed):
         rid = f"{layer}:{r['id']}"
         if not rebuild and rid in indexed:
             continue
-        text, title, snippet, lat, lng, year, category = cfg["map"](r)
+        text, title, snippet, lat, lng, year, category, lore_status, photo_url = cfg["map"](r)
         if not text:
             continue
         out.append({
             "id": rid, "layer": layer, "text": text, "title": title,
             "snippet": snippet, "lat": lat, "lng": lng, "year": year, "category": category,
+            "lore_status": lore_status, "photo_url": photo_url,
         })
     return out
 
@@ -128,18 +146,21 @@ def load_indexed(rail_url) -> set:
 
 
 def upsert(rail_url, batch):
-    """batch: list of (id, layer, title, snippet, text, vec_literal, lat, lng, year, category)."""
+    """batch: list of (id, layer, title, snippet, text, vec_literal, lat, lng, year, category,
+    lore_status, photo_url)."""
     with psycopg.connect(rail_url) as conn, conn.cursor() as cur:
         cur.executemany(
             """
             INSERT INTO layer_search_index
-                (id, layer, title, snippet, text, embedding, lat, lng, year, category, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s::vector, %s, %s, %s, %s, now())
+                (id, layer, title, snippet, text, embedding, lat, lng, year, category,
+                 lore_status, photo_url, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s::vector, %s, %s, %s, %s, %s, %s, now())
             ON CONFLICT (id) DO UPDATE SET
                 layer = EXCLUDED.layer, title = EXCLUDED.title, snippet = EXCLUDED.snippet,
                 text = EXCLUDED.text, embedding = EXCLUDED.embedding,
                 lat = EXCLUDED.lat, lng = EXCLUDED.lng, year = EXCLUDED.year,
-                category = EXCLUDED.category, updated_at = now()
+                category = EXCLUDED.category, lore_status = EXCLUDED.lore_status,
+                photo_url = EXCLUDED.photo_url, updated_at = now()
             """,
             batch,
         )
@@ -192,6 +213,7 @@ def main():
                 r["id"], r["layer"], r["title"], r["snippet"], r["text"],
                 "[" + ",".join(f"{x:.6f}" for x in vec) + "]",
                 r["lat"], r["lng"], r["year"], r["category"],
+                r["lore_status"], r["photo_url"],
             ))
         upsert(rail_url, batch)
         total += len(batch)

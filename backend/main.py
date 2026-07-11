@@ -7,6 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
+import asyncio
 import time
 import logging
 import os
@@ -76,6 +77,19 @@ async def lifespan(app: FastAPI):
     # Initialize search database (dedicated pgvector service)
     logger.info("Initializing search database connection (pgvector)...")
     init_search_engine()
+
+    # Eagerly warm the embedding model so the FIRST /search request isn't the
+    # one paying the ~150MB fastembed load. Run in a thread executor so a slow
+    # ONNX load doesn't block the event loop / startup probe.
+    async def _warm_embeddings():
+        try:
+            from services.text_embeddings import _get_model
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, _get_model)
+        except Exception as e:
+            logger.warning(f"Embedding model warm-up failed (will lazy-load on first use): {e}")
+
+    asyncio.create_task(_warm_embeddings())
 
     yield
 
@@ -169,6 +183,33 @@ async def health_check():
         },
     }
     return JSONResponse(status_code=200 if healthy else 503, content=body)
+
+
+@app.get("/api/warm")
+async def warm():
+    """Warms the embedding model + search DB connection. Call this from a
+    Railway/Render cron or client pre-warm ping to avoid eating the cold-start
+    cost on a real user's first search."""
+    from services.text_embeddings import _get_model
+    from models.search_session import get_search_db
+    from sqlalchemy import text as sql_text
+
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, _get_model)
+    except Exception as e:
+        logger.warning(f"/api/warm: embedding model load failed: {e}")
+        return JSONResponse(status_code=503, content={"status": "cold", "error": str(e)})
+
+    try:
+        async with get_search_db() as db:
+            if db is not None:
+                await db.execute(sql_text("SELECT 1"))
+    except Exception as e:
+        logger.warning(f"/api/warm: search DB probe failed: {e}")
+        return JSONResponse(status_code=503, content={"status": "cold", "error": str(e)})
+
+    return {"status": "warm"}
 
 
 # Include routers
