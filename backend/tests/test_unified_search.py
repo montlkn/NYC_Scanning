@@ -25,7 +25,7 @@ from services.unified_search import (  # noqa: E402
     dedupe_near_identical,
     exact_name_bonus,
     infer_matched_field,
-    landmark_boost,
+    fame_boost,
     poi_category_adjustment,
     profile_similarity,
     proximity_decay_bonus,
@@ -410,7 +410,7 @@ def test_infer_matched_field_category_is_lowest_priority():
 
 
 # ---------------------------------------------------------------------------
-# proximity_decay_bonus / landmark_boost — soft-radius + fame nudges
+# proximity_decay_bonus / fame_boost — soft-radius + fame nudges
 # ---------------------------------------------------------------------------
 
 def test_proximity_decay_bonus_closer_is_larger():
@@ -431,14 +431,22 @@ def test_proximity_decay_bonus_is_small():
     assert proximity_decay_bonus(0) < 0.1
 
 
-def test_landmark_boost_applies_only_on_boosted_intents():
-    assert landmark_boost("style", True) > 0.0
-    assert landmark_boost("poi", True) == 0.0  # not in LANDMARK_BOOST_INTENTS
+def test_fame_boost_applies_only_on_boosted_intents():
+    assert fame_boost("style", 0.8) > 0.0
+    assert fame_boost("poi", 0.8) == 0.0  # not in FAME_BOOST_INTENTS
 
 
-def test_landmark_boost_zero_for_non_landmark():
-    assert landmark_boost("style", False) == 0.0
-    assert landmark_boost("style", None) == 0.0
+def test_fame_boost_is_continuous_and_scales_with_fame():
+    assert fame_boost("style", 1.0) > fame_boost("style", 0.5) > fame_boost("style", 0.05)
+    # An icon-tier score dominates a median row's boost (~0.08 fame).
+    assert fame_boost("style", 0.8) > 5 * fame_boost("style", 0.08)
+
+
+def test_fame_boost_zero_for_missing_fame_and_clamps_range():
+    assert fame_boost("style", None) == 0.0
+    assert fame_boost("style", 0.0) == 0.0
+    assert fame_boost("style", 2.0) == fame_boost("style", 1.0)
+    assert fame_boost("style", -1.0) == 0.0
 
 
 # ---------------------------------------------------------------------------

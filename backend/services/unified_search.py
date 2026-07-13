@@ -273,14 +273,15 @@ HARD_RADIUS_INTENTS = frozenset({"poi", "name", "address", "event"})
 PROXIMITY_DECAY_WEIGHT = 0.06
 PROXIMITY_DECAY_SCALE_M = 3000.0
 
-# Rank boost for landmark-flagged buildings (building_search_index.is_landmark,
-# already populated by embed_buildings.py from the curated `landmark` column —
-# no schema change needed) on intents where "fame" should break ties in favor
-# of icon-tier buildings, e.g. "art deco" surfacing the Chrysler Building over
-# an obscure art-deco-tagged row house. Buildings only (venues/layers have no
-# landmark concept in this schema).
-LANDMARK_BOOST_INTENTS = frozenset({"style", "prose", "name", "architect"})
-W_LANDMARK_BOOST = 0.07
+# Fame boost (building_search_index.fame — final_score from the curated
+# buildings DB normalized 0–1 against the corpus max; see backfill_fame.py).
+# Continuous and data-derived: no icon lists, no thresholds. is_landmark was
+# tried first and is useless as a fame proxy — it's the LPC designation flag
+# and 99.4% of the index is designated. Applied on intents where fame should
+# break ties ("art deco" → Chrysler over an obscure deco row house).
+# Buildings only (venues/layers carry no fame signal in this schema).
+FAME_BOOST_INTENTS = frozenset({"style", "prose", "name", "architect"})
+W_FAME_BOOST = 0.12  # × fame (0–1): Chrysler ≈ +0.095, median row ≈ +0.01
 
 
 def proximity_decay_bonus(dist_m: Optional[float]) -> float:
@@ -292,13 +293,13 @@ def proximity_decay_bonus(dist_m: Optional[float]) -> float:
     return PROXIMITY_DECAY_WEIGHT * math.exp(-dist_m / PROXIMITY_DECAY_SCALE_M)
 
 
-def landmark_boost(intent: str, is_landmark: Optional[bool]) -> float:
-    """Small rank boost for landmark buildings on intents where fame should
-    matter. 0.0 for non-landmark hits, non-boosted intents, or hits with no
-    landmark flag (None — e.g. venues/layers, or pre-migration rows)."""
-    if intent not in LANDMARK_BOOST_INTENTS:
+def fame_boost(intent: str, fame: Optional[float]) -> float:
+    """Continuous fame boost on intents where fame should matter. 0.0 for
+    non-boosted intents or hits with no fame score (None — venues/layers, or
+    rows the backfill hasn't covered)."""
+    if intent not in FAME_BOOST_INTENTS or fame is None:
         return 0.0
-    return W_LANDMARK_BOOST if is_landmark else 0.0
+    return W_FAME_BOOST * max(0.0, min(1.0, fame))
 
 
 # ---------------------------------------------------------------------------

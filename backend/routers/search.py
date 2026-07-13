@@ -35,8 +35,8 @@ from services.unified_search import (
     coverage_adjustment,
     dedupe_near_identical,
     exact_name_bonus,
+    fame_boost,
     infer_matched_field,
-    landmark_boost,
     poi_category_adjustment,
     query_style_tokens,
     style_name_decoy_penalty,
@@ -546,7 +546,10 @@ async def _leg_buildings(
 
     pool = min(max(limit * 4, 40), 200)
     params["pool"] = pool
-    params["landmark_pool"] = 40
+    # Fame slice: vector-rank the top ~3% most famous rows (1000 of ~35k) and
+    # admit the best 40. Both are pool-size tuning knobs, not relevance rules.
+    params["fame_candidates"] = 1000
+    params["fame_pool"] = 40
     params["lex_floor"] = LEX_FLOOR
     params["fuzzy_floor"] = 0.2
     fused = "(0.7 * (1 - (b.embedding <=> CAST(:qvec AS vector))) + 0.3 * wl.lex)"
@@ -594,21 +597,25 @@ async def _leg_buildings(
             {where + (' AND ' if where else 'WHERE ')}similarity(lower(:q_lex), lower(text)) > :fuzzy_floor
             ORDER BY similarity(lower(:q_lex), lower(text)) DESC LIMIT :pool
         ),
-        landmark_pool AS (
-            -- Fame-aware retrieval slice: the landmark-flagged rows nearest
-            -- the query vector ALWAYS enter the candidate set, so "art deco"
-            -- can surface the Chrysler Building even when the general vector
-            -- pool fills up with obscure-but-closer matches. Ranking is still
-            -- decided downstream (fused score + landmark_boost).
-            SELECT bin FROM building_search_index
-            {where + (' AND ' if where else 'WHERE ')}is_landmark
-            ORDER BY embedding <=> CAST(:qvec AS vector) LIMIT :landmark_pool
+        fame_pool AS (
+            -- Fame-aware retrieval slice: among the corpus's most famous rows
+            -- (fame = normalized final_score, see backfill_fame.py), the ones
+            -- nearest the query vector ALWAYS enter the candidate set, so
+            -- "art deco" can surface the Chrysler Building even when the
+            -- general vector pool fills up with obscure-but-closer matches.
+            -- Ranking is still decided downstream (fused score + fame_boost).
+            SELECT f.bin FROM (
+                SELECT bin, embedding FROM building_search_index
+                {where + (' AND ' if where else 'WHERE ')}fame IS NOT NULL
+                ORDER BY fame DESC LIMIT :fame_candidates
+            ) f
+            ORDER BY f.embedding <=> CAST(:qvec AS vector) LIMIT :fame_pool
         ),
         pool AS (
             SELECT bin FROM vec_pool UNION SELECT bin FROM lex_pool
-            UNION SELECT bin FROM fuzzy_pool UNION SELECT bin FROM landmark_pool
+            UNION SELECT bin FROM fuzzy_pool UNION SELECT bin FROM fame_pool
         )
-        SELECT b.bin, b.bbl, b.snippet, b.year_built, b.is_landmark, b.lat, b.lng,
+        SELECT b.bin, b.bbl, b.snippet, b.year_built, b.is_landmark, b.fame, b.lat, b.lng,
                {fused} AS score,
                wl.lex AS lex_score
                {select_extra}
@@ -661,7 +668,7 @@ async def _leg_buildings(
         # embedded `text`, not `snippet`), so infer_matched_field's architect
         # slot is left None — name/style/category are the fields we can
         # actually attribute a token match to for this leg.
-        extra_offset = 9  # index of first enriched column, when present
+        extra_offset = 10  # index of first enriched column, when present
         style_family = r[extra_offset] if enriched else None
         borough_val = r[extra_offset + 1] if enriched else None
         material_val = r[extra_offset + 2] if enriched else None
@@ -681,12 +688,13 @@ async def _leg_buildings(
             "material": material_val,
             "category": None,
             "landmark": bool(r[4]) if r[4] is not None else None,
-            "lat": r[5],
-            "lng": r[6],
-            "score": float(r[7]) if r[7] is not None else 0.0,
+            "fame": float(r[5]) if r[5] is not None else None,
+            "lat": r[6],
+            "lng": r[7],
+            "score": float(r[8]) if r[8] is not None else 0.0,
             "matched_field": (
                 infer_matched_field(q_lex, name=name, style=style_family or parsed_style)
-                if (r[8] or 0) > 0.5 else "semantic"
+                if (r[9] or 0) > 0.5 else "semantic"
             ),
             "dist_m": round(float(r[dist_idx]), 1) if geo and len(r) > dist_idx and r[dist_idx] is not None else None,
             "photo_url": photo_url,
@@ -1381,9 +1389,9 @@ async def search_unified(
         if soft_radius and h.get("dist_m") is not None:
             nudged += proximity_decay_bonus(h.get("dist_m"))
         # Landmark/fame boost: buildings only, only on intents where fame
-        # should break ties (see LANDMARK_BOOST_INTENTS) — lets an icon-tier
+        # should break ties (see FAME_BOOST_INTENTS) — lets an icon-tier
         # building (Chrysler etc.) beat an obscure same-style row house.
-        nudged += landmark_boost(intent, h.get("landmark"))
+        nudged += fame_boost(intent, h.get("fame"))
         # Name intent: an exact/subset name match is the answer — this bonus
         # is deliberately dominant over every other nudge (see W_EXACT_NAME).
         if intent == "name":

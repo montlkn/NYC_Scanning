@@ -48,8 +48,14 @@ SOURCE_COLUMNS = (
     "bin, bbl, building_name, wiki_name, address, architect, style, style_secondary, "
     "building_type, use_original, year_built, era, borough_name, historic_district, "
     "landmark, mat_primary, colloquial_names_text, primary_aesthetic, secondary_aesthetic, "
-    "storytelling, geocoded_lat, geocoded_lng, normalized_profile, hero_image_url"
+    "storytelling, geocoded_lat, geocoded_lng, normalized_profile, hero_image_url, "
+    "final_score"
 )
+
+# Corpus max of final_score, fetched once per run to normalize fame 0–1 —
+# derived from the data itself, never a hardcoded scale (see backfill_fame.py,
+# which uses the identical normalization for standalone backfills).
+_FAME_MAX: float | None = None
 
 
 # Placeholder values the curated data uses for "we don't know" — embedding these
@@ -235,7 +241,10 @@ def _parse_profile_vector(raw) -> Optional[str]:
 
 
 def fetch_source_rows(supa_url: str, limit, rebuild: bool, indexed_bins: set) -> list:
+    global _FAME_MAX
     with psycopg.connect(supa_url) as conn, conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT max(final_score::float) AS mx FROM buildings_full_merge_scanning")
+        _FAME_MAX = (cur.fetchone() or {}).get("mx")
         sql = f"SELECT {SOURCE_COLUMNS} FROM buildings_full_merge_scanning WHERE bin IS NOT NULL"
         if limit:
             sql += f" LIMIT {int(limit)}"
@@ -274,16 +283,16 @@ def upsert(rail_url: str, batch: list):
             """
             INSERT INTO building_search_index
                 (bin, bbl, text, snippet, embedding, year_built, is_landmark, lat, lng,
-                 style_family, borough, material, profile, photo_url, updated_at)
+                 style_family, borough, material, profile, photo_url, fame, updated_at)
             VALUES (%s, %s, %s, %s, %s::vector, %s, %s, %s, %s,
-                    %s, %s, %s, %s::vector, %s, now())
+                    %s, %s, %s, %s::vector, %s, %s, now())
             ON CONFLICT (bin) DO UPDATE SET
                 bbl = EXCLUDED.bbl, text = EXCLUDED.text, snippet = EXCLUDED.snippet,
                 embedding = EXCLUDED.embedding, year_built = EXCLUDED.year_built,
                 is_landmark = EXCLUDED.is_landmark, lat = EXCLUDED.lat, lng = EXCLUDED.lng,
                 style_family = EXCLUDED.style_family, borough = EXCLUDED.borough,
                 material = EXCLUDED.material, profile = EXCLUDED.profile,
-                photo_url = EXCLUDED.photo_url,
+                photo_url = EXCLUDED.photo_url, fame = EXCLUDED.fame,
                 updated_at = now()
             """,
             batch,
@@ -342,6 +351,8 @@ def main():
                 _clean(r.get("mat_primary")) or None,
                 _parse_profile_vector(r.get("normalized_profile")),
                 _clean(r.get("hero_image_url")) or None,
+                (_parse_float(r.get("final_score")) / _FAME_MAX)
+                if _FAME_MAX and _parse_float(r.get("final_score")) is not None else None,
             ))
         upsert(rail_url, batch)
         total += len(batch)
