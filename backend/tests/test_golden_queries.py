@@ -195,3 +195,77 @@ class TestLiveGoldenQueries:
         elapsed = time.monotonic() - start
         assert resp.status_code == 200
         assert elapsed < 2.0, f"warm request took {elapsed:.2f}s (limit 2.0s)"
+
+
+# ---------------------------------------------------------------------------
+# (c) Round-3 live regression asserts — one per defect found in the
+# 2026-07-12 field battery. Same gating as (b). Location = Flatiron district
+# (the battery's test position) so proximity behavior matches the reports.
+# ---------------------------------------------------------------------------
+
+_BATTERY_LOC = {"lat": 40.7411, "lng": -73.9897, "radius_m": 4000}
+
+_BAR_FAMILY = ("bar", "pub", "lounge", "speakeasy", "cocktail", "gastropub", "tavern")
+_BAR_JUNK = ("antique", "sushi", "gallery")
+
+
+@requires_search_db
+@requires_httpx
+class TestRound3Regressions:
+    @classmethod
+    def setup_class(cls):
+        cls.client = httpx.Client(base_url=BASE_URL, timeout=15.0)
+        try:
+            cls.client.get("/api/search/unified", params={"q": "warmup"})
+        except httpx.HTTPError as e:
+            pytest.skip(f"search server not reachable at {BASE_URL}: {e}")
+
+    @classmethod
+    def teardown_class(cls):
+        cls.client.close()
+
+    def _hits(self, q, **extra):
+        params = {"q": q, **_BATTERY_LOC, **extra}
+        resp = self.client.get("/api/search/unified", params=params)
+        assert resp.status_code == 200
+        return resp.json()
+
+    def test_exact_name_query_ranks_the_named_building_first(self):
+        data = self._hits("chrysler")
+        hits = data["hits"]
+        assert hits, "no hits for 'chrysler'"
+        assert "chrysler" in (hits[0].get("name") or "").lower(), (
+            f"top hit for 'chrysler' is {hits[0].get('name')!r}, not the Chrysler Building"
+        )
+
+    def test_art_deco_bar_top5_is_bar_family_without_junk(self):
+        data = self._hits("art deco bar")
+        top5 = data["hits"][:5]
+        cats = [(h.get("category") or "").lower() for h in top5]
+        for junk in _BAR_JUNK:
+            assert not any(junk in c for c in cats), (
+                f"'{junk}' category in top 5 for 'art deco bar': {cats}"
+            )
+        bar_count = sum(
+            1 for c in cats if any(fam in c for fam in _BAR_FAMILY)
+        )
+        assert bar_count >= 3, f"only {bar_count} bar-family venues in top 5: {cats}"
+
+    def test_demolished_theaters_top5_all_theaters(self):
+        data = self._hits("demolished theaters")
+        top5 = data["hits"][:5]
+        for h in top5:
+            text = f"{h.get('name') or ''} {h.get('snippet') or ''} {h.get('category') or ''}".lower()
+            assert "theat" in text or "cinema" in text or "playhouse" in text, (
+                f"non-theater hit in top 5 for 'demolished theaters': {h.get('name')!r}"
+            )
+        assert not data["header"].endswith("lores"), f"header pluralizes 'lore' badly: {data['header']!r}"
+
+    def test_art_deco_surfaces_a_landmark_in_top5(self):
+        data = self._hits("art deco")
+        top5 = data["hits"][:5]
+        names = " ".join((h.get("name") or "").lower() for h in top5)
+        icons = ("chrysler", "empire state", "rockefeller", "radio city", "waldorf")
+        assert any(i in names for i in icons), (
+            f"no icon-tier landmark in top 5 for 'art deco': {[h.get('name') for h in top5]}"
+        )

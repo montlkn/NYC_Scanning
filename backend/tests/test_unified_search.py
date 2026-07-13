@@ -21,13 +21,28 @@ from services.unified_search import (  # noqa: E402
     classify_intent,
     classify_intent_detailed,
     corpus_weights,
+    coverage_adjustment,
     dedupe_near_identical,
+    exact_name_bonus,
     infer_matched_field,
     landmark_boost,
     poi_category_adjustment,
     profile_similarity,
     proximity_decay_bonus,
+    query_style_tokens,
     reciprocal_rank_fusion,
+    style_name_decoy_penalty,
+    token_coverage,
+    venue_style_affinity,
+    W_EXACT_NAME,
+    W_FULL_COVERAGE,
+    W_LOW_COVERAGE,
+    W_NAME_SUBSET,
+    W_POI_CATEGORY_MISMATCH,
+    W_POI_CATEGORY_UNKNOWN,
+    W_STYLE_NAME_DECOY,
+    W_VENUE_ERA,
+    W_VENUE_STYLE,
 )
 
 requires_search_db = pytest.mark.skipif(
@@ -329,9 +344,11 @@ def test_poi_category_adjustment_neutral_for_unmapped_noun():
 
 def test_poi_category_adjustment_does_not_false_match_substring():
     # "Publisher"/"Public Art" contain "pub" as a substring but aren't in the
-    # bar family — word-boundary matching must not treat them as a hit.
-    assert poi_category_adjustment("Publisher", "bar") == 0.0
-    assert poi_category_adjustment("Public Art", "bar") == 0.0
+    # bar family — word-boundary matching must not treat them as a BOOST.
+    # (They match no known family at all, so they get the mild unknown-category
+    # demotion, never the family boost.)
+    assert poi_category_adjustment("Publisher", "bar") == W_POI_CATEGORY_UNKNOWN
+    assert poi_category_adjustment("Public Art", "bar") == W_POI_CATEGORY_UNKNOWN
 
 
 def test_poi_category_adjustment_demotes_confirmed_junk_case():
@@ -340,11 +357,12 @@ def test_poi_category_adjustment_demotes_confirmed_junk_case():
     assert poi_category_adjustment("Sushi Restaurant", "bar") < 0
 
 
-def test_poi_category_adjustment_neutral_for_category_outside_demote_list():
-    # A category that's neither in the family nor the explicit demote list
-    # stays neutral — the demotion list is deliberately small/explicit, not
-    # "everything else".
-    assert poi_category_adjustment("Bookstore", "bar") == 0.0
+def test_poi_category_adjustment_cross_family_demotes():
+    # A category that word-matches a DIFFERENT known family (Bookstore vs a
+    # "bar" query) is confidently the wrong kind of place — real demotion,
+    # stronger than the unknown-category one.
+    assert poi_category_adjustment("Bookstore", "bar") == W_POI_CATEGORY_MISMATCH
+    assert poi_category_adjustment("Bookstore", "bar") < W_POI_CATEGORY_UNKNOWN
 
 
 def test_poi_category_adjustment_magnitude_is_small():
@@ -494,3 +512,155 @@ def test_dedupe_clusters_more_than_two_duplicates():
     out = dedupe_near_identical(hits)
     assert len(out) == 1
     assert out[0]["score"] == 0.9
+
+
+# ---------------------------------------------------------------------------
+# Round 3 — exact-name dominance (name intent)
+# ---------------------------------------------------------------------------
+
+def test_exact_name_bonus_exact_match_is_dominant():
+    assert exact_name_bonus("chrysler building", "Chrysler Building") == W_EXACT_NAME
+    # Dominant over every other nudge combined (all others <= 0.07 each).
+    assert W_EXACT_NAME > 0.07 * 3
+
+
+def test_exact_name_bonus_subset_match():
+    # "chrysler" is a subset of the full name — strong but below exact.
+    assert exact_name_bonus("chrysler", "Chrysler Building") == W_NAME_SUBSET
+    assert W_NAME_SUBSET < W_EXACT_NAME
+
+
+def test_exact_name_bonus_partial_overlap_is_zero():
+    # Sharing one of two tokens is NOT a subset match.
+    assert exact_name_bonus("chrysler tower", "Chrysler Building") == 0.0
+
+
+def test_exact_name_bonus_no_overlap_or_missing_name():
+    assert exact_name_bonus("chrysler", "Engine Company No. 14") == 0.0
+    assert exact_name_bonus("chrysler", None) == 0.0
+    assert exact_name_bonus("", "Chrysler Building") == 0.0
+
+
+def test_exact_name_bonus_ignores_punctuation_and_case():
+    assert exact_name_bonus("the dakota", "The Dakota!") == W_EXACT_NAME
+
+
+# ---------------------------------------------------------------------------
+# Round 3 — venue style/era affinity (poi intent)
+# ---------------------------------------------------------------------------
+
+def test_query_style_tokens_strips_poi_noun():
+    assert query_style_tokens("art deco bar", "bar") == frozenset({"art", "deco"})
+
+
+def test_query_style_tokens_empty_for_plain_poi_query():
+    assert query_style_tokens("bars near me", "bar") == frozenset()
+
+
+def test_venue_style_affinity_style_text_match():
+    toks = frozenset({"art", "deco"})
+    assert venue_style_affinity(toks, "Art Deco", None) == W_VENUE_STYLE
+
+
+def test_venue_style_affinity_era_fallback():
+    # No host style text, but built 1928 = inside the deco window.
+    toks = frozenset({"deco"})
+    assert venue_style_affinity(toks, None, 1928) == W_VENUE_ERA
+    assert W_VENUE_ERA < W_VENUE_STYLE
+
+
+def test_venue_style_affinity_outside_era_is_zero():
+    assert venue_style_affinity(frozenset({"deco"}), None, 1890) == 0.0
+
+
+def test_venue_style_affinity_no_style_tokens_is_zero():
+    assert venue_style_affinity(frozenset(), "Art Deco", 1928) == 0.0
+
+
+def test_venue_style_affinity_unknown_style_token_no_era_fallback():
+    # "revival" has no era window — year alone can't earn the bonus.
+    assert venue_style_affinity(frozenset({"revival"}), None, 1928) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Round 3 — style-name decoy penalty (poi intent)
+# ---------------------------------------------------------------------------
+
+def test_style_name_decoy_penalizes_high_style_deco():
+    # The confirmed live junk case: antique store whose NAME matches the
+    # query's style words.
+    p = style_name_decoy_penalty("art deco bar", "High Style Deco", "Antique Store", "bar")
+    assert p == W_STYLE_NAME_DECOY
+
+
+def test_style_name_decoy_spares_real_bar_named_deco():
+    # A real bar named after the style is a great hit, not a decoy.
+    p = style_name_decoy_penalty("art deco bar", "Deco Bar", "Cocktail Bar", "bar")
+    assert p == 0.0
+
+
+def test_style_name_decoy_zero_when_name_overlap_is_not_style():
+    p = style_name_decoy_penalty("art deco bar", "O'Casey's Irish Bar", "Irish Pub", "bar")
+    assert p == 0.0
+
+
+def test_style_name_decoy_zero_without_noun_or_name():
+    assert style_name_decoy_penalty("art deco", "High Style Deco", "Antique Store", None) == 0.0
+    assert style_name_decoy_penalty("art deco bar", None, "Antique Store", "bar") == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Round 3 — multi-token coverage (lore/event intents)
+# ---------------------------------------------------------------------------
+
+def test_token_coverage_full():
+    assert token_coverage("demolished theaters", "Center Theatre — demolished 1954", None) == 1.0
+
+
+def test_token_coverage_plural_folding_both_ways():
+    # Query plural, text singular:
+    assert token_coverage("demolished theaters", "a demolished theater") == 1.0
+    # Query singular, text plural:
+    assert token_coverage("demolished theater", "demolished theaters of Broadway") == 1.0
+
+
+def test_token_coverage_partial():
+    cov = token_coverage("demolished theaters", "Gimbels Skybridge (demolished)", None)
+    assert cov == 0.5
+
+
+def test_token_coverage_no_content_tokens_is_neutral_one():
+    assert token_coverage("", "anything") == 1.0
+
+
+def test_coverage_adjustment_rewards_full_and_demotes_low():
+    assert coverage_adjustment("lore", "demolished theaters", "Center Theatre", "demolished in 1954") == W_FULL_COVERAGE
+    assert coverage_adjustment("lore", "demolished theaters", "Gimbels Skybridge (demolished)", None) == 0.0
+    assert coverage_adjustment("lore", "demolished theaters unbuilt", "Gimbels Skybridge (demolished)", None) == -W_LOW_COVERAGE
+
+
+def test_coverage_adjustment_only_lore_and_event_intents():
+    assert coverage_adjustment("style", "demolished theaters", "Skybridge", None) == 0.0
+    assert coverage_adjustment("name", "demolished theaters", "Skybridge", None) == 0.0
+
+
+def test_coverage_adjustment_single_token_query_is_neutral():
+    assert coverage_adjustment("lore", "demolished", "Skybridge", None) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Round 3 — header fixes
+# ---------------------------------------------------------------------------
+
+def test_build_header_style_needs_majority():
+    # One styled hit out of ten must NOT brand the whole set.
+    hits = [{"type": "lore", "style": None, "year": 1900 + i} for i in range(9)]
+    hits.append({"type": "lore", "style": "medieval revival", "year": 1925})
+    assert "medieval revival" not in build_header(hits, "lore")
+
+
+def test_build_header_lore_pluralizes_as_entries():
+    hits = [{"type": "lore", "style": None, "year": 1900 + i} for i in range(3)]
+    h = build_header(hits, "lore")
+    assert "lore entries" in h
+    assert "lores" not in h

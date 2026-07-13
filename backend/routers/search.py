@@ -32,10 +32,15 @@ from services.unified_search import (
     classify_intent,
     classify_intent_detailed,
     corpus_weights,
+    coverage_adjustment,
     dedupe_near_identical,
+    exact_name_bonus,
     infer_matched_field,
     landmark_boost,
     poi_category_adjustment,
+    query_style_tokens,
+    style_name_decoy_penalty,
+    venue_style_affinity,
     profile_similarity,
     proximity_decay_bonus,
     reciprocal_rank_fusion,
@@ -541,6 +546,7 @@ async def _leg_buildings(
 
     pool = min(max(limit * 4, 40), 200)
     params["pool"] = pool
+    params["landmark_pool"] = 40
     params["lex_floor"] = LEX_FLOOR
     params["fuzzy_floor"] = 0.2
     fused = "(0.7 * (1 - (b.embedding <=> CAST(:qvec AS vector))) + 0.3 * wl.lex)"
@@ -588,8 +594,19 @@ async def _leg_buildings(
             {where + (' AND ' if where else 'WHERE ')}similarity(lower(:q_lex), lower(text)) > :fuzzy_floor
             ORDER BY similarity(lower(:q_lex), lower(text)) DESC LIMIT :pool
         ),
+        landmark_pool AS (
+            -- Fame-aware retrieval slice: the landmark-flagged rows nearest
+            -- the query vector ALWAYS enter the candidate set, so "art deco"
+            -- can surface the Chrysler Building even when the general vector
+            -- pool fills up with obscure-but-closer matches. Ranking is still
+            -- decided downstream (fused score + landmark_boost).
+            SELECT bin FROM building_search_index
+            {where + (' AND ' if where else 'WHERE ')}is_landmark
+            ORDER BY embedding <=> CAST(:qvec AS vector) LIMIT :landmark_pool
+        ),
         pool AS (
-            SELECT bin FROM vec_pool UNION SELECT bin FROM lex_pool UNION SELECT bin FROM fuzzy_pool
+            SELECT bin FROM vec_pool UNION SELECT bin FROM lex_pool
+            UNION SELECT bin FROM fuzzy_pool UNION SELECT bin FROM landmark_pool
         )
         SELECT b.bin, b.bbl, b.snippet, b.year_built, b.is_landmark, b.lat, b.lng,
                {fused} AS score,
@@ -1303,8 +1320,18 @@ async def search_unified(
         # hard filter — applied to `score` BEFORE re-sorting, so it also
         # shifts each venue's rank within its own corpus (which RRF then
         # reads), not just the final fused score.
+        style_toks = query_style_tokens(q, poi_noun)
         for h in venues_hits:
-            h["score"] = (h.get("score") or 0.0) + poi_category_adjustment(h.get("category"), poi_noun)
+            adj = poi_category_adjustment(h.get("category"), poi_noun)
+            # Host-building style/era affinity — "art deco bar" boosts bars
+            # inside deco (or deco-era) buildings; the venue row already
+            # carries building_style/building_year, previously unscored.
+            adj += venue_style_affinity(style_toks, h.get("style"), h.get("year"))
+            # Style words in a venue NAME ("High Style Deco", antique store)
+            # are a lexical decoy, not noun relevance — penalized unless the
+            # category really is in the noun's family.
+            adj += style_name_decoy_penalty(q_lex, h.get("name"), h.get("category"), poi_noun)
+            h["score"] = (h.get("score") or 0.0) + adj
         venues_hits.sort(key=lambda h: h.get("score") or 0.0, reverse=True)
 
     # Build RankedHit lists (rank = position in each corpus's own score order;
@@ -1350,6 +1377,13 @@ async def search_unified(
         # should break ties (see LANDMARK_BOOST_INTENTS) — lets an icon-tier
         # building (Chrysler etc.) beat an obscure same-style row house.
         nudged += landmark_boost(intent, h.get("landmark"))
+        # Name intent: an exact/subset name match is the answer — this bonus
+        # is deliberately dominant over every other nudge (see W_EXACT_NAME).
+        if intent == "name":
+            nudged += exact_name_bonus(q_lex, h.get("name"))
+        # Lore/event multi-token queries: reward full concept coverage
+        # ("demolished" AND "theaters"), demote single-concept matches.
+        nudged += coverage_adjustment(intent, q_lex, h.get("name"), h.get("snippet"))
         why = build_why(
             matched_field=h.get("matched_field"),
             year=h.get("year"),

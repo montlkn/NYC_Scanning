@@ -178,8 +178,9 @@ _POI_DEMOTE_UNRELATED = frozenset({
     "art gallery", "antique store", "gallery", "sushi restaurant", "furniture and home store",
 })
 
-W_POI_CATEGORY_MATCH = 0.08   # boost when venue category matches the detected POI family
-W_POI_CATEGORY_MISMATCH = -0.05  # demotion when category is a different, unrelated POI family
+W_POI_CATEGORY_MATCH = 0.15   # boost when venue category matches the detected POI family
+W_POI_CATEGORY_MISMATCH = -0.12  # demotion when category belongs to a DIFFERENT known family
+W_POI_CATEGORY_UNKNOWN = -0.06   # mild demotion when category matches no family at all ("Structure")
 
 
 def _category_word_hit(category: Optional[str], keywords: frozenset) -> bool:
@@ -201,7 +202,12 @@ def _category_word_hit(category: Optional[str], keywords: frozenset) -> bool:
 def poi_category_adjustment(category: Optional[str], poi_noun: Optional[str]) -> float:
     """Rank nudge for a venue hit under poi intent. Returns 0.0 when there's
     no detected noun, no category, or no family entry for the noun (neutral —
-    never a hard filter, just an additive adjustment on the fused score)."""
+    never a hard filter, just an additive adjustment on the fused score).
+
+    Three-way: match the noun's own family → boost; word-match a DIFFERENT
+    known family (sushi restaurant / gallery vs a "bar" query) → real demotion;
+    match nothing we know ("Structure", "Monument") → mild demotion, since FSQ
+    category text is noisy and absence of a family isn't proof of irrelevance."""
     if not poi_noun or not category:
         return 0.0
     family = POI_CATEGORY_FAMILIES.get(poi_noun)
@@ -211,7 +217,12 @@ def poi_category_adjustment(category: Optional[str], poi_noun: Optional[str]) ->
         return W_POI_CATEGORY_MATCH
     if category.strip().lower() in _POI_DEMOTE_UNRELATED:
         return W_POI_CATEGORY_MISMATCH
-    return 0.0
+    for other_noun, other_family in POI_CATEGORY_FAMILIES.items():
+        if other_noun == poi_noun or other_family == family:
+            continue
+        if _category_word_hit(category, other_family):
+            return W_POI_CATEGORY_MISMATCH
+    return W_POI_CATEGORY_UNKNOWN
 
 
 # Per-intent corpus weights for RRF fusion. Keys: buildings / venues / layers.
@@ -288,6 +299,178 @@ def landmark_boost(intent: str, is_landmark: Optional[bool]) -> float:
     if intent not in LANDMARK_BOOST_INTENTS:
         return 0.0
     return W_LANDMARK_BOOST if is_landmark else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Exact-name dominance (name intent only). RRF fused scores top out around
+# 0.016 and every other nudge is <= 0.07, so these are deliberately DOMINANT:
+# when someone types a building's name, finding that building is the whole
+# job — no semantic neighbor or proximity nudge should outrank it.
+# ---------------------------------------------------------------------------
+
+W_EXACT_NAME = 0.30    # normalized query == normalized name
+W_NAME_SUBSET = 0.20   # every query content-token appears in the name
+
+
+def exact_name_bonus(q_lex: str, name: Optional[str]) -> float:
+    """Dominant bonus for name-intent queries whose tokens are literally the
+    hit's name (or a subset of it — "chrysler" ⊆ "Chrysler Building")."""
+    if not name:
+        return 0.0
+    q_norm = _normalize_name_for_dedupe(q_lex)
+    n_norm = _normalize_name_for_dedupe(name)
+    if not q_norm or not n_norm:
+        return 0.0
+    if q_norm == n_norm:
+        return W_EXACT_NAME
+    q_toks = {t for t in _tokens(q_norm) if len(t) >= 3}
+    n_toks = {t for t in _tokens(n_norm) if len(t) >= 3}
+    if q_toks and q_toks <= n_toks:
+        return W_NAME_SUBSET
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Venue style/era affinity (poi intent). The moat query "art deco bar" wants
+# bars whose HOST BUILDING is deco — venues carry building_style and
+# building_year, but until now neither was scored. Era windows exist only for
+# styles with a well-defined period; unknown style tokens get no era fallback.
+# ---------------------------------------------------------------------------
+
+W_VENUE_STYLE = 0.12        # building_style token overlap with query style tokens
+W_VENUE_ERA = 0.06          # no style text, but building_year inside the style's era
+
+STYLE_ERA_WINDOWS: Dict[str, tuple] = {
+    "deco": (1920, 1941),
+    "moderne": (1925, 1945),
+    "streamline": (1930, 1945),
+    "victorian": (1860, 1901),
+    "italianate": (1845, 1885),
+    "beaux-arts": (1885, 1925),
+    "beaux": (1885, 1925),
+    "gothic": (1830, 1930),
+    "romanesque": (1870, 1900),
+    "federal": (1785, 1830),
+    "georgian": (1700, 1780),
+    "greek": (1820, 1860),
+    "brutalist": (1955, 1980),
+    "brutalism": (1955, 1980),
+    "midcentury": (1945, 1970),
+    "mid-century": (1945, 1970),
+    "international": (1930, 1975),
+    "postmodern": (1975, 1995),
+    "cast-iron": (1850, 1885),
+}
+
+
+def query_style_tokens(q: str, poi_noun: Optional[str] = None) -> frozenset:
+    """Style-vocab tokens in the query, minus the POI noun itself.
+    "art deco bar" (noun "bar") → {"art", "deco"}."""
+    toks = set(_tokens(q))
+    toks.discard(poi_noun or "")
+    return frozenset(toks & _STYLE_VOCAB)
+
+
+def venue_style_affinity(
+    style_toks: frozenset,
+    building_style: Optional[str],
+    building_year: Optional[int],
+) -> float:
+    """Boost a venue whose host building matches the queried style — by style
+    text if present, else by build year falling inside the style's era."""
+    if not style_toks:
+        return 0.0
+    if building_style:
+        b_toks = set(_tokens(building_style))
+        if style_toks & b_toks:
+            return W_VENUE_STYLE
+    if building_year:
+        for t in style_toks:
+            window = STYLE_ERA_WINDOWS.get(t)
+            if window and window[0] <= building_year <= window[1]:
+                return W_VENUE_ERA
+    return 0.0
+
+
+# A venue whose NAME contains the query's style tokens ("High Style Deco",
+# an antique store, for "art deco bar") wins the lexical pool on a decoy: the
+# style words in its name aren't evidence it IS what the noun asked for.
+# Penalized unless the venue's category actually matches the noun's family.
+W_STYLE_NAME_DECOY = -0.10
+
+
+def style_name_decoy_penalty(
+    q_lex: str,
+    name: Optional[str],
+    category: Optional[str],
+    poi_noun: Optional[str],
+) -> float:
+    if not name or not poi_noun:
+        return 0.0
+    family = POI_CATEGORY_FAMILIES.get(poi_noun)
+    if family and _category_word_hit(category, family):
+        return 0.0  # a real bar named "Deco Bar" is a great hit, not a decoy
+    q_toks = {t for t in _tokens(q_lex) if len(t) >= 3}
+    n_toks = set(_tokens(name))
+    overlap = q_toks & n_toks
+    if overlap and overlap <= _STYLE_VOCAB:
+        return W_STYLE_NAME_DECOY
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Multi-token conjunction (lore/event intents). "demolished theaters" must
+# reward hits covering BOTH concepts and demote single-concept matches
+# (a demolished skybridge, an extant theater).
+# ---------------------------------------------------------------------------
+
+W_FULL_COVERAGE = 0.10
+W_LOW_COVERAGE = 0.08  # subtracted when coverage < 0.5
+
+
+def token_coverage(q_lex: str, *texts: Optional[str]) -> float:
+    """Fraction of the query's distinct content tokens (len >= 3) found across
+    the given texts, with naive plural folding both ways ("theaters" matches
+    "theater" and vice versa). 1.0 when the query has no content tokens (no
+    evidence either way — callers treat that as neutral)."""
+    q_toks = {t for t in _tokens(q_lex) if len(t) >= 3}
+    if not q_toks:
+        return 1.0
+    hit_toks = set()
+    for text in texts:
+        if text:
+            hit_toks.update(_tokens(text))
+    folded = set()
+    for t in hit_toks:
+        # -re/-er spelling fold (theatre/theater, centre/center) — both appear
+        # in the corpus — then plural fold both ways.
+        variants = {t}
+        if t.endswith("re"):
+            variants.add(t[:-2] + "er")
+        elif t.endswith("er"):
+            variants.add(t[:-2] + "re")
+        for v in variants:
+            folded.add(v)
+            folded.add(v + "s")
+            if v.endswith("s"):
+                folded.add(v[:-1])
+    covered = sum(1 for t in q_toks if t in folded or t.rstrip("s") in folded)
+    return covered / len(q_toks)
+
+
+def coverage_adjustment(intent: str, q_lex: str, name: Optional[str], snippet: Optional[str]) -> float:
+    """Coverage nudge for lore/event intents with multi-token queries."""
+    if intent not in {"lore", "event"}:
+        return 0.0
+    q_toks = {t for t in _tokens(q_lex) if len(t) >= 3}
+    if len(q_toks) < 2:
+        return 0.0
+    cov = token_coverage(q_lex, name, snippet)
+    if cov >= 1.0:
+        return W_FULL_COVERAGE
+    if cov < 0.5:
+        return -W_LOW_COVERAGE
+    return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -544,12 +727,22 @@ def build_header(hits: List[Dict[str, Any]], intent: str) -> str:
     years = [h.get("year") for h in hits if isinstance(h.get("year"), int)]
     types = Counter(h.get("type") for h in hits if h.get("type"))
 
-    dominant_style = styles.most_common(1)[0][0] if styles else None
+    # A style only leads the header when it genuinely characterizes the set
+    # (majority of hits) — otherwise "demolished theaters" got summarized as
+    # "medieval revival lores" because ONE hit happened to carry that style.
+    dominant_style = None
+    if styles:
+        top_style, top_count = styles.most_common(1)[0]
+        if top_count * 2 > n:
+            dominant_style = top_style
     dominant_type = types.most_common(1)[0][0] if types else None
 
+    _TYPE_NOUNS = {"lore": "lore entries"}
     noun = "results"
     if dominant_type:
-        noun = f"{dominant_type}s" if not dominant_type.endswith("s") else dominant_type
+        noun = _TYPE_NOUNS.get(dominant_type) or (
+            f"{dominant_type}s" if not dominant_type.endswith("s") else dominant_type
+        )
 
     lead = f"{n} {dominant_style + ' ' if dominant_style else ''}{noun}"
 
