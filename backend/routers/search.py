@@ -23,6 +23,7 @@ from models.search_session import get_search_db
 from services.text_embeddings import embed_query
 from services.grok import grok_text
 from services.unified_search import (
+    HARD_RADIUS_INTENTS,
     RankedHit,
     apply_nudges,
     build_facets,
@@ -33,6 +34,7 @@ from services.unified_search import (
     corpus_weights,
     dedupe_near_identical,
     infer_matched_field,
+    landmark_boost,
     poi_category_adjustment,
     profile_similarity,
     proximity_decay_bonus,
