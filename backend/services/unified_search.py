@@ -282,6 +282,10 @@ PROXIMITY_DECAY_SCALE_M = 3000.0
 # Buildings only (venues/layers carry no fame signal in this schema).
 FAME_BOOST_INTENTS = frozenset({"style", "prose", "name", "architect"})
 W_FAME_BOOST = 0.12  # × fame (0–1): Chrysler ≈ +0.095, median row ≈ +0.01
+# Leg-level fame ordering weight (raw fused-score scale, ~0.5–0.9) — keeps
+# high-fame rows from being cut at the leg LIMIT before the post-RRF boost
+# can act. Applied by routers/search.py::_leg_buildings for FAME_BOOST_INTENTS.
+W_LEG_FAME = 0.15
 
 
 def proximity_decay_bonus(dist_m: Optional[float]) -> float:

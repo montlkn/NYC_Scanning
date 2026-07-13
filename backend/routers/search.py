@@ -36,6 +36,7 @@ from services.unified_search import (
     dedupe_near_identical,
     exact_name_bonus,
     fame_boost,
+    FAME_BOOST_INTENTS,
     infer_matched_field,
     poi_category_adjustment,
     query_style_tokens,
@@ -44,6 +45,7 @@ from services.unified_search import (
     profile_similarity,
     proximity_decay_bonus,
     reciprocal_rank_fusion,
+    W_LEG_FAME,
 )
 
 router = APIRouter(prefix="/search", tags=["search"])
@@ -482,6 +484,7 @@ async def _leg_buildings(
     style_family: Optional[str] = None,
     user_vec_lit: Optional[str] = None,
     soft_radius: bool = False,
+    fame_weight: float = 0.0,
 ) -> List[dict]:
     """Buildings leg for /unified — mirrors search_buildings()'s hybrid CTE but
     also returns name/style/year/landmark fields needed for `why`/header/facets.
@@ -550,6 +553,10 @@ async def _leg_buildings(
     # admit the best 40. Both are pool-size tuning knobs, not relevance rules.
     params["fame_candidates"] = 1000
     params["fame_pool"] = 40
+    # Leg-level fame ordering weight. The leg score is on the raw fused scale
+    # (~0.5–0.9 with small gaps between deco-tagged rows), so 0.15 × fame
+    # (Chrysler ≈ +0.12) reorders within the pool without drowning relevance.
+    params["fame_w"] = fame_weight
     params["lex_floor"] = LEX_FLOOR
     params["fuzzy_floor"] = 0.2
     fused = "(0.7 * (1 - (b.embedding <=> CAST(:qvec AS vector))) + 0.3 * wl.lex)"
@@ -629,7 +636,11 @@ async def _leg_buildings(
             ) AS lex
         ) wl
         {('WHERE ' + ' AND '.join(enriched_filters)) if (enriched and enriched_filters) else ''}
-        ORDER BY score DESC
+        -- fame participates in the LEG's ordering (not just the post-RRF
+        -- boost): the leg's LIMIT would otherwise cut a high-fame row (the
+        -- Chrysler Building for "art deco") on raw fused score before the
+        -- boost ever sees it. :fame_w is 0 for non-fame intents.
+        ORDER BY ({fused} + :fame_w * coalesce(b.fame, 0)) DESC
         LIMIT :limit
     """
 
@@ -1290,6 +1301,7 @@ async def search_unified(
         qvec_lit, q_lex, leg_limit, lat, lng, radius_m, year_from, year_to,
         borough=borough, material=material, style_family=style_family,
         user_vec_lit=user_vec_lit, soft_radius=soft_radius,
+        fame_weight=W_LEG_FAME if intent in FAME_BOOST_INTENTS else 0.0,
     )
     venues_task = _leg_venues(qvec_lit, q_lex, leg_limit, lat, lng, radius_m, year_from, year_to, soft_radius=soft_radius)
     layers_task = _leg_layers(qvec_lit, q_lex, leg_limit, lat, lng, radius_m, layer_filter, soft_radius=soft_radius)
