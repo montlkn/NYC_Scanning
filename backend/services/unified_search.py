@@ -468,7 +468,10 @@ def coverage_adjustment(intent: str, q_lex: str, name: Optional[str], snippet: O
     cov = token_coverage(q_lex, name, snippet)
     if cov >= 1.0:
         return W_FULL_COVERAGE
-    if cov < 0.5:
+    # <= 0.5, not < 0.5: for the canonical 2-token query ("demolished
+    # theaters") a single-concept match is exactly 0.5 and MUST demote —
+    # that's the whole defect this function exists for.
+    if cov <= 0.5:
         return -W_LOW_COVERAGE
     return 0.0
 

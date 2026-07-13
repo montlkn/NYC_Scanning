@@ -1331,6 +1331,13 @@ async def search_unified(
             # are a lexical decoy, not noun relevance — penalized unless the
             # category really is in the noun's family.
             adj += style_name_decoy_penalty(q_lex, h.get("name"), h.get("category"), poi_noun)
+            # Applied twice, on two different scales: here on the raw leg
+            # score (reorders the leg, which RRF reads as rank) AND stashed
+            # for the post-RRF nudge pass (raw leg scores sit at ~0.6–0.9
+            # where ±0.15 often can't flip a rank — on the RRF scale ~0.016
+            # the same weights are decisive, which is the intent: a category
+            # mismatch must actually bury the antique store).
+            h["poi_adj"] = adj
             h["score"] = (h.get("score") or 0.0) + adj
         venues_hits.sort(key=lambda h: h.get("score") or 0.0, reverse=True)
 
@@ -1381,6 +1388,9 @@ async def search_unified(
         # is deliberately dominant over every other nudge (see W_EXACT_NAME).
         if intent == "name":
             nudged += exact_name_bonus(q_lex, h.get("name"))
+        # POI adjustments re-applied on the RRF scale (see the venues
+        # re-score block above for why twice).
+        nudged += h.get("poi_adj") or 0.0
         # Lore/event multi-token queries: reward full concept coverage
         # ("demolished" AND "theaters"), demote single-concept matches.
         nudged += coverage_adjustment(intent, q_lex, h.get("name"), h.get("snippet"))

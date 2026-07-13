@@ -635,7 +635,9 @@ def test_token_coverage_no_content_tokens_is_neutral_one():
 
 def test_coverage_adjustment_rewards_full_and_demotes_low():
     assert coverage_adjustment("lore", "demolished theaters", "Center Theatre", "demolished in 1954") == W_FULL_COVERAGE
-    assert coverage_adjustment("lore", "demolished theaters", "Gimbels Skybridge (demolished)", None) == 0.0
+    # Single-concept match on a 2-token query = 0.5 coverage — the canonical
+    # defect case (skybridge matching only "demolished") MUST demote.
+    assert coverage_adjustment("lore", "demolished theaters", "Gimbels Skybridge (demolished)", None) == -W_LOW_COVERAGE
     assert coverage_adjustment("lore", "demolished theaters unbuilt", "Gimbels Skybridge (demolished)", None) == -W_LOW_COVERAGE
 
 
