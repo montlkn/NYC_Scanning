@@ -13,6 +13,7 @@ retrieval (Phase 2b).
 import asyncio
 import logging
 import time
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Query
@@ -1141,6 +1142,45 @@ async def _log_query(q: str, intent: str, latency_ms: float, result_ids: List[st
         logger.info(f"[unified] query log skipped: {e}")
 
 
+# ---------------------------------------------------------------------------
+# Unified result cache — in-process TTL cache so a repeat search in the same
+# area (the common "search, pan a little, search again" flow) skips retrieval
+# entirely. Location is quantized to ~500m cells so tiny GPS drift still hits.
+# TTL is short (5 min): the index only changes at re-ingest, but scanned_bins /
+# user_vector personalization can change mid-session.
+# ---------------------------------------------------------------------------
+
+_RESULT_CACHE_TTL_S = 300.0
+_RESULT_CACHE_MAX = 256
+_result_cache: "OrderedDict[tuple, tuple]" = OrderedDict()  # key -> (ts, response)
+
+
+def _result_cache_key(q: str, lat, lng, radius_m, limit, filters: tuple) -> tuple:
+    # ~0.005° ≈ 550m N-S; coarse enough that walking a block still hits.
+    qlat = round(lat / 0.005) if lat is not None else None
+    qlng = round(lng / 0.005) if lng is not None else None
+    return (q.strip().lower(), qlat, qlng, radius_m, limit) + filters
+
+
+def _result_cache_get(key: tuple):
+    entry = _result_cache.get(key)
+    if entry is None:
+        return None
+    ts, resp = entry
+    if (time.monotonic() - ts) > _RESULT_CACHE_TTL_S:
+        _result_cache.pop(key, None)
+        return None
+    _result_cache.move_to_end(key)
+    return resp
+
+
+def _result_cache_put(key: tuple, resp: Dict[str, Any]) -> None:
+    _result_cache[key] = (time.monotonic(), resp)
+    _result_cache.move_to_end(key)
+    while len(_result_cache) > _RESULT_CACHE_MAX:
+        _result_cache.popitem(last=False)
+
+
 @router.get("/unified")
 async def search_unified(
     q: str = Query(..., description="Natural-language search query"),
@@ -1173,6 +1213,15 @@ async def search_unified(
     normalized taxonomy exists), never exact-match.
     """
     start = time.monotonic()
+    cache_key = _result_cache_key(
+        q, lat, lng, radius_m, limit,
+        (year_from, year_to, borough, style_family, material, lore_status,
+         landmark, user_vector, scanned_bins),
+    )
+    cached_resp = _result_cache_get(cache_key)
+    if cached_resp is not None:
+        return cached_resp
+
     intent, poi_noun = classify_intent_detailed(q)
     weights = corpus_weights(intent)
     # HARD_RADIUS_INTENTS (poi/name/address/event): radius_m stays a hard
@@ -1182,7 +1231,10 @@ async def search_unified(
     soft_radius = intent not in HARD_RADIUS_INTENTS
 
     try:
-        qvec = embed_query(q)
+        # to_thread: the ONNX forward pass is sync CPU work — off the event
+        # loop so concurrent searches don't serialize behind it. Cached per
+        # query string inside embed_query, so repeats return instantly.
+        qvec = await asyncio.to_thread(embed_query, q)
     except Exception as e:
         logger.error(f"[unified] query embedding failed: {e}", exc_info=True)
         return {"intent": intent, "header": "No results", "facets": [], "hits": []}
@@ -1355,12 +1407,14 @@ async def search_unified(
     latency_ms = (time.monotonic() - start) * 1000
     asyncio.create_task(_log_query(q, intent, latency_ms, [h["id"] for h in hits if h.get("id")]))
 
-    return {
+    resp = {
         "intent": intent,
         "header": header,
         "facets": facets,
         "hits": hits,
     }
+    _result_cache_put(cache_key, resp)
+    return resp
 
 
 # ---------------------------------------------------------------------------

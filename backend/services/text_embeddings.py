@@ -45,10 +45,20 @@ def embed_texts(texts: List[str]) -> List[List[float]]:
     return [vec.tolist() for vec in model.embed(texts)]
 
 
+@lru_cache(maxsize=1024)
+def _embed_query_cached(text: str) -> tuple:
+    model = _get_model()
+    prefixed = _QUERY_INSTRUCTION + text
+    return tuple(next(iter(model.embed([prefixed]))).tolist())
+
+
 def embed_query(text: str) -> List[float]:
-    """Embed a single search query → 384-dim vector (with bge query instruction)."""
+    """Embed a single search query → 384-dim vector (with bge query instruction).
+
+    Cached per normalized query string — repeated queries ("art deco") skip the
+    ONNX forward pass entirely. Cached as a tuple so no caller can mutate the
+    shared entry.
+    """
     if not text or not text.strip():
         return [0.0] * EMBED_DIM
-    model = _get_model()
-    prefixed = _QUERY_INSTRUCTION + text.strip()
-    return next(iter(model.embed([prefixed]))).tolist()
+    return list(_embed_query_cached(text.strip().lower()))
