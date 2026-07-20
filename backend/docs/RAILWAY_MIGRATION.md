@@ -1,9 +1,18 @@
 # Railway Migration — nyc-scan backend
 
-Prep notes for moving the FastAPI backend off Render (`nyc-scanning.onrender.com`)
-onto Railway, alongside the existing Railway search-DB (pgvector) service. This
-is PREP ONLY — keep Render running until the Railway deploy is verified
-end-to-end (search, scan, health) with production traffic.
+**STATUS: DONE (2026-07-19).** Cut over to `nycscanning-production.up.railway.app`
+as primary — verified `/health`, `/api/warm`, and `/api/search/unified` return
+identical data to Render, with cold start dropping from ~32s (Render free-tier
+idle spin-down) to <1s (Railway hobby, doesn't sleep). Both the iOS app
+(`SCAN_API_URL` in Secrets.xcconfig, `feat/kit-discovery-route` +
+`reframe/ui-coherence` branches) and this backend's own prod-mode detection
+(`main.py` — reload guard + Sentry env tag now key off `RENDER` OR
+`RAILWAY_ENVIRONMENT`) point at Railway. Render (`nyc-scanning.onrender.com`)
+is intentionally left deployed and untouched as a manual rollback fallback —
+give it a day of real device traffic on Railway before decommissioning it from
+the Render dashboard.
+
+Original prep notes below, kept for reference.
 
 ## 1. Create the service
 
