@@ -38,7 +38,7 @@ if sentry_dsn:
         dsn=sentry_dsn,
         integrations=[FastApiIntegration()],
         traces_sample_rate=0.1,  # 10% of transactions for performance monitoring
-        environment="production" if os.getenv("RENDER") else "development",
+        environment="production" if os.getenv("RENDER") or os.getenv("RAILWAY_ENVIRONMENT") else "development",
         release="nyc-scan@1.0.0",
         send_default_pii=True,  # Include request headers and user data
     )
@@ -225,13 +225,17 @@ app.include_router(search.router, prefix="/api", tags=["search"])
 if __name__ == "__main__":
     import uvicorn
 
-    # Never use reload in production - it doubles memory usage
-    use_reload = settings.debug and not os.getenv("RENDER")
+    # Never use reload in production - it doubles memory usage. Render and
+    # Railway both set a platform-identifying env var; treat either as prod
+    # regardless of what DEBUG happens to be set to in that environment.
+    is_paas = bool(os.getenv("RENDER") or os.getenv("RAILWAY_ENVIRONMENT"))
+    use_reload = settings.debug and not is_paas
 
-    # Render (and most PaaS) assigns a dynamic port via $PORT. Honor it
-    # when present so the container actually binds where Render expects;
-    # without this, the process binds to settings.api_port (8000), the
-    # health-check fails, and Render keeps the previous revision serving.
+    # Render (and most PaaS, including Railway) assigns a dynamic port via
+    # $PORT. Honor it when present so the container actually binds where
+    # the platform expects; without this, the process binds to
+    # settings.api_port (8000), the health-check fails, and the platform
+    # keeps the previous revision serving.
     uvicorn.run(
         "main:app",
         host=settings.api_host,
