@@ -336,6 +336,57 @@ def exact_name_bonus(q_lex: str, name: Optional[str]) -> float:
 
 
 # ---------------------------------------------------------------------------
+# House-number dominance (name/address intent). A query like "469 broome" has
+# no street suffix, so _ADDRESS_RE misses it and it classifies as `name` — where
+# fame_boost is live and lets 570 Broome (a famous tower) outrank the exact
+# 469-475 Broome. The fuzzy name/vector score never weighs the house NUMBER, so
+# the one signal that actually pins an address is ignored. This bonus restores
+# it: when the query LEADS with a house number and a building's address range
+# contains it, add a dominant bonus (same tier as exact-name) so the correct
+# address wins over any fame/vector nudge. Buildings whose display string is the
+# address ("469-475 Broome Street") — i.e. the ~all-of-NYC row-house case — are
+# matched here; a genuinely named building without the number simply gets 0.
+# ---------------------------------------------------------------------------
+
+W_HOUSE_NUMBER = 0.30   # == W_EXACT_NAME: dominant, beats fame (Chrysler ≈ +0.095)
+
+
+def query_house_number(q: str) -> Optional[int]:
+    """Leading house number of an address-shaped query. "469 broome" -> 469;
+    "broome street" -> None. Leading-only so style/year queries ("1920s deco")
+    that merely contain digits don't trigger address scoring."""
+    m = re.match(r"\s*(\d+)", q or "")
+    return int(m.group(1)) if m else None
+
+
+def _address_number_range(s: Optional[str]) -> Optional[tuple]:
+    """Leading house-number range of a display string. "469-475 Broome St" ->
+    (469, 475); "570 Broome Street" -> (570, 570); "Gunther Building" -> None."""
+    if not s:
+        return None
+    m = re.match(r"\s*(\d+)(?:\s*-\s*(\d+))?", s)
+    if not m:
+        return None
+    lo = int(m.group(1))
+    hi = int(m.group(2)) if m.group(2) else lo
+    return (min(lo, hi), max(lo, hi))
+
+
+def house_number_bonus(q_lex: str, name: Optional[str], snippet: Optional[str]) -> float:
+    """Dominant bonus when an address-shaped query's house number falls inside a
+    building's leading address range. 0.0 when the query has no leading number
+    or no candidate string carries the matching number."""
+    qn = query_house_number(q_lex)
+    if qn is None:
+        return 0.0
+    for s in (name, snippet):
+        rng = _address_number_range(s)
+        if rng and rng[0] <= qn <= rng[1]:
+            return W_HOUSE_NUMBER
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
 # Venue style/era affinity (poi intent). The moat query "art deco bar" wants
 # bars whose HOST BUILDING is deco — venues carry building_style and
 # building_year, but until now neither was scored. Era windows exist only for

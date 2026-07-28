@@ -37,6 +37,7 @@ from services.unified_search import (
     exact_name_bonus,
     fame_boost,
     FAME_BOOST_INTENTS,
+    house_number_bonus,
     infer_matched_field,
     poi_category_adjustment,
     query_style_tokens,
@@ -1408,6 +1409,12 @@ async def search_unified(
         # is deliberately dominant over every other nudge (see W_EXACT_NAME).
         if intent == "name":
             nudged += exact_name_bonus(q_lex, h.get("name"))
+        # House-number address queries ("469 broome") classify as name/address
+        # but their number is the whole signal — a dominant bonus when a
+        # building's address range contains it, so the exact address beats fame
+        # (570 Broome was outranking 469-475). Buildings only.
+        if intent in ("name", "address") and h.get("type") == "building":
+            nudged += house_number_bonus(q_lex, h.get("name"), h.get("snippet"))
         # POI adjustments re-applied on the RRF scale (see the venues
         # re-score block above for why twice).
         nudged += h.get("poi_adj") or 0.0
