@@ -15,6 +15,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from services.unified_search import (  # noqa: E402
     RankedHit,
     apply_nudges,
+    apply_relevance_floor,
+    fold_ordinals,
+    hedged_style_penalty,
+    house_number_bonus,
+    split_style_alternatives,
+    RRF_SCALE,
+    RRF_K,
+    W_HOUSE_NUMBER,
+    W_NUMBER_ONLY,
+    W_PROXIMITY,
+    PROXIMITY_DECAY_M,
     build_facets,
     build_header,
     build_why,
@@ -649,9 +660,44 @@ def test_coverage_adjustment_rewards_full_and_demotes_low():
     assert coverage_adjustment("lore", "demolished theaters unbuilt", "Gimbels Skybridge (demolished)", None) == -W_LOW_COVERAGE
 
 
-def test_coverage_adjustment_only_lore_and_event_intents():
-    assert coverage_adjustment("style", "demolished theaters", "Skybridge", None) == 0.0
+def test_coverage_adjustment_applies_to_conjunctive_intents():
+    # Extended beyond lore/event: "art deco bars near me" classifies as `poi`
+    # (the cascade returns on the first vocab hit, dropping the "art deco"
+    # half), so poi/style/prose need coverage too or a 1-of-2 match scores as
+    # a full match. `name` stays exempt — a name query is one concept.
+    assert coverage_adjustment("style", "demolished theaters", "Skybridge", None) < 0.0
+    assert coverage_adjustment("poi", "demolished theaters", "Skybridge", None) < 0.0
     assert coverage_adjustment("name", "demolished theaters", "Skybridge", None) == 0.0
+    assert coverage_adjustment("architect", "demolished theaters", "Skybridge", None) == 0.0
+
+
+def test_coverage_adjustment_is_graded_not_a_cliff():
+    """A 3-token query covering 2 concepts must still be penalised.
+
+    The old step function only fired at cov <= 0.5, so "art deco bars" matching
+    an art gallery mislabelled `Bar` ('art' + 'bars', no 'deco') sat at 0.667
+    and took zero penalty — it ranked as a clean match. That was the top
+    result for the query in production.
+    """
+    two_of_three = coverage_adjustment("poi", "art deco bars", "Patricia Shea Fine Art", None, "Bar", None)
+    assert two_of_three < 0.0
+    # Still strictly less severe than a one-of-three match.
+    one_of_three = coverage_adjustment("poi", "art deco bars", "Random Deli", None, "Deli", None)
+    assert one_of_three < two_of_three
+    # A genuine deco bar covers all three and is rewarded.
+    assert coverage_adjustment("poi", "art deco bars", "Some Deco Bar", None, "Bar", "art deco") == W_FULL_COVERAGE
+
+
+def test_coverage_adjustment_credits_structured_fields():
+    """Category/style columns count toward coverage.
+
+    A real bar rarely has "bar" in its NAME — it has category="Bar". Without
+    crediting the structured fields, correct hits would be penalised exactly
+    as hard as wrong ones.
+    """
+    name_only = coverage_adjustment("poi", "art deco bars", "Some Deco Place", None)
+    with_fields = coverage_adjustment("poi", "art deco bars", "Some Deco Place", None, "Bar", "art deco")
+    assert with_fields > name_only
 
 
 def test_coverage_adjustment_single_token_query_is_neutral():
@@ -674,3 +720,133 @@ def test_build_header_lore_pluralizes_as_entries():
     h = build_header(hits, "lore")
     assert "lore entries" in h
     assert "lores" not in h
+
+
+# ---------------------------------------------------------------------------
+# Round 4 — the four production ranking failures.
+#
+# The suite had 100 tests and not one asserted a final ORDERING, which is why
+# every failure below shipped. These assert on the ranking outcome, not on the
+# individual weights, so they stay meaningful if the weights are retuned.
+# ---------------------------------------------------------------------------
+
+def _final_score(rrf_score, **nudges):
+    """Mirror routers/search.py's scoring: RRF fused score scaled onto the
+    nudge scale, then nudged."""
+    return apply_nudges(rrf_score * RRF_SCALE, **nudges)
+
+
+def test_proximity_cannot_overturn_a_real_relevance_gap():
+    """THE core defect: RRF spans 0.0164 while proximity was worth 0.05, so
+    distance was ~3x the entire relevance signal and silently became the
+    primary sort key. A rank-1 hit 4km away must beat a rank-10 hit at 0m."""
+    relevant_far = _final_score(1.0 / (RRF_K + 1), dist_m=4000)
+    irrelevant_near = _final_score(1.0 / (RRF_K + 10), dist_m=0)
+    assert relevant_far > irrelevant_near
+
+
+def test_proximity_still_breaks_a_genuine_tie():
+    """Relevance-first must not mean distance-blind: at equal rank, closer wins."""
+    same_rank = 1.0 / (RRF_K + 5)
+    assert _final_score(same_rank, dist_m=50) > _final_score(same_rank, dist_m=3000)
+
+
+def test_proximity_swing_is_under_one_rank_step():
+    """Quantified guard on the regression: the full 0m..infinity proximity
+    swing must stay below the gap between two adjacent RRF ranks."""
+    rank_step = (1.0 / (RRF_K + 1) - 1.0 / (RRF_K + 2)) * RRF_SCALE
+    assert W_PROXIMITY < rank_step
+
+
+def test_art_deco_bars_a_gallery_mislabelled_bar_loses_to_a_real_deco_bar():
+    """Production result #1 for "art deco bars near me" was an art gallery
+    typed BAR that is not deco. It satisfied one half of the query and was
+    scored as a complete match."""
+    q = "art deco bars"
+    real = _final_score(1.0 / (RRF_K + 8), dist_m=3000) + coverage_adjustment(
+        "poi", q, "Some Deco Bar", None, "Bar", "art deco")
+    decoy = _final_score(1.0 / (RRF_K + 1), dist_m=0) + coverage_adjustment(
+        "poi", q, "Patricia Shea Fine Art", None, "Bar", None)
+    assert real > decoy
+
+
+def test_art_deco_query_demotes_hedged_style_attribution():
+    """Production results #2-4 were Sunnyside colonial-revival houses whose
+    style string reads "simplified colonial revival or art deco" — trigram
+    similarity matched the tail and ranked them as prime Art Deco."""
+    style_toks = query_style_tokens("art deco bars", "bar")
+    hedged = hedged_style_penalty(style_toks, "simplified colonial revival or art deco")
+    confident = hedged_style_penalty(style_toks, "art deco")
+    assert hedged < 0.0
+    assert confident == 0.0
+    assert _final_score(1.0 / (RRF_K + 3)) + confident > _final_score(1.0 / (RRF_K + 1)) + hedged
+
+
+def test_split_style_alternatives():
+    assert split_style_alternatives("simplified colonial revival or art deco") == (
+        "simplified colonial revival", ["art deco"])
+    assert split_style_alternatives("art deco") == ("art deco", [])
+    assert split_style_alternatives("gothic/romanesque") == ("gothic", ["romanesque"])
+    assert split_style_alternatives(None) == ("", [])
+    assert split_style_alternatives("") == ("", [])
+
+
+def test_suffixless_address_classifies_as_address():
+    """"1 south first" has no street suffix, so the strict regex missed it and
+    it fell through to `name` intent — which weights the lore corpus higher and
+    skips address handling, hence unrelated history articles in the results."""
+    assert classify_intent("1 south first") == "address"
+    assert classify_intent("469 broome") == "address"
+    assert classify_intent("1 broadway") == "address"
+
+
+def test_address_regex_needs_a_left_word_boundary():
+    """"5 best gothic churches" parsed as an address off the "st" inside
+    "be|st", stealing it from the style branch."""
+    assert classify_intent("5 best gothic churches") == "style"
+
+
+def test_ordinal_folding_lets_a_word_query_reach_a_numeral_corpus():
+    """Without the fold "first" can never match the stored "1ST" — the row
+    never enters the candidate pool, so this is a RETRIEVAL miss that no
+    amount of reranking can repair."""
+    assert fold_ordinals("1 south first") == "1 south 1st"
+    assert fold_ordinals("1 south 1st") == "1 south 1st"  # idempotent
+    assert fold_ordinals("west twenty-third") == "west 23rd"
+
+
+def test_house_number_bonus_requires_the_street_to_match():
+    """All three of 1 South Elliott / Oxford / Portland took the full dominant
+    bonus for "1 south first" because only the leading NUMBER was checked —
+    a three-way tie that proximity then broke arbitrarily."""
+    q = fold_ordinals("1 south first")
+    assert house_number_bonus(q, "1 South 1st Street", None) == W_HOUSE_NUMBER
+    for wrong in ("1 South Oxford Street", "1 South Elliott Place", "1 South Portland Avenue"):
+        assert house_number_bonus(q, wrong, None) == W_NUMBER_ONLY
+    # Right number, right street, ranged address still qualifies.
+    assert house_number_bonus(q, "1-9 South 1st Street", None) == W_HOUSE_NUMBER
+
+
+def test_house_number_bonus_bare_number_query_keeps_full_bonus():
+    """A number-only query has nothing to disambiguate against — don't punish
+    it for a street name the user never typed."""
+    assert house_number_bonus("469", "469-475 Broome Street", None) == W_HOUSE_NUMBER
+
+
+def test_relevance_floor_drops_the_long_tail():
+    hits = [{"score": s} for s in (1.0, 0.9, 0.5, 0.35, 0.2, 0.05)]
+    kept = apply_relevance_floor(hits)
+    assert [h["score"] for h in kept] == [1.0, 0.9, 0.5]
+
+
+def test_relevance_floor_keeps_a_minimum_even_when_everything_is_weak():
+    """A thin query should still show its best guesses rather than an empty
+    state — and must still trip the client's thin-results path."""
+    kept = apply_relevance_floor([{"score": 1.0}, {"score": 0.1}])
+    assert len(kept) == 2
+
+
+def test_relevance_floor_handles_empty_and_negative_top_scores():
+    assert apply_relevance_floor([]) == []
+    negative = [{"score": -0.1}, {"score": -5.0}]
+    assert apply_relevance_floor(negative) == negative

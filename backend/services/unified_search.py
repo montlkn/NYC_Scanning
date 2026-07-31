@@ -26,9 +26,24 @@ INTENTS = ("name", "address", "poi", "architect", "style", "lore", "event", "pro
 # hyphen for Queens-style "35-01"), then a street-ish token.
 _ADDRESS_RE = re.compile(
     r"^\s*\d+[\-\d]*\s+[A-Za-z0-9][A-Za-z0-9.\s]*"
-    r"(street|st|avenue|ave|boulevard|blvd|road|rd|place|pl|drive|dr|lane|ln|way|court|ct|square|sq|broadway|parkway|pkwy)\b",
+    # (?<![A-Za-z]) is load-bearing: without a LEFT word boundary the short
+    # alternatives match mid-word, so "5 best gothic churches" parsed as an
+    # address off the "st" inside "be|st" and never reached the style branch.
+    r"(?<![A-Za-z])(street|st|avenue|ave|boulevard|blvd|road|rd|place|pl|drive|dr|lane|ln|way|court|ct|square|sq|broadway|parkway|pkwy)\b",
     re.IGNORECASE,
 )
+
+# People drop the street type constantly ("1 south first", "225 lafayette").
+# The strict regex above requires one, so those fell through the whole cascade
+# and landed on `name` intent — which weights the lore/layers corpus 0.6
+# instead of 0.4 and skips the address handling entirely. That is why an
+# address query returned unrelated history articles.
+#
+# Shape: leading house number + 1-3 following word tokens, no vocab hits. Kept
+# deliberately tight (a trailing token cap, and only when nothing else in the
+# cascade claimed the query) so prose like "5 best gothic churches" is not
+# swallowed as an address.
+_ADDRESS_LOOSE_RE = re.compile(r"^\s*\d+[\-\d]*\s+[A-Za-z][A-Za-z.'-]*(\s+[A-Za-z][A-Za-z.'-]*){0,2}\s*$")
 
 _POI_NOUNS = frozenset({
     "bar", "bars", "cafe", "cafes", "coffee", "restaurant", "restaurants",
@@ -104,6 +119,11 @@ def classify_intent_detailed(q: str) -> tuple:
         return "poi", _singularize_poi_noun(noun)
     if tokset & _STYLE_VOCAB:
         return "style", None
+
+    # Suffix-less address, checked AFTER the vocab cascade so a query that also
+    # carries style/lore/POI meaning keeps its richer intent.
+    if _ADDRESS_LOOSE_RE.match(q):
+        return "address", None
 
     # Short, capitalized, name-like query (e.g. "Chrysler Building", "The Dakota")
     # and NOT a full sentence: <= 5 words, no verb-ish trailing punctuation.
@@ -251,10 +271,24 @@ def corpus_weights(intent: str) -> Dict[str, float]:
 
 RRF_K = 60
 
-# Small, named personalization/proximity/novelty nudge constants. These only
-# break ties — never large enough to overturn a real relevance gap.
-W_PERSONALIZATION = 0.05
-W_PROXIMITY = 0.05
+# RRF produces scores in [0, 1/(k+1)] = [0, 0.0164], with adjacent ranks
+# differing by only ~0.00026. The nudge constants below live on a 0–1 scale.
+# Added together untreated, a 0.05 proximity nudge was 3x the ENTIRE relevance
+# range and a 0.15 category nudge was 9x it — so "tie-breakers" silently became
+# the primary sort key, and distance could move a result from last to first
+# regardless of relevance. (The old test asserted each nudge was small in
+# ABSOLUTE terms and never compared it to an RRF rank gap, so it passed.)
+#
+# Scaling the fused score onto the nudge scale restores the intended
+# relationship: one rank step is now ~0.016, so a 0.01 proximity nudge
+# separates near-ties without overturning real relevance gaps.
+RRF_SCALE = 60.0
+
+# Small, named personalization/proximity/novelty nudge constants. Sized in
+# RANK-STEPS post-RRF_SCALE: one rank step ~= 0.016. Keep every value here
+# below ~0.05 (≈3 ranks) unless it is deliberately dominant and documented.
+W_PERSONALIZATION = 0.02
+W_PROXIMITY = 0.01  # max ~0.6 of a rank step — a true tiebreak
 W_NOVELTY = 0.02
 PROXIMITY_DECAY_M = 1500.0  # nudge decays to ~0 by this distance
 
@@ -270,7 +304,10 @@ HARD_RADIUS_INTENTS = frozenset({"poi", "name", "address", "event"})
 # Soft-radius proximity bonus (separate from apply_nudges' W_PROXIMITY, which
 # is a tiny universal tie-break) — exponential decay so nearby results get a
 # real lift without a hard cutoff. Small relative to a real relevance gap.
-PROXIMITY_DECAY_WEIGHT = 0.06
+# Sized post-RRF_SCALE: max ~1.2 rank steps, so a much closer result wins a
+# near-tie but a genuinely better match 4km away still outranks a weak one
+# next door. This is the "relevance first, distance as tiebreak" policy.
+PROXIMITY_DECAY_WEIGHT = 0.02
 PROXIMITY_DECAY_SCALE_M = 3000.0
 
 # Fame boost (building_search_index.fame — final_score from the curated
@@ -349,6 +386,10 @@ def exact_name_bonus(q_lex: str, name: Optional[str]) -> float:
 # ---------------------------------------------------------------------------
 
 W_HOUSE_NUMBER = 0.30   # == W_EXACT_NAME: dominant, beats fame (Chrysler ≈ +0.095)
+# Number matches but the STREET does not — "1 south first" vs "1 South Oxford
+# Street". Deliberately near-zero: these are the wrong building on the right
+# house number, which is exactly the noise the old single-tier bonus promoted.
+W_NUMBER_ONLY = 0.02
 
 
 def query_house_number(q: str) -> Optional[int]:
@@ -372,17 +413,113 @@ def _address_number_range(s: Optional[str]) -> Optional[tuple]:
     return (min(lo, hi), max(lo, hi))
 
 
+# Ordinal <-> numeral folding. NYC addresses are full of ordinal streets, and
+# the corpus stores the NUMERAL form ("SOUTH 1ST STREET") while people type the
+# WORD form ("1 south first"). With no fold, "first" could never match "1st" —
+# so the literal target never entered the candidate pool at all and no amount
+# of reranking could recover it. Covers 1st-31st, which spans every numbered
+# street and avenue in the five boroughs.
+_ORDINAL_WORDS = [
+    "zeroth", "first", "second", "third", "fourth", "fifth", "sixth",
+    "seventh", "eighth", "ninth", "tenth", "eleventh", "twelfth",
+    "thirteenth", "fourteenth", "fifteenth", "sixteenth", "seventeenth",
+    "eighteenth", "nineteenth", "twentieth", "twenty-first", "twenty-second",
+    "twenty-third", "twenty-fourth", "twenty-fifth", "twenty-sixth",
+    "twenty-seventh", "twenty-eighth", "twenty-ninth", "thirtieth",
+    "thirty-first",
+]
+
+
+def _ordinal_numeral(n: int) -> str:
+    """1 -> '1st', 2 -> '2nd', 11 -> '11th'."""
+    if 10 <= (n % 100) <= 20:
+        return f"{n}th"
+    return f"{n}" + {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+
+
+_ORDINAL_WORD_TO_NUMERAL: Dict[str, str] = {
+    w: _ordinal_numeral(i)
+    for i, w in enumerate(_ORDINAL_WORDS)
+    if i > 0
+}
+# Both directions, plus the bare-cardinal spelling ("1 street" -> "1st street").
+_ORDINAL_NUMERAL_TO_WORD: Dict[str, str] = {
+    v: k for k, v in _ORDINAL_WORD_TO_NUMERAL.items()
+}
+
+
+def fold_ordinals(text: Optional[str]) -> str:
+    """Rewrite ordinal words to their numeral form ('first' -> '1st') so query
+    and corpus meet in one spelling. Idempotent on already-numeral text."""
+    if not text:
+        return ""
+    out = []
+    for t in _tokens(text):
+        out.append(_ORDINAL_WORD_TO_NUMERAL.get(t, t))
+    return " ".join(out)
+
+
+def ordinal_variants(token: str) -> set:
+    """Every spelling of one token: {'first', '1st'} or {'1st', 'first'}."""
+    v = {token}
+    if token in _ORDINAL_WORD_TO_NUMERAL:
+        v.add(_ORDINAL_WORD_TO_NUMERAL[token])
+    if token in _ORDINAL_NUMERAL_TO_WORD:
+        v.add(_ORDINAL_NUMERAL_TO_WORD[token])
+    return v
+
+
+# Street-type words carry no discriminating power — every address has one, so
+# matching on "street" must not count as matching the street NAME.
+_STREET_TYPE_WORDS = frozenset({
+    "street", "st", "avenue", "ave", "av", "boulevard", "blvd", "road", "rd",
+    "drive", "dr", "lane", "ln", "place", "pl", "court", "ct", "square", "sq",
+    "parkway", "pkwy", "terrace", "ter", "way", "walk", "plaza", "circle",
+})
+
+
+def _street_name_tokens(s: Optional[str]) -> set:
+    """Discriminating (non-numeric, non-street-type) tokens of an address,
+    ordinal-folded. '1 South Oxford Street' -> {'south', 'oxford'}."""
+    if not s:
+        return set()
+    toks = set()
+    for t in _tokens(fold_ordinals(s)):
+        if t.isdigit() or t in _STREET_TYPE_WORDS:
+            continue
+        toks.add(t)
+    return toks
+
+
 def house_number_bonus(q_lex: str, name: Optional[str], snippet: Optional[str]) -> float:
-    """Dominant bonus when an address-shaped query's house number falls inside a
-    building's leading address range. 0.0 when the query has no leading number
-    or no candidate string carries the matching number."""
+    """Bonus when an address query's house number falls inside a building's
+    leading address range.
+
+    Split by whether the STREET also matches. Previously this checked only the
+    leading number, so "1 south first" handed the full dominant bonus to
+    1 South Elliott Place, 1 South Oxford Street AND 1 South Portland Avenue
+    alike — a three-way tie that proximity then broke arbitrarily. The street
+    name is the entire discriminator in that query and it was unused.
+    """
     qn = query_house_number(q_lex)
     if qn is None:
         return 0.0
+    q_street = _street_name_tokens(q_lex)
     for s in (name, snippet):
         rng = _address_number_range(s)
         if rng and rng[0] <= qn <= rng[1]:
-            return W_HOUSE_NUMBER
+            if not q_street:
+                # Bare number query ("469") — nothing to disambiguate against.
+                return W_HOUSE_NUMBER
+            cand_street = _street_name_tokens(s)
+            # SUBSET, not intersection. "1 south first" -> {south, 1st}; all of
+            # 1 South Oxford / Elliott / Portland share "south", so any-overlap
+            # handed every one of them the full bonus — the exact three-way tie
+            # that made this query useless. Requiring every query token to be
+            # present means only 1 South 1st Street qualifies.
+            if q_street <= cand_street:
+                return W_HOUSE_NUMBER
+            return W_NUMBER_ONLY
     return 0.0
 
 
@@ -425,6 +562,65 @@ def query_style_tokens(q: str, poi_noun: Optional[str] = None) -> frozenset:
     toks = set(_tokens(q))
     toks.discard(poi_noun or "")
     return frozenset(toks & _STYLE_VOCAB)
+
+
+# ---------------------------------------------------------------------------
+# Hedged style values. The corpus stores uncertain attributions verbatim, e.g.
+# "simplified colonial revival or art deco". Trigram `word_similarity` scores
+# the query against the BEST-MATCHING SUBSTRING of the indexed text, so a query
+# for "art deco" scored ~0.66 against that string — well over the 0.45 floor —
+# and a block of Sunnyside colonial-revival houses ranked as prime Art Deco.
+#
+# Splitting on the hedge separators lets a match against the PRIMARY (first)
+# attribution count fully while a match that only lands on an alternative is
+# discounted. This is a ranking-time repair; materializing the split at ingest
+# would be cheaper per query (see embed_buildings.py) but this needs no
+# re-index and no migration.
+# ---------------------------------------------------------------------------
+
+_STYLE_ALT_SPLIT_RE = re.compile(r"\s+or\s+|\s*/\s*|\s*;\s*|\s*,\s*", re.IGNORECASE)
+
+# Sized post-RRF_SCALE: ~6 rank steps. Enough to sink a hedged secondary match
+# beneath any confident primary match without erasing it entirely — the
+# building might genuinely be deco, we just have far weaker evidence.
+W_HEDGED_STYLE = 0.10
+
+
+def split_style_alternatives(style: Optional[str]) -> tuple:
+    """('simplified colonial revival or art deco') ->
+    ('simplified colonial revival', ['art deco']).
+
+    Returns ("", []) for empty input. A style with no separator is all primary.
+    """
+    if not style:
+        return "", []
+    parts = [p.strip() for p in _STYLE_ALT_SPLIT_RE.split(style) if p and p.strip()]
+    if not parts:
+        return "", []
+    return parts[0], parts[1:]
+
+
+def hedged_style_penalty(style_toks: frozenset, style: Optional[str]) -> float:
+    """Demote a hit whose only style evidence sits in a hedged ALTERNATIVE.
+
+    Returns 0.0 when the query has no style tokens, when the style value is not
+    hedged, or when the primary attribution satisfies the query — i.e. it only
+    fires for the specific "matched the 'or ...' tail" case.
+    """
+    if not style_toks or not style:
+        return 0.0
+    primary, alts = split_style_alternatives(style)
+    if not alts:
+        return 0.0
+    primary_toks = set(_tokens(primary))
+    if style_toks & primary_toks:
+        return 0.0  # the confident attribution already answers the query
+    alt_toks: set = set()
+    for a in alts:
+        alt_toks.update(_tokens(a))
+    if style_toks & alt_toks:
+        return -W_HEDGED_STYLE
+    return 0.0
 
 
 def venue_style_affinity(
@@ -480,8 +676,11 @@ def style_name_decoy_penalty(
 # (a demolished skybridge, an extant theater).
 # ---------------------------------------------------------------------------
 
+# Sized post-RRF_SCALE (one rank step ~= 0.016). Coverage is the closest thing
+# the ranker has to conjunctive AND semantics, so it is deliberately strong:
+# a 1-of-2 match drops ~15 ranks relative to a 2-of-2 match.
 W_FULL_COVERAGE = 0.10
-W_LOW_COVERAGE = 0.08  # subtracted when coverage < 0.5
+W_LOW_COVERAGE = 0.25  # subtracted when coverage <= 0.5
 
 
 def token_coverage(q_lex: str, *texts: Optional[str]) -> float:
@@ -514,22 +713,44 @@ def token_coverage(q_lex: str, *texts: Optional[str]) -> float:
     return covered / len(q_toks)
 
 
-def coverage_adjustment(intent: str, q_lex: str, name: Optional[str], snippet: Optional[str]) -> float:
-    """Coverage nudge for lore/event intents with multi-token queries."""
-    if intent not in {"lore", "event"}:
+def coverage_adjustment(
+    intent: str,
+    q_lex: str,
+    name: Optional[str],
+    snippet: Optional[str],
+    *extra: Optional[str],
+) -> float:
+    """Coverage nudge for multi-token queries.
+
+    Extended beyond lore/event to poi/style/prose. "art deco bars near me"
+    classifies as `poi` (the intent cascade returns on the first vocab hit, so
+    the "art deco" half is dropped at classification time) — which meant the
+    one function implementing conjunctive coverage explicitly excluded the
+    exact intent that needed it. Result: a deco building that is not a bar and
+    a bar that is not deco each scored as a full match. Coverage is what makes
+    the two halves of the query multiply instead of alternate.
+    """
+    if intent not in {"lore", "event", "poi", "style", "prose"}:
         return 0.0
     q_toks = {t for t in _tokens(q_lex) if len(t) >= 3}
     if len(q_toks) < 2:
         return 0.0
-    cov = token_coverage(q_lex, name, snippet)
+    # `extra` carries the STRUCTURED fields (category, style) so a genuine
+    # hit gets credit for a concept it satisfies by data rather than by
+    # prose: a real bar has category="Bar" but rarely "bar" in its name,
+    # and a deco building carries the style in a column. Without these a
+    # correct match would be penalised exactly as hard as a wrong one.
+    cov = token_coverage(q_lex, name, snippet, *extra)
     if cov >= 1.0:
         return W_FULL_COVERAGE
-    # <= 0.5, not < 0.5: for the canonical 2-token query ("demolished
-    # theaters") a single-concept match is exactly 0.5 and MUST demote —
-    # that's the whole defect this function exists for.
-    if cov <= 0.5:
-        return -W_LOW_COVERAGE
-    return 0.0
+    # Graded, not a cliff at 0.5. The old step function scored a 3-token query
+    # covering 2 concepts ("art deco bars" matching a gallery mislabelled Bar:
+    # 'art' + 'bars', no 'deco') at exactly 0.667 — above the cliff, so zero
+    # penalty, so it ranked as a clean match. Scaling by the MISSING fraction
+    # penalises every incomplete match in proportion to what it's missing,
+    # while still reaching the full -W_LOW_COVERAGE at the canonical
+    # half-covered case that this function was originally written for.
+    return -min(W_LOW_COVERAGE, W_LOW_COVERAGE * (1.0 - cov) * 2.0)
 
 
 # ---------------------------------------------------------------------------
@@ -558,6 +779,49 @@ def _haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     dlambda = math.radians(lng2 - lng1)
     a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlambda / 2) ** 2
     return 2 * r * math.asin(min(1.0, math.sqrt(a)))
+
+
+# ---------------------------------------------------------------------------
+# Relevance floor. Every leg returns its top `leg_limit` unconditionally, no
+# matter how bad the matches are, and there was no threshold anywhere in the
+# pipeline — so a query with three good answers still returned forty rows, the
+# other thirty-seven being whatever the corpus had. Capping the list lower
+# treats the symptom; the floor treats the cause.
+#
+# Relative, not absolute: post-nudge scores are not calibrated across intents,
+# so the only defensible reference point is the best hit for THIS query.
+# ---------------------------------------------------------------------------
+
+RELEVANCE_FLOOR_RATIO = 0.40
+RELEVANCE_FLOOR_MIN_KEEP = 3   # never return an empty list over a weak top hit
+
+
+def apply_relevance_floor(
+    hits: List[Dict[str, Any]],
+    *,
+    ratio: float = RELEVANCE_FLOOR_RATIO,
+    min_keep: int = RELEVANCE_FLOOR_MIN_KEEP,
+    score_key: str = "score",
+) -> List[Dict[str, Any]]:
+    """Drop hits scoring below `ratio` of the top hit's score.
+
+    Expects `hits` already sorted descending. Always keeps at least `min_keep`
+    so a genuinely thin query still shows its best guesses (and still trips the
+    client's thin-results path) rather than rendering a bare empty state.
+
+    Negative top scores mean everything got penalised — no meaningful ratio
+    exists there, so the floor is skipped rather than applied backwards.
+    """
+    if not hits:
+        return hits
+    top = hits[0].get(score_key) or 0.0
+    if top <= 0:
+        return hits
+    threshold = top * ratio
+    kept = [h for h in hits if (h.get(score_key) or 0.0) >= threshold]
+    if len(kept) < min_keep:
+        return hits[:min_keep]
+    return kept
 
 
 def dedupe_near_identical(

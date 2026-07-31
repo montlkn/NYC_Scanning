@@ -33,10 +33,13 @@ from services.unified_search import (
     classify_intent_detailed,
     corpus_weights,
     coverage_adjustment,
+    apply_relevance_floor,
     dedupe_near_identical,
     exact_name_bonus,
     fame_boost,
     FAME_BOOST_INTENTS,
+    fold_ordinals,
+    hedged_style_penalty,
     house_number_bonus,
     infer_matched_field,
     poi_category_adjustment,
@@ -46,6 +49,7 @@ from services.unified_search import (
     profile_similarity,
     proximity_decay_bonus,
     reciprocal_rank_fusion,
+    RRF_SCALE,
     W_LEG_FAME,
 )
 
@@ -80,7 +84,12 @@ def _lexical_query(q: str) -> str:
     is entirely stopwords) so the lexical pool never goes empty.
     """
     kept = [w for w in q.split() if w.lower().strip(".,!?;:'\"") not in _LEX_STOPWORDS]
-    return " ".join(kept) if kept else q
+    out = " ".join(kept) if kept else q
+    # Ordinal fold ("1 south first" -> "1 south 1st"). The corpus stores the
+    # numeral spelling, so without this the trigram pool can never retrieve an
+    # ordinal-street address and the row simply never becomes a candidate —
+    # a retrieval miss no downstream reranking can repair.
+    return fold_ordinals(out) or out
 
 
 # word_similarity()/similarity() alone false-match short generic tokens as
@@ -1354,10 +1363,11 @@ async def search_unified(
             adj += style_name_decoy_penalty(q_lex, h.get("name"), h.get("category"), poi_noun)
             # Applied twice, on two different scales: here on the raw leg
             # score (reorders the leg, which RRF reads as rank) AND stashed
-            # for the post-RRF nudge pass (raw leg scores sit at ~0.6–0.9
-            # where ±0.15 often can't flip a rank — on the RRF scale ~0.016
-            # the same weights are decisive, which is the intent: a category
-            # mismatch must actually bury the antique store).
+            # for the post-RRF nudge pass. Post-RRF_SCALE one rank step is
+            # ~0.016, so a ±0.15 category adjustment moves a hit ~9 ranks —
+            # decisive enough to bury the antique store, without the old
+            # behaviour where it silently outweighed the entire relevance
+            # range.
             h["poi_adj"] = adj
             h["score"] = (h.get("score") or 0.0) + adj
         venues_hits.sort(key=lambda h: h.get("score") or 0.0, reverse=True)
@@ -1388,8 +1398,10 @@ async def search_unified(
         # which case apply_nudges skips the term cleanly.
         personalization_dot = h.get("personalization_dot")
         is_novel = h.get("bin") not in scanned if (scanned and h.get("bin")) else None
+        # RRF_SCALE lifts the fused score (range 0–0.0164) onto the same 0–1
+        # scale the nudges below use, so they tie-break instead of dominating.
         nudged = apply_nudges(
-            score,
+            score * RRF_SCALE,
             personalization_dot=personalization_dot,
             dist_m=h.get("dist_m"),
             is_novel=is_novel,
@@ -1420,7 +1432,17 @@ async def search_unified(
         nudged += h.get("poi_adj") or 0.0
         # Lore/event multi-token queries: reward full concept coverage
         # ("demolished" AND "theaters"), demote single-concept matches.
-        nudged += coverage_adjustment(intent, q_lex, h.get("name"), h.get("snippet"))
+        nudged += coverage_adjustment(
+            intent, q_lex, h.get("name"), h.get("snippet"),
+            h.get("category"), h.get("style"),
+        )
+        # Hedged style attributions ("… colonial revival OR art deco") were
+        # scoring as confident matches because trigram similarity reads the
+        # best-matching substring. Discount a match that only lands on the
+        # alternative, never on the primary.
+        nudged += hedged_style_penalty(
+            query_style_tokens(q, poi_noun), h.get("style")
+        )
         why = build_why(
             matched_field=h.get("matched_field"),
             year=h.get("year"),
@@ -1454,7 +1476,9 @@ async def search_unified(
     # THEN truncate to `limit`.
     all_hits.sort(key=lambda h: h["score"], reverse=True)
     deduped = dedupe_near_identical(all_hits)
-    hits = deduped[:limit]
+    # Floor BEFORE the limit: `limit` is a ceiling on how many good results to
+    # show, not a quota to fill with noise.
+    hits = apply_relevance_floor(deduped)[:limit]
 
     header = build_header(hits, intent)
     facets = build_facets({
