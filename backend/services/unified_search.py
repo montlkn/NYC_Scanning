@@ -219,7 +219,11 @@ def _category_word_hit(category: Optional[str], keywords: frozenset) -> bool:
     return False
 
 
-def poi_category_adjustment(category: Optional[str], poi_noun: Optional[str]) -> float:
+def poi_category_adjustment(
+    category: Optional[str],
+    poi_noun: Optional[str],
+    category_labels: Optional[Sequence[str]] = None,
+) -> float:
     """Rank nudge for a venue hit under poi intent. Returns 0.0 when there's
     no detected noun, no category, or no family entry for the noun (neutral —
     never a hard filter, just an additive adjustment on the fused score).
@@ -234,6 +238,25 @@ def poi_category_adjustment(category: Optional[str], poi_noun: Optional[str]) ->
     if not family:
         return 0.0
     if _category_word_hit(category, family):
+        # A single stored `category` is one arbitrarily-chosen FSQ label (see
+        # seed_venues.category_leaf). When the full label set is available and
+        # it ALSO claims an unrelated family, the "match" is a coin flip that
+        # happened to land on the query's family -- an art gallery FSQ tagged
+        # both 'Art Gallery' and 'Bar'. Withhold the boost rather than reward
+        # the ambiguity. Rows seeded before the labels column exists pass None
+        # and keep the old behaviour.
+        if category_labels:
+            # DISJOINT families only. bar/pub/lounge/speakeasy deliberately
+            # share keywords, so "!= family" would read "Cocktail Bar" as a
+            # lounge-family conflict with a bar query and withhold the boost
+            # from a textbook match.
+            conflicting = any(
+                other_family.isdisjoint(family)
+                and any(_category_word_hit(lbl, other_family) for lbl in category_labels)
+                for other_family in POI_CATEGORY_FAMILIES.values()
+            )
+            if conflicting:
+                return 0.0
         return W_POI_CATEGORY_MATCH
     if category.strip().lower() in _POI_DEMOTE_UNRELATED:
         return W_POI_CATEGORY_MISMATCH

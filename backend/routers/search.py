@@ -784,7 +784,8 @@ async def _leg_venues(
         params["lex_wb"] = word_boundary
         lex_word_boundary_clause = "AND lower(name || ' ' || coalesce(snippet, '')) ~ :lex_wb"
 
-    sql = f"""
+    def _sql(labels_col: bool) -> str:
+      return f"""
         WITH vec_pool AS (
             SELECT fsq_id FROM venues {where}
             ORDER BY embedding <=> CAST(:qvec AS vector) LIMIT :pool
@@ -803,6 +804,7 @@ async def _leg_venues(
         SELECT v.fsq_id, v.name, v.category, v.snippet, v.lat, v.lng,
                v.bin, v.bbl, v.building_year, v.building_style, v.photo_url,
                {fused} AS score, wl.lex AS lex_score
+               {(', v.category_labels') if labels_col else ''}
                {(', ' + haversine_v + ' AS dist_m') if geo else ''}
         FROM venues v
         JOIN pool USING (fsq_id)
@@ -812,19 +814,38 @@ async def _leg_venues(
         ORDER BY score DESC
         LIMIT :limit
     """
+
+    # category_labels only exists after 20260731_venues_category_labels.sql.
+    # Probe for it exactly like the buildings leg probes its enriched columns —
+    # WITHOUT this, an unmigrated DB would fail the whole hybrid query and
+    # silently degrade every POI search to pure-vector.
+    labels_col = True
     try:
         async with get_search_db() as db:
             if db is None:
                 return []
-            result = await db.execute(text(sql), params)
+            result = await db.execute(text(_sql(True)), params)
             rows = result.fetchall()
-    except Exception as e:
-        # Covers BOTH the pre-existing trigram-migration-missing case AND a
-        # not-yet-migrated venues.photo_url column (20260710_index_enrich.sql)
-        # — either way, graceful degradation to the pure-vector leg (no
-        # photo_url, no trigram fusion) rather than a 500.
-        logger.warning(f"[unified/venues] hybrid query failed ({e}); falling back to pure vector")
-        return await _leg_venues_vector_only(qvec_lit, limit, lat, lng, radius_m, year_from, year_to, soft_radius=soft_radius)
+    except Exception:
+        labels_col = False
+        try:
+            async with get_search_db() as db:
+                if db is None:
+                    return []
+                result = await db.execute(text(_sql(False)), params)
+                rows = result.fetchall()
+        except Exception as e:
+            # Covers BOTH the pre-existing trigram-migration-missing case AND a
+            # not-yet-migrated venues.photo_url column (20260710_index_enrich.sql)
+            # — either way, graceful degradation to the pure-vector leg (no
+            # photo_url, no trigram fusion) rather than a 500.
+            logger.warning(f"[unified/venues] hybrid query failed ({e}); falling back to pure vector")
+            return await _leg_venues_vector_only(qvec_lit, limit, lat, lng, radius_m, year_from, year_to, soft_radius=soft_radius)
+
+    # Column layout: 13 fixed (0-12), then category_labels when present, then
+    # dist_m when a location was supplied. Indices shift with labels_col.
+    labels_idx = 13 if labels_col else None
+    dist_idx = 14 if labels_col else 13
 
     hits = []
     for r in rows:
@@ -846,7 +867,14 @@ async def _leg_venues(
                 infer_matched_field(q_lex, name=r[1], style=r[9], category=r[2])
                 if (r[12] or 0) > 0.5 else "semantic"
             ),
-            "dist_m": round(float(r[13]), 1) if geo and len(r) > 13 and r[13] is not None else None,
+            "dist_m": (
+                round(float(r[dist_idx]), 1)
+                if geo and len(r) > dist_idx and r[dist_idx] is not None else None
+            ),
+            "category_labels": (
+                list(r[labels_idx])
+                if labels_idx is not None and len(r) > labels_idx and r[labels_idx] else None
+            ),
             "photo_url": r[10],
             "lore_status": None,
         })
@@ -1352,7 +1380,7 @@ async def search_unified(
         # reads), not just the final fused score.
         style_toks = query_style_tokens(q, poi_noun)
         for h in venues_hits:
-            adj = poi_category_adjustment(h.get("category"), poi_noun)
+            adj = poi_category_adjustment(h.get("category"), poi_noun, h.get("category_labels"))
             # Host-building style/era affinity — "art deco bar" boosts bars
             # inside deco (or deco-era) buildings; the venue row already
             # carries building_style/building_year, previously unscored.

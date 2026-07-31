@@ -850,3 +850,22 @@ def test_relevance_floor_handles_empty_and_negative_top_scores():
     assert apply_relevance_floor([]) == []
     negative = [{"score": -0.1}, {"score": -5.0}]
     assert apply_relevance_floor(negative) == negative
+
+
+def test_poi_category_adjustment_withholds_boost_on_conflicting_labels():
+    """A venue FSQ tagged BOTH 'Art Gallery' and 'Bar' must not collect the
+    category boost for a "bar" query. The stored single `category` is one
+    arbitrarily-chosen label (seed_venues.category_leaf picked by parquet
+    order on a depth tie), so a lone 'Bar' is a coin flip, not evidence.
+    """
+    # No label set (pre-migration rows) — unchanged behaviour.
+    assert poi_category_adjustment("Bar", "bar") > 0
+    # Corroborating labels agree it's a bar — still boosted.
+    assert poi_category_adjustment("Bar", "bar", ["Bar", "Cocktail Bar"]) > 0
+    # Labels disagree — withhold.
+    assert poi_category_adjustment("Bar", "bar", ["Art Gallery", "Bar"]) == 0.0
+
+
+def test_poi_category_adjustment_unknown_labels_do_not_block_a_match():
+    """Labels we have no family for ("Monument") aren't a conflict."""
+    assert poi_category_adjustment("Bar", "bar", ["Bar", "Monument"]) > 0

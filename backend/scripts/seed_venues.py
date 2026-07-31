@@ -126,12 +126,50 @@ def fetch_venues(bboxes: list, shards: int, token: str) -> list:
 
 
 def category_leaf(labels) -> str:
-    """Most-specific category, e.g. 'Dining and Drinking > Bar > Speakeasy' -> 'Speakeasy'."""
+    """Most-specific category, e.g. 'Dining and Drinking > Bar > Speakeasy' -> 'Speakeasy'.
+
+    FSQ gives a LIST of labels and this keeps exactly one. `max()` on
+    `>`-count returns the FIRST element on a depth tie, i.e. arbitrary parquet
+    order — so a place labelled both 'Arts and Entertainment > Art Gallery'
+    AND 'Dining and Drinking > Bar' got whichever came first, and the
+    corroborating label that would have outvoted it was thrown away. That is
+    how an art gallery ended up typed BAR and ranked #1 for "art deco bars
+    near me". `category_labels` below preserves the rest so the ranker can
+    see the conflict.
+    """
     if not labels:
         return ""
-    # Pick the longest (deepest) label, take its leaf segment.
-    deepest = max(labels, key=lambda s: s.count(">"))
+    # Deterministic on ties (deepest, then alphabetical) so re-ingesting
+    # unchanged data produces an unchanged column.
+    deepest = max(labels, key=lambda s: (s.count(">"), s))
     return deepest.split(">")[-1].strip()
+
+
+def category_labels(labels) -> list:
+    """Every category label's leaf segment, deduped, order-stable."""
+    if not labels:
+        return []
+    out, seen = [], set()
+    for label in labels:
+        leaf = label.split(">")[-1].strip()
+        if leaf and leaf.lower() not in seen:
+            seen.add(leaf.lower())
+            out.append(leaf)
+    return out
+
+
+def category_top_levels(labels) -> list:
+    """Top-level FSQ domains ('Dining and Drinking', 'Arts and Entertainment').
+    Two different domains on one venue is the mislabel signal."""
+    if not labels:
+        return []
+    out, seen = [], set()
+    for label in labels:
+        top = label.split(">")[0].strip()
+        if top and top.lower() not in seen:
+            seen.add(top.lower())
+            out.append(top)
+    return out
 
 
 def normalize_instagram(raw) -> Optional[str]:
@@ -257,6 +295,10 @@ def main():
         prepared.append({
             "fsq_id": fsq_id, "name": name, "lat": lat, "lng": lng,
             "category": leaf, "category_id": (cat_ids[0] if cat_ids else None),
+            # All labels + top-level domains preserved so the ranker can tell a
+            # genuine bar from a gallery that FSQ also tagged "Bar".
+            "category_labels": category_labels(labels),
+            "category_domains": category_top_levels(labels),
             "address": address, "bin": bin_, "bbl": bbl, "byear": byear,
             "instagram": normalize_instagram(instagram),
             "website": clean_text(website), "tel": clean_text(tel),
@@ -284,6 +326,7 @@ def main():
             batch = [
                 (
                     p["fsq_id"], p["name"], p["category"], p["category_id"],
+                    p["category_labels"], p["category_domains"],
                     p["text"], p["snippet"],
                     "[" + ",".join(f"{x:.6f}" for x in v) + "]",
                     p["lat"], p["lng"], p["bin"], p["bbl"], p["byear"], None,
@@ -294,13 +337,16 @@ def main():
             cur.executemany(
                 """
                 INSERT INTO venues
-                    (fsq_id, name, category, category_id, text, snippet, embedding,
+                    (fsq_id, name, category, category_id,
+                     category_labels, category_domains, text, snippet, embedding,
                      lat, lng, bin, bbl, building_year, building_style,
                      instagram, website, tel, photo_url, updated_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s::vector,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::vector,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, now())
                 ON CONFLICT (fsq_id) DO UPDATE SET
                     name=EXCLUDED.name, category=EXCLUDED.category,
-                    category_id=EXCLUDED.category_id, text=EXCLUDED.text,
+                    category_id=EXCLUDED.category_id,
+                    category_labels=EXCLUDED.category_labels,
+                    category_domains=EXCLUDED.category_domains, text=EXCLUDED.text,
                     snippet=EXCLUDED.snippet, embedding=EXCLUDED.embedding,
                     lat=EXCLUDED.lat, lng=EXCLUDED.lng, bin=EXCLUDED.bin,
                     bbl=EXCLUDED.bbl, building_year=EXCLUDED.building_year,
