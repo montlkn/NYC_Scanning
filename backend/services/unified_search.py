@@ -646,6 +646,51 @@ def hedged_style_penalty(style_toks: frozenset, style: Optional[str]) -> float:
     return 0.0
 
 
+# ---------------------------------------------------------------------------
+# Architect match (architect intent). Structured `architect` only exists as of
+# the LPC backfill; before that "buildings designed by Cass Gilbert" could only
+# fuzzy-match the embedded `text` blob, which put any building whose prose
+# happened to mention Gilbert on equal footing with one he actually designed.
+# ---------------------------------------------------------------------------
+
+# Sized post-RRF_SCALE (~1 rank step = 0.016). Dominant like W_EXACT_NAME: if
+# the user named an architect and this building is BY that architect, that is
+# the answer, not a tiebreak.
+W_ARCHITECT_MATCH = 0.30
+
+# Words that appear in the query around an architect's name but aren't part of
+# it. Without stripping these, "buildings designed by X" would match any
+# architect field, since every candidate shares zero of them and the overlap
+# test would be driven by whichever token happened to survive.
+_ARCHITECT_QUERY_NOISE = frozenset({
+    "building", "buildings", "designed", "design", "architect", "architects",
+    "by", "the", "of", "who", "was", "firm", "structures", "work", "works",
+})
+
+
+def architect_match_bonus(q_lex: str, architect: Optional[str]) -> float:
+    """Bonus when the query's non-noise tokens appear in this building's
+    architect field.
+
+    Requires a SURNAME-strength match: every meaningful query token must be
+    present, so "cass gilbert" doesn't reward every Gilbert in the corpus and
+    "gilbert" alone still matches Cass Gilbert. Returns 0.0 with no architect
+    or no usable query tokens.
+    """
+    if not architect:
+        return 0.0
+    q_toks = {
+        t for t in _tokens(q_lex)
+        if len(t) >= 3 and t not in _ARCHITECT_QUERY_NOISE
+    }
+    if not q_toks:
+        return 0.0
+    a_toks = set(_tokens(architect))
+    if not a_toks:
+        return 0.0
+    return W_ARCHITECT_MATCH if q_toks <= a_toks else 0.0
+
+
 def venue_style_affinity(
     style_toks: frozenset,
     building_style: Optional[str],

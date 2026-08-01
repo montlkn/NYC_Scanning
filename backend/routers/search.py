@@ -36,6 +36,7 @@ from services.unified_search import (
     apply_relevance_floor,
     dedupe_near_identical,
     exact_name_bonus,
+    architect_match_bonus,
     fame_boost,
     FAME_BOOST_INTENTS,
     fold_ordinals,
@@ -594,7 +595,11 @@ async def _leg_buildings(
     def _sql(enriched: bool) -> str:
         select_extra = (
             ", b.style_family AS b_style_family, b.borough AS b_borough, "
-            "b.material AS b_material, b.photo_url AS b_photo_url"
+            "b.material AS b_material, b.photo_url AS b_photo_url, "
+            # architect: backfilled from LPC gpmc-yuvp (26,430 rows). Until now
+            # there was no architect column, so the `architect` intent and
+            # infer_matched_field's architect slot had nothing to read.
+            "b.architect AS b_architect"
             + (", -(b.profile <#> CAST(:uvec AS vector)) AS b_personalization"
                if (enriched and user_vec_lit) else "")
             if enriched else ""
@@ -685,17 +690,17 @@ async def _leg_buildings(
         snippet = r[2] or ""
         name = snippet.split("—", 1)[0].strip() if "—" in snippet else snippet
         parsed_style = snippet.split("—", 1)[1].strip() if "—" in snippet else None
-        # Architect isn't a separate SELECTed column here (only lives in the
-        # embedded `text`, not `snippet`), so infer_matched_field's architect
-        # slot is left None — name/style/category are the fields we can
-        # actually attribute a token match to for this leg.
+        # Architect IS a real column now (LPC backfill), so a token match can
+        # be attributed to it honestly instead of being reported as a name
+        # match — "buildings by Cass Gilbert" now says "matched: architect".
         extra_offset = 10  # index of first enriched column, when present
         style_family = r[extra_offset] if enriched else None
         borough_val = r[extra_offset + 1] if enriched else None
         material_val = r[extra_offset + 2] if enriched else None
         photo_url = r[extra_offset + 3] if enriched else None
-        personalization_dot = float(r[extra_offset + 4]) if has_personalization and r[extra_offset + 4] is not None else None
-        dist_idx = extra_offset + (5 if has_personalization else 4) if enriched else extra_offset
+        architect_val = r[extra_offset + 4] if enriched else None
+        personalization_dot = float(r[extra_offset + 5]) if has_personalization and r[extra_offset + 5] is not None else None
+        dist_idx = extra_offset + (6 if has_personalization else 5) if enriched else extra_offset
         hits.append({
             "type": "building",
             "id": str(r[0]).replace(".0", "") if r[0] else None,
@@ -705,6 +710,7 @@ async def _leg_buildings(
             "snippet": snippet or None,
             "year": r[3],
             "style": style_family or parsed_style or None,
+            "architect": architect_val,
             "borough": borough_val,
             "material": material_val,
             "category": None,
@@ -714,7 +720,8 @@ async def _leg_buildings(
             "lng": r[7],
             "score": float(r[8]) if r[8] is not None else 0.0,
             "matched_field": (
-                infer_matched_field(q_lex, name=name, style=style_family or parsed_style)
+                infer_matched_field(q_lex, name=name, style=style_family or parsed_style,
+                                    architect=architect_val)
                 if (r[9] or 0) > 0.5 else "semantic"
             ),
             "dist_m": round(float(r[dist_idx]), 1) if geo and len(r) > dist_idx and r[dist_idx] is not None else None,
@@ -1449,6 +1456,11 @@ async def search_unified(
         # is deliberately dominant over every other nudge (see W_EXACT_NAME).
         if intent == "name":
             nudged += exact_name_bonus(q_lex, h.get("name"))
+        # Architect intent: a real column match is the answer, same standing as
+        # an exact name match. Previously this intent had no structured field
+        # to score against at all.
+        if intent == "architect":
+            nudged += architect_match_bonus(q_lex, h.get("architect"))
         # House-number address queries ("469 broome") classify as name/address
         # but their number is the whole signal — a dominant bonus when a
         # building's address range contains it, so the exact address beats fame

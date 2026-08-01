@@ -16,6 +16,8 @@ from services.unified_search import (  # noqa: E402
     RankedHit,
     apply_nudges,
     apply_relevance_floor,
+    architect_match_bonus,
+    W_ARCHITECT_MATCH,
     fold_ordinals,
     hedged_style_penalty,
     house_number_bonus,
@@ -869,3 +871,22 @@ def test_poi_category_adjustment_withholds_boost_on_conflicting_labels():
 def test_poi_category_adjustment_unknown_labels_do_not_block_a_match():
     """Labels we have no family for ("Monument") aren't a conflict."""
     assert poi_category_adjustment("Bar", "bar", ["Bar", "Monument"]) > 0
+
+
+def test_architect_match_bonus():
+    """Structured architect matching. Before the LPC backfill there was no
+    architect column, so this intent could only fuzzy-match the embedded text
+    blob -- a building whose prose merely MENTIONED Gilbert ranked alongside
+    one he designed."""
+    assert architect_match_bonus("cass gilbert", "Cass Gilbert") == W_ARCHITECT_MATCH
+    # Surname alone still finds him.
+    assert architect_match_bonus("gilbert", "Cass Gilbert") == W_ARCHITECT_MATCH
+    # Query noise ("buildings designed by") must not defeat the match.
+    assert architect_match_bonus("buildings designed by cass gilbert", "Cass Gilbert") == W_ARCHITECT_MATCH
+    # A DIFFERENT Gilbert must not collect it.
+    assert architect_match_bonus("cass gilbert", "Bradford Gilbert") == 0.0
+    # Missing architect is neutral, never negative.
+    assert architect_match_bonus("cass gilbert", None) == 0.0
+    assert architect_match_bonus("cass gilbert", "") == 0.0
+    # A query of pure noise must not match every architect in the corpus.
+    assert architect_match_bonus("buildings designed by the architect", "Cass Gilbert") == 0.0
