@@ -350,7 +350,11 @@ def building_style(snippet) -> str:
     if not snippet or "—" not in snippet:
         return ""
     style = snippet.split("—", 1)[1].strip()
-    return style if style.lower() not in ("", "unknown", "none") else ""
+    # "no style" is the curated index's explicit NULL for an unremarkable
+    # building. Stored verbatim it becomes a real style string that tokenizes
+    # into venue_style_affinity as the word "style" — noise that would match
+    # nothing useful while claiming the venue HAS an attribution.
+    return style if style.lower() not in ("", "unknown", "none", "no style") else ""
 
 
 def build_text(name, cat_leaf, address, byear, style="") -> str:
@@ -445,6 +449,7 @@ def main():
             "address": address, "bin": bin_, "bbl": bbl, "byear": byear,
             "instagram": normalize_instagram(instagram),
             "website": clean_text(website), "tel": clean_text(tel),
+            "style": style or None,
             "text": build_text(name, leaf, address, byear, style),
             "snippet": f"{name} — {leaf}" if leaf else name,
         })
@@ -483,7 +488,7 @@ def main():
                     p["category_labels"], p["category_domains"],
                     p["text"], p["snippet"],
                     "[" + ",".join(f"{x:.6f}" for x in v) + "]",
-                    p["lat"], p["lng"], p["bin"], p["bbl"], p["byear"], None,
+                    p["lat"], p["lng"], p["bin"], p["bbl"], p["byear"], p["style"],
                     p["instagram"], p["website"], p["tel"], None,
                 )
                 for p, v in zip(chunk, vectors)
@@ -504,6 +509,7 @@ def main():
                     snippet=EXCLUDED.snippet, embedding=EXCLUDED.embedding,
                     lat=EXCLUDED.lat, lng=EXCLUDED.lng, bin=EXCLUDED.bin,
                     bbl=EXCLUDED.bbl, building_year=EXCLUDED.building_year,
+                    building_style=EXCLUDED.building_style,
                     instagram=EXCLUDED.instagram, website=EXCLUDED.website,
                     tel=EXCLUDED.tel, photo_url=EXCLUDED.photo_url, updated_at=now()
                 """,
