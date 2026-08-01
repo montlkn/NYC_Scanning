@@ -196,7 +196,14 @@ def clean_text(raw) -> Optional[str]:
 
 
 def load_buildings(rail_url: str) -> list:
-    """All building geocodes for the in-memory nearest-neighbor join."""
+    """All building geocodes for the in-memory nearest-neighbor join.
+
+    LEGACY fallback path — only used when FOOTPRINTS_DB_URL is unset. This
+    reads `building_search_index`, which is the ~35k curated LANDMARK set, not
+    the city. Joining venues against it left 79% of them with no building at
+    all (and therefore no year and no style), which is why an "art deco bar"
+    query had almost nothing to work with. See join_buildings_via_footprints.
+    """
     with psycopg.connect(rail_url) as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT bin, bbl, year_built, snippet, lat, lng FROM building_search_index "
@@ -206,7 +213,8 @@ def load_buildings(rail_url: str) -> list:
 
 
 def nearest_building(vlat, vlng, buildings, grid):
-    """Nearest building within JOIN_RADIUS_M, via a coarse lat/lng grid bucket."""
+    """Nearest building within JOIN_RADIUS_M, via a coarse lat/lng grid bucket.
+    Legacy in-memory path — see load_buildings."""
     import math
     key = (round(vlat, 3), round(vlng, 3))  # ~110m cells
     best, best_d = None, JOIN_RADIUS_M + 1
@@ -221,6 +229,117 @@ def nearest_building(vlat, vlng, buildings, grid):
                 if d < best_d:
                     best, best_d = b, d
     return best
+
+
+# ---------------------------------------------------------------------------
+# Footprint-based geo-join (the real one).
+#
+# Three sources, three different databases/tables, in priority order:
+#
+#   building_footprints   (FOOTPRINTS_DB, 1.08M rows) — the spatial index.
+#                         Gives bin + bbl + construction_year for essentially
+#                         every structure in NYC. GiST index on `centroid`, so
+#                         KNN is cheap.
+#   pluto_buildings       (FOOTPRINTS_DB, 858k rows) — year_built + building
+#                         class, keyed by BBL. Has NO coordinates, so it can
+#                         only be reached through the footprint's bbl.
+#   building_search_index (SEARCH_DB, 35k rows) — the curated landmark set,
+#                         the ONLY source of architectural STYLE.
+#
+# Era therefore covers ~the whole city while style stays limited to the curated
+# set — which is the correct shape, because `venue_style_affinity` scores a
+# venue on its building's ERA when no style string exists (deco = 1920-1941).
+# ---------------------------------------------------------------------------
+
+# Venues are sent to the footprints DB in chunks; one round-trip per chunk
+# rather than per venue.
+JOIN_CHUNK = 2000
+
+
+def join_buildings_via_footprints(fp_url: str, search_url: str, venues: list) -> dict:
+    """Nearest footprint within JOIN_RADIUS_M for each venue.
+
+    `venues` is the raw parquet row list; returns {index: (bin, bbl, year, style)}
+    for the ones that joined. Indices absent from the dict didn't join.
+    """
+    out: dict = {}
+    with psycopg.connect(fp_url) as conn, conn.cursor() as cur:
+        for start in range(0, len(venues), JOIN_CHUNK):
+            chunk = venues[start : start + JOIN_CHUNK]
+            # (idx, lat, lng) tuples; skip rows with no coordinate.
+            vals = [
+                (start + i, float(r[2]), float(r[3]))
+                for i, r in enumerate(chunk)
+                if r[2] is not None and r[3] is not None
+            ]
+            if not vals:
+                continue
+            placeholders = ",".join(["(%s,%s::float8,%s::float8)"] * len(vals))
+            params: list = []
+            for v in vals:
+                params.extend(v)
+            params.append(JOIN_RADIUS_M)
+            cur.execute(
+                f"""
+                WITH v(idx, lat, lng) AS (VALUES {placeholders})
+                SELECT v.idx, f.bin, f.bbl, f.construction_year
+                FROM v
+                CROSS JOIN LATERAL (
+                    SELECT bin, bbl, construction_year, centroid
+                    FROM building_footprints
+                    WHERE centroid IS NOT NULL
+                    -- <-> against the GiST index: index-assisted KNN, so this
+                    -- is a bounded lookup, not a scan of 1.08M rows.
+                    ORDER BY centroid <-> ST_SetSRID(ST_MakePoint(v.lng, v.lat), 4326)
+                    LIMIT 1
+                ) f
+                WHERE ST_DWithin(
+                    f.centroid::geography,
+                    ST_SetSRID(ST_MakePoint(v.lng, v.lat), 4326)::geography,
+                    %s
+                )
+                """,
+                params,
+            )
+            for idx, bin_, bbl, year in cur.fetchall():
+                out[idx] = [bin_, bbl, year, ""]
+            logger.info(f"  geo-join {min(start + JOIN_CHUNK, len(venues))}/{len(venues)}")
+
+        # PLUTO year_built fills gaps where the footprint has no
+        # construction_year (a large share of the DOB footprint set).
+        bbls = {v[1] for v in out.values() if v[1]}
+        if bbls:
+            cur.execute(
+                "SELECT bbl, year_built FROM pluto_buildings "
+                "WHERE bbl = ANY(%s) AND year_built IS NOT NULL AND year_built > 1600",
+                (list(bbls),),
+            )
+            pluto_years = dict(cur.fetchall())
+            filled = 0
+            for v in out.values():
+                if not v[2] and v[1] and pluto_years.get(v[1]):
+                    v[2] = pluto_years[v[1]]
+                    filled += 1
+            logger.info(f"  PLUTO filled {filled} missing year_built values")
+
+    # Style, from the curated landmark index on the OTHER database.
+    bins = {v[0] for v in out.values() if v[0]}
+    if bins:
+        with psycopg.connect(search_url) as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT bin, snippet FROM building_search_index WHERE bin = ANY(%s)",
+                (list(bins),),
+            )
+            styles = {b: building_style(s) for b, s in cur.fetchall()}
+        styled = 0
+        for v in out.values():
+            s = styles.get(v[0])
+            if s:
+                v[3] = s
+                styled += 1
+        logger.info(f"  {styled} venues inherited a building STYLE from the curated index")
+
+    return out
 
 
 def building_style(snippet) -> str:
@@ -271,27 +390,51 @@ def main():
     if not rows:
         return
 
-    # Build the join grid over buildings.
-    buildings = load_buildings(rail_url)
-    logger.info(f"{len(buildings)} buildings loaded for geo-join")
+    # Geo-join. Prefer the full 1.08M-row footprint set; fall back to the
+    # legacy 35k landmark index only if the footprints DB isn't configured.
+    fp_url = os.environ.get("FOOTPRINTS_DB_URL")
+    joins: dict = {}
+    buildings: list = []
     grid: dict = {}
-    for b in buildings:
-        gk = (round(b[4], 3), round(b[5], 3))
-        grid.setdefault(gk, []).append(b)
+    if fp_url:
+        logger.info("geo-joining against building_footprints (PostGIS)...")
+        joins = join_buildings_via_footprints(fp_url, rail_url, rows)
+    else:
+        logger.warning(
+            "FOOTPRINTS_DB_URL unset — falling back to the 35k landmark index. "
+            "Most venues will get no building, year or style."
+        )
+        buildings = load_buildings(rail_url)
+        logger.info(f"{len(buildings)} buildings loaded for geo-join")
+        for b in buildings:
+            gk = (round(b[4], 3), round(b[5], 3))
+            grid.setdefault(gk, []).append(b)
 
     prepared = []
     joined = 0
-    for r in rows:
+    with_year = 0
+    with_style = 0
+    for idx, r in enumerate(rows):
         fsq_id, name, lat, lng, address, cat_ids, labels, instagram, website, tel = r
         leaf = category_leaf(labels)
-        b = nearest_building(lat, lng, buildings, grid)
         bin_ = bbl = byear = None
         style = ""
-        if b:
-            # b = (bin, bbl, year_built, snippet, lat, lng) — snippet carries style.
-            bin_, bbl, byear = b[0], b[1], b[2]
-            style = building_style(b[3])
-            joined += 1
+        if fp_url:
+            j = joins.get(idx)
+            if j:
+                bin_, bbl, byear, style = j[0], j[1], j[2], j[3]
+                joined += 1
+        else:
+            b = nearest_building(lat, lng, buildings, grid)
+            if b:
+                # b = (bin, bbl, year_built, snippet, lat, lng) — snippet carries style.
+                bin_, bbl, byear = b[0], b[1], b[2]
+                style = building_style(b[3])
+                joined += 1
+        if byear:
+            with_year += 1
+        if style:
+            with_style += 1
         prepared.append({
             "fsq_id": fsq_id, "name": name, "lat": lat, "lng": lng,
             "category": leaf, "category_id": (cat_ids[0] if cat_ids else None),
@@ -306,7 +449,18 @@ def main():
             "snippet": f"{name} — {leaf}" if leaf else name,
         })
 
-    logger.info(f"{joined}/{len(prepared)} venues geo-joined to a building (<= {JOIN_RADIUS_M}m)")
+    n = len(prepared) or 1
+    logger.info(
+        f"{joined}/{len(prepared)} venues geo-joined to a building "
+        f"(<= {JOIN_RADIUS_M}m)  [{100 * joined // n}%]"
+    )
+    # Year and style are reported separately because they matter for different
+    # queries: ERA drives the "art deco bar" affinity for the whole city, STYLE
+    # only exists for the curated landmark subset.
+    logger.info(
+        f"  provenance: {with_year} with a build YEAR ({100 * with_year // n}%), "
+        f"{with_style} with a STYLE ({100 * with_style // n}%)"
+    )
 
     if args.dry_run:
         for p in prepared[:8]:
