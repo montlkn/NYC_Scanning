@@ -176,6 +176,17 @@ BLOCK_LOT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A third layout (1980s-90s reports, e.g. LP-1647 Upper West Side) writes the
+# same information as "Tax Map Block/Lot: 1121/29" — no borough on the line,
+# and the scan OCRs "Block/Lot" into things like "BlockjlDt:". So match on the
+# stable parts, "Tax Map" followed by block/lot digits, and tolerate whatever
+# the OCR made of the words between. The borough comes from the district's own
+# BINs instead, whose first digit IS the borough code.
+BLOCK_LOT_ALT_RE = re.compile(
+    r"Tax\s*Map\b[^\d\n]{0,24}?(\d{2,5})\s*[/|jl]\s*(\d{1,5})",
+    re.IGNORECASE,
+)
+
 # "Date:", "Architect/Builder:", "Original Owner:", "Significant Architectural
 # Features:". Label runs of capitalised words ending in a colon.
 FIELD_RE = re.compile(r"^([A-Z][A-Za-z()/&,\- ]{2,45}):\s*(.+)$")
@@ -183,14 +194,26 @@ FIELD_RE = re.compile(r"^([A-Z][A-Za-z()/&,\- ]{2,45}):\s*(.+)$")
 BOROUGH_CODE = {"manhattan": "1", "bronx": "2", "brooklyn": "3",
                 "queens": "4", "staten island": "5"}
 
-# Fields worth keeping as lore. "Facade Notes" and the condition-survey lines
-# (Windows: Replaced, Cornice: Original) describe present-day fabric, not
-# history, and read as an inspection checklist rather than a story.
-LORE_FIELDS = {
-    "date", "architect/builder", "architect", "builder", "original owner",
-    "type", "style", "stories", "material(s)", "materials",
-    "significant architectural features", "history", "alterations",
-}
+# Condition-survey fields to DROP: they describe present-day fabric and read as
+# an inspection checklist rather than history.
+#
+# This is a blocklist, not a whitelist, because these scans mangle the labels —
+# ARCHITECT becomes "AROITTECT", OWNER/DEVELOPER becomes "OWNER/DEVEIDPER". A
+# whitelist of exact names silently discards every garbled label, which starves
+# entries below the length threshold and looks like "the report has no data".
+# Substring matching on the survey vocabulary is far more OCR-tolerant, and
+# wrongly keeping an odd field is much cheaper than dropping the architect.
+DROP_FIELD_SUBSTRINGS = (
+    "window", "cornice", "stoop", "door", "areaway", "sidewalk", "curb",
+    "paving", "roof", "fence", "railing", "gate", "security", "lighting",
+    "utility", "meter", "conduit", "awning", "sign", "notable condition",
+    "facade note", "planting", "flagpole", "antenna", "cable",
+)
+
+
+def is_lore_field(label: str) -> bool:
+    low = label.lower()
+    return not any(s in low for s in DROP_FIELD_SUBSTRINGS)
 
 
 def bbl_from(borough: str, block: str, lot: str) -> str:
@@ -213,7 +236,11 @@ class ModernEntry:
 
 
 def extract_modern(pdf_path: str, report_id: str,
-                   limit_pages: int | None = None) -> list[ModernEntry]:
+                   limit_pages: int | None = None,
+                   default_borough: str | None = None) -> list[ModernEntry]:
+    """`default_borough` is the borough DIGIT ('1'..'5') used by the alternate
+    Block/Lot layout, which omits the borough from the line. Callers derive it
+    from the district's BINs rather than guessing."""
     reader = PdfReader(pdf_path)
     pages = reader.pages if limit_pages is None else reader.pages[:limit_pages]
     out: list[ModernEntry] = []
@@ -227,14 +254,23 @@ def extract_modern(pdf_path: str, report_id: str,
         lines = [l.strip() for l in raw.split("\n") if l.strip()]
         for i, line in enumerate(lines):
             m = BLOCK_LOT_RE.search(line)
+            bbl = None
             if m:
-                # The address is the line above the Block/Lot line.
-                addr = lines[i - 1].strip() if i > 0 else ""
                 try:
                     bbl = bbl_from(m.group(1), m.group(2), m.group(3))
                 except (KeyError, ValueError):
-                    current = None
-                    continue
+                    bbl = None
+            elif default_borough:
+                alt = BLOCK_LOT_ALT_RE.search(line)
+                if alt:
+                    try:
+                        bbl = (f"{default_borough}"
+                               f"{int(alt.group(1)):05d}{int(alt.group(2)):04d}")
+                    except ValueError:
+                        bbl = None
+            if bbl:
+                # The address is the line above the Block/Lot line.
+                addr = lines[i - 1].strip() if i > 0 else ""
                 current = ModernEntry(report=report_id, address=addr, bbl=bbl, page=pno)
                 out.append(current)
                 continue
@@ -243,7 +279,7 @@ def extract_modern(pdf_path: str, report_id: str,
             fm = FIELD_RE.match(line)
             if fm:
                 label = fm.group(1).strip().lower()
-                if label in LORE_FIELDS:
+                if is_lore_field(label):
                     current.fields[label] = fm.group(2).strip()
                     current._last = label  # type: ignore[attr-defined]
                 else:
@@ -257,15 +293,32 @@ def extract_modern(pdf_path: str, report_id: str,
 
 
 def looks_modern(pdf_path: str, probe_pages: int = 40) -> bool:
-    """True if the PDF uses the structured Block/Lot record format."""
+    """True if the PDF uses either structured Block/Lot record format.
+
+    Probes from a quarter of the way in, not from page 0: these reports open
+    with tables of contents and designation boilerplate, and the per-building
+    entries can start hundreds of pages deep (LP-1647's begin around p.280 of
+    1,537). Probing only the front returns False on a structured report and
+    silently routes it to the legacy parser, which yields nothing.
+    """
     reader = PdfReader(pdf_path)
+    n = len(reader.pages)
+    if n == 0:
+        return False
+    # Sample EVENLY across the whole document rather than one contiguous window.
+    # A window can land entirely in front matter or an index — LP-1647 runs to
+    # 1,537 pages with a long table of contents and a back index — and a probe
+    # that sees neither returns False, routing a structured report to the legacy
+    # parser, which yields nothing at all.
+    step = max(n // probe_pages, 1)
     hits = 0
-    for page in reader.pages[:probe_pages]:
+    for i in range(0, n, step):
         try:
-            if BLOCK_LOT_RE.search(page.extract_text() or ""):
-                hits += 1
+            text = reader.pages[i].extract_text() or ""
         except Exception:
             continue
+        if BLOCK_LOT_RE.search(text) or BLOCK_LOT_ALT_RE.search(text):
+            hits += 1
         if hits >= 2:
             return True
     return False
