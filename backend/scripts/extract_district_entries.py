@@ -156,6 +156,121 @@ def expand_range(lo: int, hi: int | None) -> list[int]:
     return [lo, hi]
 
 
+# ── Modern-report format ──────────────────────────────────────────────────────
+# Reports from roughly LP-2000 on abandon the typewritten marginal-marker layout
+# for a structured per-building record in a single column:
+#
+#     70-10 60th Lane
+#     Borough of Queens Tax Map Block 3517, Lot 28
+#     Date: 1907 (NB 2414-1907)
+#     Architect/Builder: Louis Berger & Company
+#     Original Owner: Paul Stier
+#
+# This is strictly better than the old format: the fields are labelled, and the
+# Block/Lot line yields a BBL, so buildings match EXACTLY instead of through
+# fuzzy address comparison. Detected per PDF rather than guessed from LP number,
+# since the changeover was gradual.
+BLOCK_LOT_RE = re.compile(
+    r"Borough of\s+(Manhattan|Bronx|Brooklyn|Queens|Staten Island)\s+"
+    r"Tax Map Block\s+([\d]+)\s*,?\s*Lot\s+([\d]+)",
+    re.IGNORECASE,
+)
+
+# "Date:", "Architect/Builder:", "Original Owner:", "Significant Architectural
+# Features:". Label runs of capitalised words ending in a colon.
+FIELD_RE = re.compile(r"^([A-Z][A-Za-z()/&,\- ]{2,45}):\s*(.+)$")
+
+BOROUGH_CODE = {"manhattan": "1", "bronx": "2", "brooklyn": "3",
+                "queens": "4", "staten island": "5"}
+
+# Fields worth keeping as lore. "Facade Notes" and the condition-survey lines
+# (Windows: Replaced, Cornice: Original) describe present-day fabric, not
+# history, and read as an inspection checklist rather than a story.
+LORE_FIELDS = {
+    "date", "architect/builder", "architect", "builder", "original owner",
+    "type", "style", "stories", "material(s)", "materials",
+    "significant architectural features", "history", "alterations",
+}
+
+
+def bbl_from(borough: str, block: str, lot: str) -> str:
+    """Borough digit + 5-digit block + 4-digit lot, the standard BBL form."""
+    return f"{BOROUGH_CODE[borough.strip().lower()]}{int(block):05d}{int(lot):04d}"
+
+
+@dataclass
+class ModernEntry:
+    report: str
+    address: str
+    bbl: str
+    fields: dict[str, str] = field(default_factory=dict)
+    page: int = 0
+
+    @property
+    def text(self) -> str:
+        parts = [f"{k.title()}: {v}" for k, v in self.fields.items()]
+        return re.sub(r"\s+", " ", " ".join(parts)).strip()
+
+
+def extract_modern(pdf_path: str, report_id: str,
+                   limit_pages: int | None = None) -> list[ModernEntry]:
+    reader = PdfReader(pdf_path)
+    pages = reader.pages if limit_pages is None else reader.pages[:limit_pages]
+    out: list[ModernEntry] = []
+    current: ModernEntry | None = None
+
+    for pno, page in enumerate(pages):
+        try:
+            raw = page.extract_text() or ""
+        except Exception:
+            continue
+        lines = [l.strip() for l in raw.split("\n") if l.strip()]
+        for i, line in enumerate(lines):
+            m = BLOCK_LOT_RE.search(line)
+            if m:
+                # The address is the line above the Block/Lot line.
+                addr = lines[i - 1].strip() if i > 0 else ""
+                try:
+                    bbl = bbl_from(m.group(1), m.group(2), m.group(3))
+                except (KeyError, ValueError):
+                    current = None
+                    continue
+                current = ModernEntry(report=report_id, address=addr, bbl=bbl, page=pno)
+                out.append(current)
+                continue
+            if current is None:
+                continue
+            fm = FIELD_RE.match(line)
+            if fm:
+                label = fm.group(1).strip().lower()
+                if label in LORE_FIELDS:
+                    current.fields[label] = fm.group(2).strip()
+                    current._last = label  # type: ignore[attr-defined]
+                else:
+                    current._last = None  # type: ignore[attr-defined]
+            else:
+                # Continuation of the previous field's value (these wrap freely).
+                last = getattr(current, "_last", None)
+                if last:
+                    current.fields[last] += " " + line
+    return out
+
+
+def looks_modern(pdf_path: str, probe_pages: int = 40) -> bool:
+    """True if the PDF uses the structured Block/Lot record format."""
+    reader = PdfReader(pdf_path)
+    hits = 0
+    for page in reader.pages[:probe_pages]:
+        try:
+            if BLOCK_LOT_RE.search(page.extract_text() or ""):
+                hits += 1
+        except Exception:
+            continue
+        if hits >= 2:
+            return True
+    return False
+
+
 @dataclass
 class Entry:
     report: str
@@ -317,6 +432,28 @@ def main() -> int:
     ap.add_argument("--min-chars", type=int, default=200,
                     help="drop entries thinner than this; they read as stubs")
     args = ap.parse_args()
+
+    modern = looks_modern(args.pdf)
+    print(f"format              : {'modern (Block/Lot records)' if modern else 'legacy (marginal markers)'}")
+
+    if modern:
+        mentries = [e for e in extract_modern(args.pdf, args.report, args.limit_pages)
+                    if len(e.text) >= args.min_chars]
+        print(f"entries >= {args.min_chars} chars : {len(mentries)}")
+        print(f"with BBL            : {sum(1 for e in mentries if e.bbl)}")
+        if mentries:
+            lens = sorted(len(e.text) for e in mentries)
+            print(f"text length med/max : {lens[len(lens)//2]} / {lens[-1]}")
+        for e in mentries[: args.sample]:
+            print(f"\n--- {e.address}  BBL={e.bbl}  page={e.page}")
+            print(f"    {e.text[:400]}")
+        if args.json_out:
+            with open(args.json_out, "w") as fh:
+                json.dump([{"report": e.report, "address": e.address, "bbl": e.bbl,
+                            "page": e.page, "fields": e.fields, "text": e.text}
+                           for e in mentries], fh, indent=1)
+            print(f"\nwrote {args.json_out}")
+        return 0
 
     entries = extract(args.pdf, args.report, args.limit_pages)
     kept = [e for e in entries if len(e.text) >= args.min_chars]
