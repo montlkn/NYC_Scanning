@@ -20,6 +20,16 @@ from utils.storage import upload_image
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+# These photos are keepers: the only way one reaches this endpoint is the user
+# tapping SAVE on the scan sheet. They must NOT live under `scans/`, which an
+# R2 lifecycle rule ("DeleteTemporaryScans") expires after 3 days — a holdover
+# from the old pipeline, when the backend received photos for matching and they
+# really were temporary. That rule silently deleted every saved photo, so the
+# building sheet fell back to a placeholder days after the user saved one.
+# The path now states the intent, instead of relying on nobody re-adding a
+# lifecycle rule to the wrong prefix.
+PHOTO_PREFIX = "contributions/"
+
 
 @router.post("/scan-photo")
 async def upload_scan_photo(
@@ -35,7 +45,7 @@ async def upload_scan_photo(
 
     try:
         photo_url = await upload_image(
-            photo_bytes, f"scans/{scan_id}.jpg", create_thumbnail=True
+            photo_bytes, f"{PHOTO_PREFIX}{scan_id}.jpg", create_thumbnail=True
         )
     except Exception as e:
         logger.error(f"scan-photo upload failed for {scan_id}: {e}")
