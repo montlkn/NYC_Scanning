@@ -13,45 +13,11 @@ Key metrics:
 """
 
 import logging
-from typing import List, Optional, Dict, Any
+from typing import List
 
-from services.analytics import track_scan, track_confirmation
+from services.analytics import track_confirmation
 
 logger = logging.getLogger(__name__)
-
-
-def log_scan(
-    scan_id: str,
-    top3_bins: List[str],
-    score_breakdowns: List[Dict[str, Any]],
-    cone_deg: float,
-    used_ring_fallback: bool,
-    clip_method: str,
-    processing_time_ms: int,
-    verification_method: str,
-    top_confidence: float,
-    show_picker: bool,
-):
-    logger.debug(
-        f"[telemetry:{scan_id}] "
-        f"top3={top3_bins} "
-        f"cone={cone_deg:.0f}° ring={used_ring_fallback} "
-        f"clip={clip_method} "
-        f"conf={top_confidence:.3f} picker={show_picker} "
-        f"{processing_time_ms}ms"
-    )
-
-    track_scan(scan_id, {
-        "top3_bins": top3_bins,
-        "top_confidence": top_confidence,
-        "cone_deg": cone_deg,
-        "used_ring_fallback": used_ring_fallback,
-        "clip_method": clip_method,
-        "show_picker": show_picker,
-        "processing_time_ms": processing_time_ms,
-        "verification_method": verification_method,
-        "score_breakdowns": score_breakdowns,
-    })
 
 
 def log_confirmation(
