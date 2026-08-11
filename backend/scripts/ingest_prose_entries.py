@@ -171,6 +171,8 @@ def main() -> int:
     ap.add_argument("--survey", required=True)
     ap.add_argument("--tmp", default="/tmp/jink_prose_ingest.pdf")
     ap.add_argument("--limit", type=int)
+    ap.add_argument("--only", nargs="*", help="report filenames, e.g. 0696.pdf — "
+                    "for retrying a report that failed on a transient DB drop")
     ap.add_argument("--commit", action="store_true")
     ap.add_argument("--sleep", type=float, default=1.0)
     args = ap.parse_args()
@@ -185,6 +187,9 @@ def main() -> int:
     # it labelled 'legacy'. detect_format re-checks each PDF below.
     targets = [r for r in recs if r.get("format") == "legacy" and not r.get("error")]
     targets.sort(key=lambda r: -r["bins_in_district"])
+    if args.only:
+        want = set(args.only)
+        targets = [r for r in targets if r["report"] in want]
     if args.limit:
         targets = targets[: args.limit]
 

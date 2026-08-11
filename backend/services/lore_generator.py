@@ -10,6 +10,7 @@ Usage:
     lore = await generate_building_lore(session, bin_val, building_name, ...)
 """
 
+import math
 import os
 import logging
 import re
@@ -105,6 +106,82 @@ async def _get_block_context(session: AsyncSession, bin_val: str) -> Optional[st
     if not bits:
         return None
     return "; ".join(bits)
+
+
+async def _get_nearby_lore(session: AsyncSession, bin_val: str,
+                           radius_m: int = 150, limit: int = 3) -> Optional[str]:
+    """Lore events and plaques near this building, from the indexed layers.
+
+    We already hold 1,806 lore events and 105 plaques with coordinates and
+    sources — the register the app actually wants ("This delightful East Village
+    faux carriage house was built in 1891 for sculptors, not horses"). A
+    designation report will never contain that, so without this the writeup is
+    all fabric and no story.
+
+    These are NEARBY, not necessarily ABOUT this building — a plaque 100m away
+    belongs to a different address. The prompt says so explicitly and permits
+    only a relational mention, because presenting a neighbour's history as this
+    building's is precisely the mis-attribution the rest of this pipeline works
+    to avoid.
+    """
+    try:
+        row = (await session.execute(text("""
+            SELECT ST_Y(centroid::geometry) AS lat, ST_X(centroid::geometry) AS lng
+            FROM building_footprints
+            WHERE replace(bin,'.0','') = :bin AND centroid IS NOT NULL LIMIT 1
+        """), {"bin": bin_val})).fetchone()
+    except Exception as e:
+        logger.warning(f"nearby-lore centroid lookup failed for {bin_val}: {e}")
+        return None
+    if not row or row[0] is None:
+        return None
+    lat, lng = float(row[0]), float(row[1])
+
+    # The search DB has NO PostGIS — `geography` does not exist there, unlike
+    # the buildings DB. A ST_DWithin query fails, and because this helper
+    # swallows errors it would fail SILENTLY: no nearby lore, ever, with nothing
+    # in the logs to say why. So distance is plain arithmetic, which at a 150m
+    # radius is well within a metre of the true value, over an index of ~1,900
+    # rows where a full scan costs nothing.
+    m_per_deg_lat = 111_320.0
+    m_per_deg_lng = max(m_per_deg_lat * math.cos(math.radians(lat)), 1.0)
+    dlat = radius_m / m_per_deg_lat
+    dlng = radius_m / m_per_deg_lng
+
+    try:
+        from models.search_session import get_search_db
+        async with get_search_db() as sdb:
+            if sdb is None:
+                return None
+            rows = (await sdb.execute(text("""
+                SELECT title, snippet, layer, year,
+                       sqrt(
+                         power((lat - :lat) * :mlat, 2) +
+                         power((lng - :lng) * :mlng, 2)
+                       ) AS d
+                FROM layer_search_index
+                WHERE layer IN ('lore','plaque')
+                  AND lat IS NOT NULL AND lng IS NOT NULL
+                  AND lat BETWEEN :lat - :dlat AND :lat + :dlat
+                  AND lng BETWEEN :lng - :dlng AND :lng + :dlng
+                ORDER BY d ASC
+                LIMIT :lim
+            """), {"lat": lat, "lng": lng, "mlat": m_per_deg_lat,
+                   "mlng": m_per_deg_lng, "dlat": dlat, "dlng": dlng,
+                   "lim": limit})).fetchall()
+    except Exception as e:
+        logger.warning(f"nearby-lore lookup failed for {bin_val}: {e}")
+        return None
+
+    if not rows:
+        return None
+    bits = []
+    for title, snippet, layer, year, dist in rows:
+        label = (title or snippet or "").strip()
+        if not label:
+            continue
+        bits.append(f"[{layer}, {int(dist)}m away] {label[:180]}")
+    return "\n".join(bits) if bits else None
 
 
 async def _get_architect_catalogue_count(
@@ -212,6 +289,7 @@ async def _synthesize_with_grok(
     architect: Optional[str],
     block_context: Optional[str] = None,
     architect_count: Optional[int] = None,
+    nearby_lore: Optional[str] = None,
 ) -> Optional[str]:
     """Synthesize raw LPC/Wikipedia chunks into punchy, grounded copy.
 
@@ -282,6 +360,15 @@ async def _synthesize_with_grok(
             f"This architect has {architect_count} other buildings in Jink's "
             f"catalogue (say 'in this app' or similar — it is NOT a claim about "
             f"their whole career)."
+        )
+    if nearby_lore:
+        extras.append(
+            "Lore recorded NEARBY (each line gives its distance). These are "
+            "NOT about this building unless the address plainly matches — they "
+            "belong to neighbouring sites. You may mention one only "
+            "relationally ('around the corner from...', 'on the same block "
+            "as...'), and must never restate it as this building's own "
+            "history:\n" + nearby_lore
         )
     if extras:
         user += (
@@ -558,8 +645,9 @@ async def generate_building_lore_detailed(
     if raw:
         block_ctx = await _get_block_context(session, bin_val)
         arch_n = await _get_architect_catalogue_count(session, architect)
+        near = await _get_nearby_lore(session, bin_val)
         lore = await _synthesize_with_grok(raw, building_name, address, year_built,
-                                           style, architect, block_ctx, arch_n)
+                                           style, architect, block_ctx, arch_n, near)
         if lore:
             if cache_to_db:
                 await _cache_storytelling(session, bin_val, lore)
@@ -582,8 +670,9 @@ async def generate_building_lore_detailed(
         if raw:
             block_ctx = await _get_block_context(session, bin_val)
             arch_n = await _get_architect_catalogue_count(session, architect)
+            near = await _get_nearby_lore(session, bin_val)
             lore = await _synthesize_with_grok(raw, building_name, address, year_built,
-                                               style, architect, block_ctx, arch_n)
+                                               style, architect, block_ctx, arch_n, near)
             # A Wikipedia extract is at least written prose, so serving it raw is
             # tolerable where raw LPC typescript is not. It is still marked
             # unsynthesized so the cost/quality split stays visible.

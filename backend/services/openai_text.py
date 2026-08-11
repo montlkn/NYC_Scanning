@@ -65,29 +65,57 @@ async def openai_text(
             {"role": "user", "content": user},
         ],
         "max_output_tokens": max_tokens,
+        # No reasoning. This is rewriting supplied source text, not solving
+        # anything — there is nothing to reason about. Reasoning tokens are
+        # billed at the output rate AND drawn from max_output_tokens before the
+        # prose is, which is what truncated lore mid-sentence. Turning it off
+        # both cuts cost and removes the truncation pressure.
+        "reasoning": {"effort": "none"},
         # Stable prefix key so the large, static system prompt is billed at the
         # cached-input rate across calls.
         "prompt_cache_key": "jink-lore-synth",
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=timeout_s) as client:
-            resp = await client.post(
-                OPENAI_URL,
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json=body,
-            )
-        if resp.status_code != 200:
-            logger.warning(
-                f"openai_text {resp.status_code}: {resp.text[:200]}"
-            )
+    async def _post(payload: dict) -> Optional[httpx.Response]:
+        try:
+            async with httpx.AsyncClient(timeout=timeout_s) as client:
+                return await client.post(
+                    OPENAI_URL,
+                    headers={
+                        "Authorization": f"Bearer {OPENAI_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+        except Exception as e:
+            logger.warning(f"openai_text failed: {e}")
             return None
+
+    resp = await _post(body)
+    if resp is None:
+        return None
+
+    # Accepted reasoning-effort values differ across model generations, and a
+    # rejected one 400s the whole call. Rather than pin a value we cannot verify
+    # from here, retry once without the field — losing the saving, never the
+    # lore. The log line says which happened.
+    if resp.status_code == 400 and "reasoning" in resp.text.lower():
+        logger.warning(
+            f"openai_text: model rejected reasoning effort, retrying without "
+            f"({resp.text[:160]})"
+        )
+        body.pop("reasoning", None)
+        resp = await _post(body)
+        if resp is None:
+            return None
+
+    if resp.status_code != 200:
+        logger.warning(f"openai_text {resp.status_code}: {resp.text[:200]}")
+        return None
+    try:
         data = resp.json()
     except Exception as e:
-        logger.warning(f"openai_text failed: {e}")
+        logger.warning(f"openai_text bad json: {e}")
         return None
 
     # Responses API: output[] carries message items whose content[] holds text.
