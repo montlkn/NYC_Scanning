@@ -26,6 +26,88 @@ logger = logging.getLogger(__name__)
 FLOAT_PATTERN = re.compile(r'^\d+\.\d+$')
 
 
+async def _get_block_context(session: AsyncSession, bin_val: str) -> Optional[str]:
+    """Computed facts about how this building sits among its ACTUAL neighbours.
+
+    This is lore no model and no web search can produce, because it requires the
+    whole city at once: "sixty years older than anything on its block" is only
+    knowable by comparing against every surrounding footprint.
+
+    It deliberately does NOT use the precomputed `*_surprise_*` /
+    `local_era_contrast` / `neighbor_count_r*` columns. Those compare against the
+    curated 35k rather than the real block, and `neighbor_count_r300` holds
+    exactly ONE distinct value across all 35,382 rows — so any claim derived from
+    them ("older than its block") may simply be false. `building_footprints`
+    carries 1.08M real NYC footprints with construction years, which is the
+    honest comparison set.
+
+    Also counts the architect's other work IN OUR CATALOGUE — phrased as such,
+    since it is not a claim about their whole career.
+    """
+    try:
+        row = (await session.execute(text("""
+            WITH me AS (
+              SELECT bin, centroid, construction_year, height_roof
+              FROM building_footprints
+              WHERE replace(bin,'.0','') = :bin AND centroid IS NOT NULL
+              LIMIT 1
+            )
+            SELECT
+              (SELECT construction_year FROM me)                     AS my_year,
+              (SELECT height_roof FROM me)                           AS my_height,
+              count(*)                                               AS neighbours,
+              round(avg(f.construction_year)
+                    FILTER (WHERE f.construction_year > 1700))       AS avg_year,
+              min(f.construction_year)
+                    FILTER (WHERE f.construction_year > 1700)        AS oldest,
+              round(max(f.height_roof))                              AS tallest
+            FROM building_footprints f, me
+            WHERE f.bin <> me.bin
+              AND ST_DWithin(f.centroid::geography, me.centroid::geography, 100)
+        """), {"bin": bin_val})).fetchone()
+    except Exception as e:
+        logger.warning(f"block context failed for BIN {bin_val}: {e}")
+        return None
+
+    if not row or not row[2]:
+        return None
+    my_year, my_height, neighbours, avg_year, oldest, tallest = row
+
+    bits = []
+    if my_year and avg_year and neighbours >= 5:
+        gap = int(my_year) - int(avg_year)
+        if abs(gap) >= 20:
+            bits.append(
+                f"built {abs(gap)} years {'after' if gap > 0 else 'before'} the "
+                f"average of its {neighbours} neighbours within 100m "
+                f"(this {int(my_year)}, block average {int(avg_year)})"
+            )
+    if my_height and tallest and float(my_height) > float(tallest) * 1.5:
+        bits.append(
+            f"taller than everything within 100m "
+            f"({int(float(my_height))}ft vs {int(float(tallest))}ft next tallest)"
+        )
+    if not bits:
+        return None
+    return "; ".join(bits)
+
+
+async def _get_architect_catalogue_count(
+    session: AsyncSession, architect: Optional[str]
+) -> Optional[int]:
+    """How many other buildings in OUR catalogue share this architect."""
+    if not architect or architect.strip().lower() in ("", "not determined", "unknown"):
+        return None
+    try:
+        row = (await session.execute(text("""
+            SELECT count(*) FROM buildings_full_merge_scanning
+            WHERE btrim(lower(architect)) = btrim(lower(:a))
+        """), {"a": architect})).fetchone()
+    except Exception:
+        return None
+    return int(row[0]) if row and row[0] and int(row[0]) > 1 else None
+
+
 async def _get_raw_chunks_detailed(
     bin_val: str, building_name: Optional[str]
 ) -> tuple[Optional[str], Optional[str], Optional[str]]:
@@ -113,6 +195,8 @@ async def _synthesize_with_grok(
     year_built: Optional[str],
     style: Optional[str],
     architect: Optional[str],
+    block_context: Optional[str] = None,
+    architect_count: Optional[int] = None,
 ) -> Optional[str]:
     """Synthesize raw LPC/Wikipedia chunks into punchy, grounded copy.
 
@@ -170,6 +254,26 @@ async def _synthesize_with_grok(
         f"Building: {meta_line}\n"
         f"Source material:\n{raw_text}"
     )
+
+    # Computed facts, appended separately from the source text so the model can
+    # tell them apart. These are measured from the full city footprint dataset
+    # and our own catalogue — they are TRUE, and no web search could produce
+    # them — but they are only worth a sentence when the contrast is striking.
+    extras = []
+    if block_context:
+        extras.append(f"How it sits on its block (measured, verified): {block_context}.")
+    if architect_count:
+        extras.append(
+            f"This architect has {architect_count} other buildings in Jink's "
+            f"catalogue (say 'in this app' or similar — it is NOT a claim about "
+            f"their whole career)."
+        )
+    if extras:
+        user += (
+            "\n\nAdditional verified facts:\n" + "\n".join(extras) +
+            "\nUse at most ONE of these, and only if it is genuinely surprising. "
+            "Never pad with it."
+        )
     result = None
     if is_configured():
         result = await openai_text(system=system, user=user, max_tokens=300)
@@ -432,7 +536,10 @@ async def generate_building_lore_detailed(
     # 1. Landmark chunks (LPC-sourced, free) — stored on Railway → synthesize
     raw, spec, src = await _get_raw_chunks_detailed(bin_val, building_name)
     if raw:
-        lore = await _synthesize_with_grok(raw, building_name, address, year_built, style, architect)
+        block_ctx = await _get_block_context(session, bin_val)
+        arch_n = await _get_architect_catalogue_count(session, architect)
+        lore = await _synthesize_with_grok(raw, building_name, address, year_built,
+                                           style, architect, block_ctx, arch_n)
         synthesized = bool(lore)
         if not lore:
             lore = raw  # fallback to raw if synthesis fails
@@ -445,7 +552,10 @@ async def generate_building_lore_detailed(
     if building_name or address:
         raw = await _get_lore_from_wikipedia(building_name, address)
         if raw:
-            lore = await _synthesize_with_grok(raw, building_name, address, year_built, style, architect)
+            block_ctx = await _get_block_context(session, bin_val)
+            arch_n = await _get_architect_catalogue_count(session, architect)
+            lore = await _synthesize_with_grok(raw, building_name, address, year_built,
+                                               style, architect, block_ctx, arch_n)
             synthesized = bool(lore)
             if not lore:
                 lore = raw
