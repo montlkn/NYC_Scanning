@@ -32,12 +32,21 @@ async def _get_raw_chunks(bin_val: str, building_name: Optional[str]) -> Optiona
             if railway_db is None:
                 return None
 
-            # Try by BIN first
+            # Try by BIN first. Building-specific chunks MUST outrank
+            # district-level ones: most buildings in a historic district share a
+            # single generic district blurb, so ordering by chunk_index alone
+            # hands every building on the block the same paragraph and the lore
+            # reads identically across a whole neighbourhood.
+            #
+            # BINs are compared with the '.0' suffix stripped — these are stored
+            # numeric-as-text, and an unstripped compare silently matches
+            # nothing.
             result = await railway_db.execute(
                 text("""
                     SELECT chunk_text FROM landmark_chunks
-                    WHERE bin = :bin
-                    ORDER BY chunk_index ASC
+                    WHERE replace(bin, '.0', '') = replace(:bin, '.0', '')
+                    ORDER BY (specificity = 'building') DESC NULLS LAST,
+                             chunk_index ASC
                     LIMIT 3
                 """),
                 {'bin': bin_val}

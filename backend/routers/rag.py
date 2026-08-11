@@ -24,25 +24,58 @@ def get_connection():
 
 @router.get("/search")
 async def search_landmark_chunks(
-    building_name: str = Query(..., description="Building name to search for"),
+    building_name: Optional[str] = Query(None, description="Building name to search for"),
+    bin: Optional[str] = Query(None, description="BIN — exact, and strongly preferred"),
     limit: int = Query(3, description="Max chunks to return"),
 ) -> List[dict]:
     """
-    Search for landmark chunks by building name.
-    Returns historical context from NYC Landmarks Commission reports.
+    Landmark chunks for a building, from NYC Landmarks Commission reports.
+
+    Prefer `bin`. Name matching is a substring ILIKE and measured at only 43%
+    hit rate on a random sample of the catalogue — the misses were name-match
+    failures, not missing corpus, since chunks are BIN-keyed at ingest. Name is
+    kept as a fallback for callers that genuinely have no BIN.
+
+    Building-specific chunks always outrank district-level ones. Most buildings
+    in a historic district share a single generic district blurb, so without
+    that ordering an entire neighbourhood reads identically.
     """
+    if not building_name and not bin:
+        raise HTTPException(status_code=400, detail="bin or building_name required")
     try:
         conn = get_connection()
         cur = conn.cursor()
 
-        # Use ILIKE for case-insensitive partial matching
+        if bin:
+            cur.execute(
+                """
+                SELECT id, building_name, bin, bbl, address, chunk_text,
+                       source_file, page_number, specificity
+                FROM landmark_chunks
+                WHERE replace(bin, '.0', '') = replace(%s, '.0', '')
+                ORDER BY (specificity = 'building') DESC NULLS LAST, chunk_index
+                LIMIT %s
+                """,
+                (bin, limit),
+            )
+            rows = cur.fetchall()
+            if rows:
+                cur.close()
+                conn.close()
+                return [dict(r) for r in rows]
+
+        if not building_name:
+            cur.close()
+            conn.close()
+            return []
+
         cur.execute(
             """
             SELECT id, building_name, bin, bbl, address, chunk_text,
-                   source_file, page_number
+                   source_file, page_number, specificity
             FROM landmark_chunks
             WHERE building_name ILIKE %s
-            ORDER BY chunk_index
+            ORDER BY (specificity = 'building') DESC NULLS LAST, chunk_index
             LIMIT %s
             """,
             (f"%{building_name}%", limit),
@@ -54,6 +87,8 @@ async def search_landmark_chunks(
 
         return [dict(row) for row in rows]
 
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"[RAG] Search error: {e}")
         return []
