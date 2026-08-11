@@ -52,7 +52,7 @@ from psycopg2.extras import execute_batch  # noqa: E402
 from dotenv import load_dotenv  # noqa: E402
 
 from extract_district_entries import (  # noqa: E402
-    detect_format, extract_prose, normalize_street,
+    detect_format, extract, extract_prose, normalize_street,
 )
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
@@ -199,16 +199,28 @@ def main() -> int:
             continue
         try:
             fmt = detect_format(args.tmp)
-            if fmt != "prose":
-                print(f"  skipped: detected {fmt}")
+            if fmt == "prose":
+                entries = [
+                    e for e in extract_prose(args.tmp, name)
+                    if getattr(e, "kind", "building") == "building"
+                    and getattr(e, "confidence", "inline") in ACCEPTED_TIERS
+                    and len(" ".join(e.text_parts)) >= MIN_CHARS
+                ]
+            elif fmt == "legacy":
+                # Marginal-marker reports (LP-0489 Greenwich Village and kin)
+                # resolve by the SAME house-number + street key as prose, so they
+                # belong here rather than in the BBL-keyed modern ingest — which
+                # skips them, leaving ~1,361 Greenwich Village buildings with no
+                # ingest path at all. Their attribution comes from a marker in
+                # the margin, not from sentence position, so there is no
+                # confidence tier to filter on.
+                entries = [
+                    e for e in extract(args.tmp, name)
+                    if len(" ".join(e.text_parts)) >= MIN_CHARS
+                ]
+            else:
+                print(f"  skipped: detected {fmt} (BBL-keyed ingest handles it)")
                 continue
-
-            entries = [
-                e for e in extract_prose(args.tmp, name)
-                if getattr(e, "kind", "building") == "building"
-                and getattr(e, "confidence", "inline") in ACCEPTED_TIERS
-                and len(" ".join(e.text_parts)) >= MIN_CHARS
-            ]
             rows_db = district_addresses(rail, src)
             streets = sorted({e.street for e in entries})
             resolve = build_street_resolver(streets)
