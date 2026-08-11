@@ -372,9 +372,12 @@ async def _synthesize_with_grok(
         )
     if extras:
         user += (
-            "\n\nAdditional verified facts:\n" + "\n".join(extras) +
-            "\nUse at most ONE of these, and only if it is genuinely surprising. "
-            "Never pad with it."
+            "\n\nAdditional verified material:\n" + "\n".join(extras) +
+            "\nYou may use ONE measured fact AND ONE nearby-lore mention — they "
+            "are different kinds of material and do not compete. A single "
+            "'ONE of these' budget made the model always pick the measured "
+            "fact, so the lore never appeared at all. Take either only when it "
+            "genuinely earns its sentence; never pad."
         )
     result = None
     if is_configured():
@@ -684,7 +687,33 @@ async def generate_building_lore_detailed(
             return LoreResult(text=lore, tier="wikipedia", specificity="building",
                               source=None, synthesized=synthesized)
 
-    # 3. Web search from building fields (paid, last resort)
+    # 3. Paid search (last resort). Brave when configured: N literal queries in,
+    # N billed, always. The agentic path it replaces let the MODEL decide how
+    # many searches to run, which reached 13-24 per building and once cost $0.55
+    # for one. Falls back to that path only when no Brave key is set.
+    from services import brave_search
+    if brave_search.is_configured():
+        queries = brave_search.build_queries(building_name, address, architect,
+                                             year_built)
+        results = await brave_search.search(queries)
+        raw = brave_search.as_source_text(results)
+        if raw:
+            block_ctx = await _get_block_context(session, bin_val)
+            arch_n = await _get_architect_catalogue_count(session, architect)
+            near = await _get_nearby_lore(session, bin_val)
+            lore = await _synthesize_with_grok(raw, building_name, address,
+                                               year_built, style, architect,
+                                               block_ctx, arch_n, near)
+            if lore:
+                if cache_to_db:
+                    await _cache_storytelling(session, bin_val, lore)
+                urls = brave_search.source_urls(results)
+                return LoreResult(text=lore, tier="brave_search",
+                                  specificity="building",
+                                  source=urls[0] if urls else None,
+                                  synthesized=True)
+            logger.warning(f"brave results found but synthesis failed for {bin_val}")
+
     lore = await _get_lore_from_grok(building_name, address, year_built, style, architect, materials)
     if lore:
         if cache_to_db:
