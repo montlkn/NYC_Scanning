@@ -20,7 +20,9 @@ from models.config import get_settings
 from models.session import init_db, close_db
 from models.footprints_session import init_footprints_engine, close_footprints_db, footprints_db_ok
 from models.search_session import init_search_engine, close_search_db
-from routers import scan, scan_photo, buildings, stamps, vetting, rag, search, lore
+from routers import (
+    scan, scan_photo, buildings, stamps, vetting, rag, search, lore, websearch,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -239,6 +241,10 @@ app.include_router(vetting.router, prefix="/api", tags=["vetting"])
 app.include_router(rag.router, prefix="/api", tags=["rag"])
 app.include_router(lore.router, prefix="/api", tags=["lore"])
 app.include_router(search.router, prefix="/api", tags=["search"])
+# Same /api/search prefix as above, different routes (POST /sources). Kept in
+# its own module because it is a capped Brave fan-out for CLIENTS, not part of
+# the vector-search ranking stack.
+app.include_router(websearch.router, prefix="/api", tags=["search"])
 
 
 if __name__ == "__main__":
