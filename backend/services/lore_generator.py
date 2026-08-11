@@ -14,6 +14,7 @@ import os
 import logging
 import re
 import httpx
+from dataclasses import dataclass
 from typing import Optional
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,12 +26,22 @@ logger = logging.getLogger(__name__)
 FLOAT_PATTERN = re.compile(r'^\d+\.\d+$')
 
 
-async def _get_raw_chunks(bin_val: str, building_name: Optional[str]) -> Optional[str]:
-    """Query landmark_chunks on Railway for the best available raw text for this building."""
+async def _get_raw_chunks_detailed(
+    bin_val: str, building_name: Optional[str]
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Same lookup as `_get_raw_chunks`, but also reports HOW specific the text
+    is and which report it came from: (text, specificity, source_file).
+
+    `specificity` is 'building' for per-building entries extracted from a
+    designation report, or None for the district-level blurb that is shared
+    across every building in a historic district. Callers need the distinction:
+    district text is legitimate grounding but must never be presented as though
+    it were about this building specifically, and it is the signal for whether
+    the cheap tier actually earned its keep."""
     try:
         async with get_footprints_db() as railway_db:
             if railway_db is None:
-                return None
+                return None, None, None
 
             # Try by BIN first. Building-specific chunks MUST outrank
             # district-level ones: most buildings in a historic district share a
@@ -43,7 +54,8 @@ async def _get_raw_chunks(bin_val: str, building_name: Optional[str]) -> Optiona
             # nothing.
             result = await railway_db.execute(
                 text("""
-                    SELECT chunk_text FROM landmark_chunks
+                    SELECT chunk_text, specificity, source_file
+                    FROM landmark_chunks
                     WHERE replace(bin, '.0', '') = replace(:bin, '.0', '')
                     ORDER BY (specificity = 'building') DESC NULLS LAST,
                              chunk_index ASC
@@ -57,9 +69,11 @@ async def _get_raw_chunks(bin_val: str, building_name: Optional[str]) -> Optiona
             if not rows and building_name:
                 result = await railway_db.execute(
                     text("""
-                        SELECT chunk_text FROM landmark_chunks
+                        SELECT chunk_text, specificity, source_file
+                        FROM landmark_chunks
                         WHERE source_file ILIKE :name
-                        ORDER BY chunk_index ASC
+                        ORDER BY (specificity = 'building') DESC NULLS LAST,
+                                 chunk_index ASC
                         LIMIT 3
                     """),
                     {'name': f'%{building_name.strip()}%'}
@@ -67,17 +81,29 @@ async def _get_raw_chunks(bin_val: str, building_name: Optional[str]) -> Optiona
                 rows = result.fetchall()
 
         if not rows:
-            return None
+            return None, None, None
 
-        chunks = [r[0] for r in rows if r[0]]
+        # Only mix chunks of the SAME specificity. Concatenating a building's own
+        # record with the district blurb lets the model attribute district-wide
+        # description to this building, which is exactly the failure the
+        # specificity split exists to prevent.
+        top_spec = rows[0][1]
+        chosen = [r for r in rows if r[1] == top_spec]
+        chunks = [r[0] for r in chosen if r[0]]
         combined = '\n\n'.join(chunks)
         if len(combined) > 3000:
             combined = combined[:3000].rsplit(' ', 1)[0] + '…'
-        return combined
+        return combined, top_spec, chosen[0][2]
 
     except Exception as e:
         logger.warning(f"landmark_chunks lookup failed for BIN {bin_val}: {e}")
-        return None
+        return None, None, None
+
+
+async def _get_raw_chunks(bin_val: str, building_name: Optional[str]) -> Optional[str]:
+    """Back-compat wrapper: text only."""
+    text_, _spec, _src = await _get_raw_chunks_detailed(bin_val, building_name)
+    return text_
 
 
 async def _synthesize_with_grok(
@@ -340,6 +366,78 @@ async def _reindex_building(session: AsyncSession, bin_val: str):
         logger.warning(f"Search re-index skipped for BIN {bin_val}: {e}")
 
 
+@dataclass
+class LoreResult:
+    """Lore plus the provenance needed to render honest citations and to measure
+    how often each tier actually fires.
+
+    `tier` is the whole point. Tier 3 is the only one that costs money (agentic
+    web search, measured at $0.09-0.55 per building with a long tail), so the
+    tier-3 rate across real traffic is the number that decides whether a
+    dedicated search provider is worth adding. Nothing else can tell us that.
+    """
+    text: str
+    tier: str                      # landmark_chunks | wikipedia | web_search
+    specificity: Optional[str]     # 'building' | None (district-level)
+    source: Optional[str]          # report URL / article / None
+    synthesized: bool              # False when raw source text was served as-is
+
+
+async def generate_building_lore_detailed(
+    session: AsyncSession,
+    bin_val: str,
+    building_name: Optional[str] = None,
+    address: Optional[str] = None,
+    year_built: Optional[str] = None,
+    style: Optional[str] = None,
+    architect: Optional[str] = None,
+    materials: Optional[str] = None,
+    cache_to_db: bool = True
+) -> Optional[LoreResult]:
+    """
+    Generate or retrieve building lore via a three-tier fallback chain, and say
+    which tier answered.
+
+    Tier order is by cost, cheapest first: LPC designation reports (free, and
+    the best-grounded source we have) → Wikipedia (free) → web search (paid,
+    last resort).
+    """
+    # 1. Landmark chunks (LPC-sourced, free) — stored on Railway → synthesize
+    raw, spec, src = await _get_raw_chunks_detailed(bin_val, building_name)
+    if raw:
+        lore = await _synthesize_with_grok(raw, building_name, address, year_built, style, architect)
+        synthesized = bool(lore)
+        if not lore:
+            lore = raw  # fallback to raw if synthesis fails
+        if cache_to_db:
+            await _cache_storytelling(session, bin_val, lore)
+        return LoreResult(text=lore, tier="landmark_chunks", specificity=spec,
+                          source=src, synthesized=synthesized)
+
+    # 2. Wikipedia (free, no key) — tries name then address → synthesize
+    if building_name or address:
+        raw = await _get_lore_from_wikipedia(building_name, address)
+        if raw:
+            lore = await _synthesize_with_grok(raw, building_name, address, year_built, style, architect)
+            synthesized = bool(lore)
+            if not lore:
+                lore = raw
+            if cache_to_db:
+                await _cache_storytelling(session, bin_val, lore)
+            return LoreResult(text=lore, tier="wikipedia", specificity="building",
+                              source=None, synthesized=synthesized)
+
+    # 3. Web search from building fields (paid, last resort)
+    lore = await _get_lore_from_grok(building_name, address, year_built, style, architect, materials)
+    if lore:
+        if cache_to_db:
+            await _cache_storytelling(session, bin_val, lore)
+        return LoreResult(text=lore, tier="web_search", specificity="building",
+                          source=None, synthesized=True)
+
+    return None
+
+
 async def generate_building_lore(
     session: AsyncSession,
     bin_val: str,
@@ -351,38 +449,9 @@ async def generate_building_lore(
     materials: Optional[str] = None,
     cache_to_db: bool = True
 ) -> Optional[str]:
-    """
-    Generate or retrieve building lore via a three-tier fallback chain.
-
-    Returns lore string or None if all sources fail.
-    Caches result back to DB by default so next scan is instant.
-    """
-    # 1. Landmark chunks (LPC-sourced, free) — stored on Railway → synthesize with Grok
-    raw = await _get_raw_chunks(bin_val, building_name)
-    if raw:
-        lore = await _synthesize_with_grok(raw, building_name, address, year_built, style, architect)
-        if not lore:
-            lore = raw  # fallback to raw if synthesis fails
-        if cache_to_db:
-            await _cache_storytelling(session, bin_val, lore)
-        return lore
-
-    # 2. Wikipedia (free, no key) — tries name then address → synthesize
-    if building_name or address:
-        raw = await _get_lore_from_wikipedia(building_name, address)
-        if raw:
-            lore = await _synthesize_with_grok(raw, building_name, address, year_built, style, architect)
-            if not lore:
-                lore = raw
-            if cache_to_db:
-                await _cache_storytelling(session, bin_val, lore)
-            return lore
-
-    # 3. Grok generation from building fields + web search (pure generation, last resort)
-    lore = await _get_lore_from_grok(building_name, address, year_built, style, architect, materials)
-    if lore:
-        if cache_to_db:
-            await _cache_storytelling(session, bin_val, lore)
-        return lore
-
-    return None
+    """Back-compat wrapper returning just the lore string."""
+    res = await generate_building_lore_detailed(
+        session, bin_val, building_name, address, year_built, style,
+        architect, materials, cache_to_db
+    )
+    return res.text if res else None

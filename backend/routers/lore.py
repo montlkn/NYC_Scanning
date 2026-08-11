@@ -1,0 +1,117 @@
+"""
+Lore Router — building lore via the tiered chain, cheapest source first.
+
+Why this exists
+───────────────
+`services/lore_generator.generate_building_lore` implements a three-tier chain
+(LPC designation reports → Wikipedia → paid web search) but nothing called it:
+the scan router's two call sites were removed with the matching-pipeline
+cleanup, leaving it dead code. Meanwhile the iOS client generates lore by
+calling an agentic web-search model directly for EVERY building — the most
+expensive tier, unconditionally, even for the ~13k buildings whose designation
+report we already hold.
+
+This endpoint puts the chain back in front of that path.
+
+Provenance is returned alongside the text on purpose:
+  * `tier` — which source answered. Only `web_search` costs money, so the
+    tier-3 rate over real traffic is the measurement that decides whether a
+    dedicated search provider is worth adding.
+  * `specificity` — 'building' means the text is about THIS building; null
+    means it is the district-level blurb shared by every building in the
+    historic district. The client must not present the latter as though it
+    were specific, and the distinction is invisible in the prose itself.
+"""
+
+import logging
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import text as sql_text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from models.session import get_db
+from services.lore_generator import generate_building_lore_detailed
+
+router = APIRouter(prefix="/lore", tags=["lore"])
+logger = logging.getLogger(__name__)
+
+
+@router.get("/{bin_val}")
+async def get_building_lore(
+    bin_val: str,
+    refresh: bool = Query(False, description="Bypass the cached storytelling column"),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """
+    Lore for one building, by BIN.
+
+    Serves the cached `storytelling` column when present unless `refresh=true`,
+    otherwise runs the tier chain and caches the result.
+    """
+    # BINs are stored numeric-as-text and reach us with a '.0' suffix from
+    # several callers; normalise once here so every lookup below agrees.
+    bin_clean = (bin_val or "").replace(".0", "").strip()
+    if not bin_clean.isdigit():
+        raise HTTPException(status_code=400, detail="bin must be numeric")
+
+    try:
+        row = (await db.execute(sql_text("""
+            SELECT building_name, address, year_built, style, architect,
+                   mat_primary, storytelling
+            FROM buildings_full_merge_scanning
+            WHERE replace(bin, '.0', '') = :bin
+            LIMIT 1
+        """), {"bin": bin_clean})).fetchone()
+    except Exception as e:
+        logger.warning(f"lore lookup failed for BIN {bin_clean}: {e}")
+        raise HTTPException(status_code=503, detail="building lookup unavailable")
+
+    if not row:
+        raise HTTPException(status_code=404, detail="building not found")
+
+    name, address, year_built, style, architect, materials, cached = row
+
+    if cached and not refresh:
+        return {
+            "bin": bin_clean,
+            "lore": cached,
+            "tier": "cache",
+            "specificity": None,
+            "source": None,
+            "synthesized": True,
+        }
+
+    result = await generate_building_lore_detailed(
+        db, bin_clean,
+        building_name=name,
+        address=address,
+        year_built=str(year_built) if year_built is not None else None,
+        style=style,
+        architect=architect,
+        materials=materials,
+    )
+    if not result:
+        # Every tier declined. That is a real outcome, not an error — the
+        # client shows the building without lore rather than a failure state.
+        return {
+            "bin": bin_clean,
+            "lore": None,
+            "tier": None,
+            "specificity": None,
+            "source": None,
+            "synthesized": False,
+        }
+
+    logger.info(
+        f"[LORE] bin={bin_clean} tier={result.tier} "
+        f"specificity={result.specificity} synthesized={result.synthesized}"
+    )
+    return {
+        "bin": bin_clean,
+        "lore": result.text,
+        "tier": result.tier,
+        "specificity": result.specificity,
+        "source": result.source,
+        "synthesized": result.synthesized,
+    }
