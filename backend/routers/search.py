@@ -6,7 +6,7 @@ by cosine distance with optional era/geo filters. Returns BINs + score + snippet
 the iOS app hydrates full building rows from Supabase by BIN.
 
 This is vector SEARCH (ranking) — NOT lore RAG. Lore generation stays
-client-side Grok web-search; see routers/rag.py for the separate lore-grounding
+client-side; see routers/rag.py for the separate lore-grounding
 retrieval (Phase 2b).
 """
 
@@ -21,7 +21,7 @@ from sqlalchemy import text
 
 from models.search_session import get_search_db
 from services.text_embeddings import embed_query
-from services.grok import grok_text
+from services.openai_text import openai_text
 from services.unified_search import (
     HARD_RADIUS_INTENTS,
     RankedHit,
@@ -1142,10 +1142,10 @@ async def _leg_layers_vector_only(
 
 
 # ---------------------------------------------------------------------------
-# Grok interpretation cache — prose-intent only, OFF the response critical
+# Query-interpretation cache — prose-intent only, OFF the response critical
 # path. Synchronous cache CHECK (fast SELECT); on miss we return without it
 # and write the interpretation in a background task so the NEXT identical
-# query benefits. See services/grok.py::grok_text.
+# query benefits. See services/openai_text.py::openai_text.
 # ---------------------------------------------------------------------------
 
 async def _get_cached_interpretation(q: str) -> Optional[dict]:
@@ -1165,11 +1165,17 @@ async def _get_cached_interpretation(q: str) -> Optional[dict]:
 
 
 async def _refine_and_cache_interpretation(q: str) -> None:
-    """Background task: ask Grok to expand era/style hints for a prose query,
-    then cache the interpretation for next time. Never raises into the caller
-    (it's fire-and-forget via asyncio.create_task)."""
+    """Background task: expand era/style hints for a prose query, then cache the
+    interpretation for next time. Never raises into the caller (it's
+    fire-and-forget via asyncio.create_task)."""
     try:
-        raw = await grok_text(
+        # 600, not the old 150. `max_output_tokens` on a reasoning model is a
+        # budget the reasoning pass draws from FIRST, so a tight cap truncates
+        # the JSON — and truncated JSON fails the parse below and is discarded,
+        # meaning the cache would simply never populate and every query would
+        # pay the miss forever. The answer here is ~50 tokens; the headroom is
+        # what guarantees it survives.
+        raw = await openai_text(
             system=(
                 "You expand a natural-language NYC-architecture search query into "
                 "structured filter hints. Reply with compact JSON only: "
@@ -1177,9 +1183,8 @@ async def _refine_and_cache_interpretation(q: str) -> None:
                 "No prose, no markdown fences."
             ),
             user=q,
-            max_tokens=150,
-            temperature=0.2,
-            search_enabled=False,
+            max_tokens=600,
+            cache_key="jink-search-interp",
         )
         if not raw:
             return
@@ -1187,7 +1192,7 @@ async def _refine_and_cache_interpretation(q: str) -> None:
         try:
             interpretation = json.loads(raw)
         except Exception:
-            logger.info(f"[unified] Grok interpretation not valid JSON, discarding: {raw[:120]}")
+            logger.info(f"[unified] interpretation not valid JSON, discarding: {raw[:120]}")
             return
 
         async with get_search_db() as db:
@@ -1203,7 +1208,7 @@ async def _refine_and_cache_interpretation(q: str) -> None:
             )
             await db.commit()
     except Exception as e:
-        logger.info(f"[unified] background Grok interpretation refine skipped: {e}")
+        logger.info(f"[unified] background interpretation refine skipped: {e}")
 
 
 async def _log_query(q: str, intent: str, latency_ms: float, result_ids: List[str]) -> None:

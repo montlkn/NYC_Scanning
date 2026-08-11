@@ -1,10 +1,19 @@
 """
 Lore Generator — on-the-fly building description fallback.
 
-Priority chain for a building with no storytelling:
-  1. landmark_chunks table (free, fast, LPC-sourced)
-  2. Wikipedia REST API (free, no key)
-  3. Gemini generation from building fields (API call, cached to DB)
+Priority chain for a building with no storytelling, cheapest first. Every tier
+that produces prose runs it through gpt-5.6-luna with NO tools attached; the
+only tier that touches the open web is 3, where the query count is a constant
+we set rather than a number a model chooses.
+
+  1. landmark_chunks table   (free — LPC designation reports, best-grounded)
+  2. Wikipedia REST API      (free, no key)
+  3. Brave web search        (paid, capped at brave_search.MAX_QUERIES)
+  4. fields-only description (no research; states what the DB already holds)
+
+Tiers 3 and 4 both degrade silently when their key is missing, so `main.py`
+logs the configuration state at startup. See `services/openai_text.py` for why
+no tool is ever attached to the synthesis call.
 
 Usage:
     lore = await generate_building_lore(session, bin_val, building_name, ...)
@@ -309,7 +318,7 @@ async def _get_raw_chunks(bin_val: str, building_name: Optional[str]) -> Optiona
     return text_
 
 
-async def _synthesize_with_grok(
+async def _synthesize(
     raw_text: str,
     building_name: Optional[str],
     address: Optional[str],
@@ -320,17 +329,16 @@ async def _synthesize_with_grok(
     architect_count: Optional[int] = None,
     nearby_lore: Optional[str] = None,
 ) -> Optional[str]:
-    """Synthesize raw LPC/Wikipedia chunks into punchy, grounded copy.
+    """Synthesize raw LPC/Wikipedia/Brave source text into punchy, grounded copy.
 
-    Runs on gpt-5.6-luna when OPENAI_API_KEY is set, falling back to Grok
-    otherwise. Synthesis is rewriting, not researching — the facts arrive as
-    source text — so it belongs on the cheapest capable model.
+    Runs on gpt-5.6-luna. Synthesis is rewriting, not researching — the facts
+    arrive as source text — so it belongs on the cheapest capable model, with
+    no tools attached.
 
-    Note the Grok fallback passes `search_enabled=False`. It defaults to True,
-    which meant tier-1 synthesis over already-free LPC text was still asking a
-    model to run live web search, defeating the point of the cheap tier."""
-    from services.grok import grok_text
-    from services.openai_text import openai_text, is_configured
+    Returns None when OPENAI_API_KEY is unset. Callers must treat that as "no
+    lore" rather than substituting raw source: a designation report opens with
+    hearing boilerplate in OCR'd typescript, and this result CACHES."""
+    from services.openai_text import openai_text
 
     meta_parts = []
     if building_name and building_name != '0':
@@ -408,31 +416,30 @@ async def _synthesize_with_grok(
             "fact, so the lore never appeared at all. Take either only when it "
             "genuinely earns its sentence; never pad."
         )
-    result = None
-    if is_configured():
-        result = await openai_text(system=system, user=user, max_tokens=1200)
-        if _is_complete(result):
-            logger.info(f"luna synthesised lore for '{building_name or address}'")
-            return result.strip()
-        if result:
-            logger.warning(
-                f"luna returned truncated lore ({len(result)} chars) for "
-                f"'{building_name or address}'; falling back"
-            )
-
-    # Fallback: Grok, explicitly WITHOUT search. The source text is already in
-    # the prompt; a search here would bill the expensive path to restate facts
-    # we already hold.
-    result = await grok_text(system=system, user=user, max_tokens=400,
-                             temperature=0.3, search_enabled=False)
+    subject = building_name or address
+    result = await openai_text(system=system, user=user, max_tokens=1200)
     if _is_complete(result):
-        logger.info(f"Grok synthesised lore for '{building_name or address}'")
+        logger.info(f"luna synthesised lore for '{subject}'")
         return result.strip()
+
+    # Truncation used to fall through to Grok at a SMALLER budget, which could
+    # only truncate again — it papered over the failure rather than fixing it.
+    # The real cause is that `max_output_tokens` covers reasoning tokens too, so
+    # the fix is more headroom, not another model. One retry only: a second
+    # truncation means the prompt is wrong, and retrying forever would bill for
+    # it. Returning None is safe — the caller falls to the next tier and nothing
+    # incomplete is ever cached.
+    if result:
+        logger.warning(
+            f"luna returned truncated lore ({len(result)} chars) for "
+            f"'{subject}'; retrying with a larger output budget"
+        )
+        result = await openai_text(system=system, user=user, max_tokens=2400)
+        if _is_complete(result):
+            logger.info(f"luna synthesised lore for '{subject}' on retry")
+            return result.strip()
+        logger.warning(f"luna still truncated for '{subject}'; giving up")
     return None
-
-
-# Back-compat alias — old callers still use _synthesize_with_gemini name.
-_synthesize_with_gemini = _synthesize_with_grok
 
 
 async def _wikipedia_fetch(query: str) -> Optional[str]:
@@ -481,7 +488,7 @@ async def _get_lore_from_wikipedia(
     return None
 
 
-async def _get_lore_from_grok(
+async def _describe_from_fields(
     building_name: Optional[str],
     address: Optional[str],
     year_built: Optional[str],
@@ -489,11 +496,26 @@ async def _get_lore_from_grok(
     architect: Optional[str],
     materials: Optional[str],
 ) -> Optional[str]:
-    """Use Grok (with web search) to generate grounded lore from building fields.
-    Last-resort fallback when no LPC chunks and no Wikipedia hit existed.
-    Search is enabled so Grok can verify named tenants, recent history, etc.
+    """Last resort: describe the building from the DB fields we already hold.
+
+    This used to be Grok with `search_enabled=True` — an AGENTIC search where the
+    model chose how many queries to run. That is the path that reached 13–24
+    searches on one building and once billed $0.55, and replacing it is the whole
+    reason the Brave tier above exists. Restoring search here in any form would
+    re-open exactly that leak, one tier lower and less visibly.
+
+    So this tier no longer discovers anything. It states what the database
+    already knows, in the app's voice. That is a real reduction in reach:
+    a building with no designation report, no Wikipedia article, and no Brave
+    result now gets a description rather than researched history. The trade is
+    deliberate — an uncapped bill for the long tail was the thing we were
+    actually paying for, and the tail is where agentic search performed worst
+    (nothing to find, so it searched hardest).
+
+    The prompt therefore forbids implying research happened. Without that, a
+    model handed six fields and asked for "punchy" prose invents a tenant.
     """
-    from services.grok import grok_text
+    from services.openai_text import openai_text
 
     fields = []
     if building_name and building_name != '0':
@@ -513,31 +535,30 @@ async def _get_lore_from_grok(
 
     system = (
         "You are an architecture writer for Jink, a NYC discovery app. Write "
-        "in the voice of a knowledgeable friend, not a textbook. Strict "
-        "grounding rules: every factual claim must come from the building "
-        "fields below or a verifiable web search of THIS specific address. "
-        "Do not invent names, dates, events, or details. If after searching "
-        "you find nothing specific, write a concise description using only "
-        "the verified fields — no filler.\n\n"
+        "in the voice of a knowledgeable friend, not a textbook.\n\n"
+        "You have NO web access and NO sources beyond the fields given below. "
+        "Every factual claim must come from those fields. Do not invent or "
+        "infer names, dates, events, tenants, architects, or history — not even "
+        "plausible ones. Do not imply you researched anything.\n\n"
+        "If the fields are thin, write less. Two accurate sentences beat four "
+        "padded ones. Describing what a style and era MEAN in general terms is "
+        "allowed and encouraged; asserting anything specific that is not in the "
+        "fields is not.\n\n"
         "Hard bans: 'rose amid', 'quiet sentinel', 'bustling streets', "
         "'whisper of jazz', 'sentinel on a street', 'time capsule', "
         "'frozen in time'. No clichés. No markdown."
     )
     user = (
-        "Write 3-4 punchy sentences about this NYC building. Search the web "
-        "to find documented history of this exact address. Only state facts "
-        "you can ground in the fields or a verified web source.\n\n"
+        "Write 2-4 punchy sentences about this NYC building, using ONLY the "
+        "fields below.\n\n"
         + '\n'.join(fields)
     )
-    result = await grok_text(system=system, user=user, max_tokens=300, temperature=0.3)
-    if result and len(result) > 30:
-        logger.info(f"Grok generated lore for '{building_name or address}'")
+    result = await openai_text(system=system, user=user, max_tokens=900,
+                               cache_key="jink-lore-fields")
+    if _is_complete(result):
+        logger.info(f"luna described '{building_name or address}' from fields")
         return result.strip()
     return None
-
-
-# Back-compat alias — old callers still use _get_lore_from_gemini name.
-_get_lore_from_gemini = _get_lore_from_grok
 
 
 async def _cache_storytelling(session: AsyncSession, bin_val: str, lore: str):
@@ -641,10 +662,14 @@ class LoreResult:
     """Lore plus the provenance needed to render honest citations and to measure
     how often each tier actually fires.
 
-    `tier` is the whole point. Tier 3 is the only one that costs money (agentic
-    web search, measured at $0.09-0.55 per building with a long tail), so the
-    tier-3 rate across real traffic is the number that decides whether a
-    dedicated search provider is worth adding. Nothing else can tell us that.
+    `tier` is the whole point. Tier 3 (`brave_search`) is the only one that
+    costs anything beyond tokens, and its price is now a constant we set rather
+    than a number a model chose — the agentic path it replaced measured
+    $0.09-0.55 per building with a long tail. The tier-3 rate across real
+    traffic is what decides whether the search subscription earns its keep, and
+    the tier-4 (`fields_only`) rate is what it costs in reach: those are the
+    buildings that get a description instead of history. Nothing else can tell
+    us either number.
     """
     text: str
     tier: str                      # landmark_chunks | wikipedia | web_search
@@ -678,7 +703,7 @@ async def generate_building_lore_detailed(
         block_ctx = await _get_block_context(session, bin_val)
         arch_n = await _get_architect_catalogue_count(session, architect)
         near = await _get_nearby_lore(session, bin_val)
-        lore = await _synthesize_with_grok(raw, building_name, address, year_built,
+        lore = await _synthesize(raw, building_name, address, year_built,
                                            style, architect, block_ctx, arch_n, near)
         if lore:
             if cache_to_db:
@@ -703,7 +728,7 @@ async def generate_building_lore_detailed(
             block_ctx = await _get_block_context(session, bin_val)
             arch_n = await _get_architect_catalogue_count(session, architect)
             near = await _get_nearby_lore(session, bin_val)
-            lore = await _synthesize_with_grok(raw, building_name, address, year_built,
+            lore = await _synthesize(raw, building_name, address, year_built,
                                                style, architect, block_ctx, arch_n, near)
             # A Wikipedia extract is at least written prose, so serving it raw is
             # tolerable where raw LPC typescript is not. It is still marked
@@ -716,11 +741,21 @@ async def generate_building_lore_detailed(
             return LoreResult(text=lore, tier="wikipedia", specificity="building",
                               source=None, synthesized=synthesized)
 
-    # 3. Paid search (last resort). Brave when configured: N literal queries in,
-    # N billed, always. The agentic path it replaces let the MODEL decide how
-    # many searches to run, which reached 13-24 per building and once cost $0.55
-    # for one. Falls back to that path only when no Brave key is set.
+    # 3. Paid search — the ONLY tier that hits the open web, and the only one
+    # that costs money beyond tokens. N literal queries in, N billed, always.
+    # The agentic path this replaced let the MODEL decide how many searches to
+    # run, which reached 13-24 per building and once cost $0.55 for one.
+    #
+    # When no Brave key is set this tier is SKIPPED SILENTLY and the chain drops
+    # to a fields-only description. That is a quiet loss of reach, so the miss
+    # is logged — an unconfigured key used to be indistinguishable from a
+    # building the web simply had nothing on.
     from services import brave_search
+    if not brave_search.is_configured():
+        logger.warning(
+            f"BRAVE_API_KEY not set — skipping web tier for BIN {bin_val}; "
+            f"falling through to a fields-only description"
+        )
     if brave_search.is_configured():
         cats = await _get_lore_categories()
         queries = brave_search.build_queries(building_name, address, architect,
@@ -731,7 +766,7 @@ async def generate_building_lore_detailed(
             block_ctx = await _get_block_context(session, bin_val)
             arch_n = await _get_architect_catalogue_count(session, architect)
             near = await _get_nearby_lore(session, bin_val)
-            lore = await _synthesize_with_grok(raw, building_name, address,
+            lore = await _synthesize(raw, building_name, address,
                                                year_built, style, architect,
                                                block_ctx, arch_n, near)
             if lore:
@@ -744,11 +779,16 @@ async def generate_building_lore_detailed(
                                   synthesized=True)
             logger.warning(f"brave results found but synthesis failed for {bin_val}")
 
-    lore = await _get_lore_from_grok(building_name, address, year_built, style, architect, materials)
+    # 4. Fields only. Named `fields_only`, not `web_search`, because it no
+    # longer searches anything — the old name would have kept reporting web
+    # coverage the chain had stopped providing, and `tier` is the metric the
+    # spend decision rests on.
+    lore = await _describe_from_fields(building_name, address, year_built,
+                                       style, architect, materials)
     if lore:
         if cache_to_db:
             await _cache_storytelling(session, bin_val, lore)
-        return LoreResult(text=lore, tier="web_search", specificity="building",
+        return LoreResult(text=lore, tier="fields_only", specificity="building",
                           source=None, synthesized=True)
 
     return None

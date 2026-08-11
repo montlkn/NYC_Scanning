@@ -3,8 +3,9 @@ Lore Router — building lore via the tiered chain, cheapest source first.
 
 Why this exists
 ───────────────
-`services/lore_generator.generate_building_lore` implements a three-tier chain
-(LPC designation reports → Wikipedia → paid web search) but nothing called it:
+`services/lore_generator.generate_building_lore` implements a four-tier chain
+(LPC designation reports → Wikipedia → capped Brave search → fields-only) but
+nothing called it:
 the scan router's two call sites were removed with the matching-pipeline
 cleanup, leaving it dead code. Meanwhile the iOS client generates lore by
 calling an agentic web-search model directly for EVERY building — the most
@@ -14,9 +15,11 @@ report we already hold.
 This endpoint puts the chain back in front of that path.
 
 Provenance is returned alongside the text on purpose:
-  * `tier` — which source answered. Only `web_search` costs money, so the
-    tier-3 rate over real traffic is the measurement that decides whether a
-    dedicated search provider is worth adding.
+  * `tier` — which source answered: `landmark_chunks` | `wikipedia` |
+    `brave_search` | `fields_only` | `cache`. Only `brave_search` costs money
+    beyond tokens, so its rate over real traffic decides whether the search
+    subscription earns its keep; the `fields_only` rate is the matching cost in
+    reach, since those buildings get a description rather than history.
   * `specificity` — 'building' means the text is about THIS building; null
     means it is the district-level blurb shared by every building in the
     historic district. The client must not present the latter as though it

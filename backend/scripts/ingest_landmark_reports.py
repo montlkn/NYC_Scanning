@@ -3,7 +3,8 @@
 Ingest NYC LPC designation report PDFs into the `landmark_chunks` table so the
 lore chain's tier-1 (BIN-keyed LPC retrieval in services/lore_generator.py) has
 a corpus to read. Today `landmark_chunks` is EMPTY, so tier-1 never fires and
-every building falls through to Wikipedia/Grok.
+every building falls through to Wikipedia, then Brave, then a fields-only
+description.
 
 How it works — no scraping, no manual collection:
   1. Read every designated landmark (BIN + lp_number) from the BUILDINGS Supabase
@@ -67,7 +68,7 @@ _NL = re.compile(r"\n{3,}")
 # pypdf splits letters across the two-column LPC layout ("La ndmarks"). Collapse
 # runs of single spaces inside words conservatively: join a lone space between
 # two word chars only when it produces no real word boundary loss is hard to do
-# perfectly — so we just normalize whitespace and let Grok synthesis clean the
+# perfectly — so we just normalize whitespace and let the synthesis pass clean the
 # rest (it already handles raw LPC text in lore_generator).
 
 
@@ -179,7 +180,7 @@ def connect_rail(rail_url: str):
     """One long-lived connection with TCP keepalives — the ingest makes thousands
     of small writes over minutes, and a connect-per-write to Railway times out
     (66.33.22.250 dropped mid-run). Keepalives hold the socket open across the
-    slow PDF-fetch / Grok-synthesis gaps between writes."""
+    slow PDF-fetch / synthesis gaps between writes."""
     return psycopg.connect(
         rail_url, connect_timeout=15, keepalives=1,
         keepalives_idle=30, keepalives_interval=10, keepalives_count=5,
@@ -279,7 +280,7 @@ async def synthesize_district_blurb(name: str, raw_chunks: list[str]) -> str | N
     distill ONE clean 3-4 sentence blurb per district and fan that — accurate
     district context for every building inside it, no per-BIN duplication.
     Run once per district (~160 calls)."""
-    from services.grok import grok_text
+    from services.openai_text import openai_text
 
     # Use the front matter (designation rationale lives near the top) plus a
     # mid-report sample, trimmed — skip the boundary survey tail.
@@ -299,7 +300,12 @@ async def synthesize_district_blurb(name: str, raw_chunks: list[str]) -> str | N
         "designation list numbers."
     )
     user = f"Historic District: {name}\n\nSource material:\n{source}"
-    result = await grok_text(system=system, user=user, max_tokens=260, temperature=0.3)
+    # 900, not 260: reasoning tokens are drawn from this budget before the prose
+    # is. A blurb truncated here is worse than one missing, because it fans out
+    # to every BIN in the district — one bad generation becomes thousands of
+    # bad rows.
+    result = await openai_text(system=system, user=user, max_tokens=900,
+                               cache_key="jink-district-blurb")
     return result.strip() if result and len(result) > 40 else None
 
 

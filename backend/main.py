@@ -66,6 +66,24 @@ async def lifespan(app: FastAPI):
     logger.info(f"Environment: {settings.env}")
     logger.info(f"Debug Mode: {settings.debug}")
 
+    # Say which external providers are actually wired up. Both of these gate
+    # their features on a bare `if key:` and skip silently when unset, so a
+    # missing variable produces a 200 with an empty field rather than an error.
+    # That is indistinguishable from "this building has no lore" over HTTP, and
+    # it cost a full debugging session to tell apart. The deploy log now answers
+    # it directly.
+    from services.openai_text import assert_configured as _assert_llm
+    from services import brave_search as _brave
+    _assert_llm()
+    if _brave.is_configured():
+        logger.info(f"[SEARCH] brave configured, max {_brave.MAX_QUERIES} queries/building")
+    else:
+        logger.warning(
+            "[SEARCH] BRAVE_API_KEY is NOT set — the web tier is disabled; "
+            "buildings with no LPC report or Wikipedia article fall back to a "
+            "fields-only description."
+        )
+
     # Initialize database connection
     logger.info("Initializing database connection...")
     await init_db()
