@@ -760,7 +760,9 @@ async def generate_building_lore_detailed(
         cats = await _get_lore_categories()
         queries = brave_search.build_queries(building_name, address, architect,
                                              year_built, categories=cats)
-        results = await brave_search.search(queries)
+        results = brave_search.filter_relevant(
+            await brave_search.search(queries), building_name, address,
+        )
         raw = brave_search.as_source_text(results)
         if raw:
             block_ctx = await _get_block_context(session, bin_val)

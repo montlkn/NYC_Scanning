@@ -87,7 +87,9 @@ async def get_sources(req: SourcesRequest) -> SourcesResponse:
         req.building_name, req.address, req.architect,
         req.year_built, categories=req.categories,
     )
-    results = await brave_search.search(queries)
+    results = brave_search.filter_relevant(
+        await brave_search.search(queries), req.building_name, req.address,
+    )
     return SourcesResponse(
         source_text=brave_search.as_source_text(results),
         sources=brave_search.source_urls(results),
