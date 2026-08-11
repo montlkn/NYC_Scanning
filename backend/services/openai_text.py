@@ -41,12 +41,19 @@ async def openai_text(
     *,
     system: str,
     user: str,
-    max_tokens: int = 300,
+    max_tokens: int = 1200,
     timeout_s: float = 30.0,
 ) -> Optional[str]:
     """Text in, text out. No tools, so no search is ever billed.
 
     `temperature` is deliberately absent: GPT-5.x reasoning models reject it.
+
+    `max_tokens` maps to `max_output_tokens`, which on a reasoning model covers
+    REASONING TOKENS TOO — they are spent first. At 300 the reasoning pass ate
+    the budget and the prose was cut mid-sentence ("At 1,454 feet tall including
+    its"), which then cached. The default is sized so a ~300-token answer still
+    fits after reasoning; at $1.20/1M output the headroom costs a fraction of a
+    cent and buys a complete sentence.
     """
     if not OPENAI_API_KEY:
         return None

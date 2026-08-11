@@ -26,6 +26,21 @@ logger = logging.getLogger(__name__)
 FLOAT_PATTERN = re.compile(r'^\d+\.\d+$')
 
 
+def _is_complete(text: Optional[str]) -> bool:
+    """Reject a truncated generation before it can be cached.
+
+    The old gate was `len(result) > 30`, which passed a 32-character fragment —
+    "At 1,454 feet tall including its" — straight into the storytelling column,
+    where it is served forever as that building's story. A cut-off generation is
+    indistinguishable from a good one by length alone, so require a closing
+    sentence mark as well. Cheaper to regenerate than to cache a fragment.
+    """
+    if not text:
+        return False
+    t = text.strip()
+    return len(t) >= 120 and t[-1] in '.!?"”’'
+
+
 async def _get_block_context(session: AsyncSession, bin_val: str) -> Optional[str]:
     """Computed facts about how this building sits among its ACTUAL neighbours.
 
@@ -276,17 +291,22 @@ async def _synthesize_with_grok(
         )
     result = None
     if is_configured():
-        result = await openai_text(system=system, user=user, max_tokens=300)
-        if result and len(result) > 30:
+        result = await openai_text(system=system, user=user, max_tokens=1200)
+        if _is_complete(result):
             logger.info(f"luna synthesised lore for '{building_name or address}'")
             return result.strip()
+        if result:
+            logger.warning(
+                f"luna returned truncated lore ({len(result)} chars) for "
+                f"'{building_name or address}'; falling back"
+            )
 
     # Fallback: Grok, explicitly WITHOUT search. The source text is already in
     # the prompt; a search here would bill the expensive path to restate facts
     # we already hold.
-    result = await grok_text(system=system, user=user, max_tokens=300,
+    result = await grok_text(system=system, user=user, max_tokens=400,
                              temperature=0.3, search_enabled=False)
-    if result and len(result) > 30:
+    if _is_complete(result):
         logger.info(f"Grok synthesised lore for '{building_name or address}'")
         return result.strip()
     return None
