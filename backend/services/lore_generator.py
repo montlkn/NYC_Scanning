@@ -540,13 +540,21 @@ async def generate_building_lore_detailed(
         arch_n = await _get_architect_catalogue_count(session, architect)
         lore = await _synthesize_with_grok(raw, building_name, address, year_built,
                                            style, architect, block_ctx, arch_n)
-        synthesized = bool(lore)
-        if not lore:
-            lore = raw  # fallback to raw if synthesis fails
-        if cache_to_db:
-            await _cache_storytelling(session, bin_val, lore)
-        return LoreResult(text=lore, tier="landmark_chunks", specificity=spec,
-                          source=src, synthesized=synthesized)
+        if lore:
+            if cache_to_db:
+                await _cache_storytelling(session, bin_val, lore)
+            return LoreResult(text=lore, tier="landmark_chunks", specificity=spec,
+                              source=src, synthesized=True)
+        # Synthesis failed (missing/failing API key, timeout). Do NOT serve the
+        # raw chunk: a designation report opens with hearing boilerplate — "Six
+        # witnesses spoke in favor of designation. There were no speakers in
+        # opposition." — in OCR'd 1981 typescript. Shipping that as a building's
+        # story is worse than having none, and it CACHES, so one bad key
+        # poisons the storytelling column for every building it touches.
+        # Fall through to the next tier instead.
+        logger.warning(
+            f"synthesis failed for BIN {bin_val}; skipping raw landmark text"
+        )
 
     # 2. Wikipedia (free, no key) — tries name then address → synthesize
     if building_name or address:
@@ -556,6 +564,9 @@ async def generate_building_lore_detailed(
             arch_n = await _get_architect_catalogue_count(session, architect)
             lore = await _synthesize_with_grok(raw, building_name, address, year_built,
                                                style, architect, block_ctx, arch_n)
+            # A Wikipedia extract is at least written prose, so serving it raw is
+            # tolerable where raw LPC typescript is not. It is still marked
+            # unsynthesized so the cost/quality split stays visible.
             synthesized = bool(lore)
             if not lore:
                 lore = raw
