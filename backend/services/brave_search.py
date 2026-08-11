@@ -50,11 +50,25 @@ def is_configured() -> bool:
 
 
 def build_queries(building_name: Optional[str], address: Optional[str],
-                  architect: Optional[str], year_built: Optional[str]) -> list[str]:
+                  architect: Optional[str], year_built: Optional[str],
+                  categories: Optional[list[str]] = None) -> list[str]:
     """Literal queries from what we already know, most specific first.
 
     Deliberately not model-generated: a model writing its own queries is how the
     old path ended up running twenty of them.
+
+    `categories` turns the last slot into a STORY SWEEP. The first two queries
+    establish identity — who built it, when — which a designation report already
+    gives us for most buildings. The interesting registers (crime, disaster,
+    supernatural, pop culture) need to be asked for, or search returns the same
+    architectural summary three times.
+
+    One sweep rather than one query per category: Brave bills per REQUEST, so
+    eight category queries would be eight times the cost for the same building.
+    OR-ing them into a single request keeps the ceiling at 3.
+
+    The terms come from the live `lore` category list in the search index, not a
+    list written here — add a category to the data and the sweep picks it up.
     """
     name = (building_name or "").strip()
     addr = (address or "").strip()
@@ -62,11 +76,20 @@ def build_queries(building_name: Optional[str], address: Optional[str],
     if arch.lower() in ("not determined", "unknown"):
         arch = ""
 
+    subject = f'"{name}"' if (name and name != "0") else (f'"{addr}"' if addr else "")
+
     queries: list[str] = []
     if name and name != "0":
         queries.append(f'"{name}" New York building history')
     if addr:
         queries.append(f'"{addr}" New York City building history')
+    if categories and subject:
+        # Story sweep — see docstring. Category slugs are used verbatim so the
+        # query tracks the data; jargon slugs still narrow the result set
+        # usefully when OR-ed against a quoted address.
+        terms = " OR ".join(sorted({c.strip() for c in categories if c and c.strip()}))
+        if terms:
+            queries.append(f"{subject} New York {terms}")
     if arch and (addr or name):
         queries.append(f'{arch} architect "{addr or name}"')
     if not queries and year_built:

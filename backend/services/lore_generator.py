@@ -42,6 +42,35 @@ def _is_complete(text: Optional[str]) -> bool:
     return len(t) >= 120 and t[-1] in '.!?"”’'
 
 
+_LORE_CATEGORIES: Optional[list[str]] = None
+
+
+async def _get_lore_categories() -> Optional[list[str]]:
+    """Distinct lore categories, read once per process from the search index.
+
+    Read from the data rather than written here so the Brave story sweep tracks
+    whatever categories actually exist — add one to the index and the sweep
+    picks it up with no code change.
+    """
+    global _LORE_CATEGORIES
+    if _LORE_CATEGORIES is not None:
+        return _LORE_CATEGORIES
+    try:
+        from models.search_session import get_search_db
+        async with get_search_db() as sdb:
+            if sdb is None:
+                return None
+            rows = (await sdb.execute(text(
+                "SELECT DISTINCT category FROM layer_search_index "
+                "WHERE layer='lore' AND category IS NOT NULL"
+            ))).fetchall()
+        _LORE_CATEGORIES = [r[0] for r in rows if r[0]]
+    except Exception as e:
+        logger.warning(f"lore category lookup failed: {e}")
+        return None
+    return _LORE_CATEGORIES
+
+
 async def _get_block_context(session: AsyncSession, bin_val: str) -> Optional[str]:
     """Computed facts about how this building sits among its ACTUAL neighbours.
 
@@ -693,8 +722,9 @@ async def generate_building_lore_detailed(
     # for one. Falls back to that path only when no Brave key is set.
     from services import brave_search
     if brave_search.is_configured():
+        cats = await _get_lore_categories()
         queries = brave_search.build_queries(building_name, address, architect,
-                                             year_built)
+                                             year_built, categories=cats)
         results = await brave_search.search(queries)
         raw = brave_search.as_source_text(results)
         if raw:
