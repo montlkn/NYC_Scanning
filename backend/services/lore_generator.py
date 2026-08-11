@@ -114,8 +114,17 @@ async def _synthesize_with_grok(
     style: Optional[str],
     architect: Optional[str],
 ) -> Optional[str]:
-    """Use Grok to synthesize raw LPC/Wikipedia chunks into punchy, grounded copy."""
+    """Synthesize raw LPC/Wikipedia chunks into punchy, grounded copy.
+
+    Runs on gpt-5.6-luna when OPENAI_API_KEY is set, falling back to Grok
+    otherwise. Synthesis is rewriting, not researching — the facts arrive as
+    source text — so it belongs on the cheapest capable model.
+
+    Note the Grok fallback passes `search_enabled=False`. It defaults to True,
+    which meant tier-1 synthesis over already-free LPC text was still asking a
+    model to run live web search, defeating the point of the cheap tier."""
     from services.grok import grok_text
+    from services.openai_text import openai_text, is_configured
 
     meta_parts = []
     if building_name and building_name != '0':
@@ -142,7 +151,14 @@ async def _synthesize_with_grok(
         "Hard bans: 'rose amid', 'quiet sentinel', 'bustling streets', "
         "'whisper of jazz', 'sentinel on a street', 'time capsule', "
         "'frozen in time', 'turn-of-the-century dreams'. No clichés. No "
-        "markdown, no bullets, no headers."
+        "markdown, no bullets, no headers.\n\n"
+        "The source is OCR'd from scanned reports and contains scanning "
+        "errors — 'Buiiding' for 'Building', 'Centw:y' for 'Century', "
+        "'AROITTECT' for 'ARCHITECT', stray punctuation inside words. Read "
+        "through them and write the corrected form. Never reproduce a garbled "
+        "spelling, and never quote the source verbatim. If a proper name is "
+        "too corrupted to reconstruct with confidence, omit it rather than "
+        "guessing at it."
     )
     user = (
         "Write 3-4 punchy sentences about this NYC building. Lead with the "
@@ -154,7 +170,18 @@ async def _synthesize_with_grok(
         f"Building: {meta_line}\n"
         f"Source material:\n{raw_text}"
     )
-    result = await grok_text(system=system, user=user, max_tokens=300, temperature=0.3)
+    result = None
+    if is_configured():
+        result = await openai_text(system=system, user=user, max_tokens=300)
+        if result and len(result) > 30:
+            logger.info(f"luna synthesised lore for '{building_name or address}'")
+            return result.strip()
+
+    # Fallback: Grok, explicitly WITHOUT search. The source text is already in
+    # the prompt; a search here would bill the expensive path to restate facts
+    # we already hold.
+    result = await grok_text(system=system, user=user, max_tokens=300,
+                             temperature=0.3, search_enabled=False)
     if result and len(result) > 30:
         logger.info(f"Grok synthesised lore for '{building_name or address}'")
         return result.strip()
