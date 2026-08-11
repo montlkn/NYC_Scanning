@@ -49,7 +49,7 @@ import psycopg2  # noqa: E402
 from dotenv import load_dotenv  # noqa: E402
 
 from extract_district_entries import (  # noqa: E402
-    extract, extract_modern, looks_modern, normalize_street,
+    detect_format, extract, extract_modern, extract_prose, normalize_street,
 )
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
@@ -68,7 +68,17 @@ def norm_db_address(addr: str) -> tuple[int | None, str | None]:
     m = re.match(r"^(\d+)\s+(.*)$", a)
     if not m:
         return None, None
-    toks = [ABBR.get(t, t) for t in m.group(2).split()]
+    raw = m.group(2).split()
+    toks = []
+    for i, t in enumerate(raw):
+        # Expand an abbreviation only where it can BE one: a thoroughfare word
+        # at the end, or a compass prefix at the start. Blanket expansion turns
+        # "ST JOHN'S PLACE" (Saint) into "STREET JOHN'S PLACE" and loses every
+        # building on it — 143 of them in Clinton Hill alone.
+        if i == len(raw) - 1 or (i == 0 and t in ("N", "S", "E", "W", "SO")):
+            toks.append(ABBR.get(t, t))
+        else:
+            toks.append(t)
     return int(m.group(1)), normalize_street(" ".join(toks))
 
 
@@ -118,10 +128,20 @@ def district_addresses(rail_url: str, source_file: str) -> list[tuple[str, str]]
 
 
 def match_legacy(entries, rows) -> int:
-    index: dict[tuple[int, str], bool] = {}
+    return match_by_address(entries, rows)[0]
+
+
+def match_by_address(entries, rows) -> tuple[int, dict[str, int]]:
+    """(bins matched, bins matched per attribution tier).
+
+    The tier split matters: a prose report's `head` matches are as trustworthy
+    as the old marginal-marker ones, while `inline` matches are a sentence that
+    merely names the building. Reporting one number for both would hide that.
+    """
+    index: dict[tuple[int, str], list] = {}
     for e in entries:
         for n in e.numbers:
-            index[(n, e.street)] = True
+            index.setdefault((n, e.street), []).append(e)
     streets = sorted({e.street for e in entries})
     cache: dict[str, str] = {}
 
@@ -135,13 +155,19 @@ def match_legacy(entries, rows) -> int:
         return cache[s]
 
     hit = 0
+    tiers: dict[str, int] = {}
     for _bin, addr in rows:
         n, s = norm_db_address(addr)
         if n is None:
             continue
-        if (n, resolve(s)) in index:
-            hit += 1
-    return hit
+        es = index.get((n, resolve(s)))
+        if not es:
+            continue
+        hit += 1
+        best = max((getattr(e, "confidence", "head") for e in es),
+                   key=lambda t: {"head": 3, "lead": 2, "inline": 1}.get(t, 0))
+        tiers[best] = tiers.get(best, 0) + 1
+    return hit, tiers
 
 
 def match_modern(entries, buildings_url: str) -> int:
@@ -183,8 +209,9 @@ def summarize(path: str) -> None:
     ok = [r for r in recs if not r.get("error")]
     bins = sum(r["bins_in_district"] for r in ok)
     matched = sum(r["matched"] for r in ok)
-    modern = [r for r in ok if r["format"] == "modern"]
-    legacy = [r for r in ok if r["format"] == "legacy"]
+    by_format: dict[str, list] = {}
+    for r in ok:
+        by_format.setdefault(r["format"], []).append(r)
 
     def rate(rs):
         b = sum(r["bins_in_district"] for r in rs)
@@ -192,9 +219,17 @@ def summarize(path: str) -> None:
         return b, m, (100 * m / b if b else 0)
 
     print(f"\nreports surveyed : {len(ok)} ok, {len(recs)-len(ok)} failed")
-    for label, rs in (("modern", modern), ("legacy", legacy)):
+    for label in sorted(by_format):
+        rs = by_format[label]
         b, m, pct = rate(rs)
         print(f"  {label:6}: {len(rs):3d} reports  {m:6d}/{b:6d} bins  {pct:.0f}%")
+        tiers: dict[str, int] = {}
+        for r in rs:
+            for k, v in (r.get("tiers") or {}).items():
+                tiers[k] = tiers.get(k, 0) + v
+        if tiers:
+            print("          tiers: " + ", ".join(
+                f"{k}={v}" for k, v in sorted(tiers.items(), key=lambda kv: -kv[1])))
     print(f"  TOTAL : {matched}/{bins} bins = {100*matched/bins if bins else 0:.0f}%")
     worst = sorted(ok, key=lambda r: r["matched"] / max(r["bins_in_district"], 1))[:8]
     print("\nlowest-yield reports (inspect these):")
@@ -207,6 +242,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="survey.jsonl")
     ap.add_argument("--limit", type=int)
+    ap.add_argument("--only", nargs="*", metavar="0709.pdf",
+                    help="survey just these reports, by file name")
     ap.add_argument("--tmp", default="/tmp/jink_survey.pdf")
     ap.add_argument("--summary-only", action="store_true")
     ap.add_argument("--sleep", type=float, default=1.0,
@@ -233,6 +270,9 @@ def main() -> int:
 
     reports = district_reports(rail)
     todo = [r for r in reports if r[0] not in done]
+    if args.only:
+        want = set(args.only)
+        todo = [r for r in reports if r[0].split("/")[-1] in want]
     if args.limit:
         todo = todo[: args.limit]
     print(f"{len(reports)} district reports, {len(done)} already done, {len(todo)} to go",
@@ -249,18 +289,21 @@ def main() -> int:
             continue
         try:
             size_mb = os.path.getsize(args.tmp) / 1e6
-            modern = looks_modern(args.tmp)
-            if modern:
+            fmt = detect_format(args.tmp)
+            if fmt == "modern":
                 boro = district_borough(rail, src)
                 ents = [e for e in extract_modern(args.tmp, name, default_borough=boro)
                         if len(e.text) >= MIN_CHARS]
                 matched = match_modern(ents, bldg)
                 rec.update(format="modern", entries=len(ents), matched=matched)
             else:
-                ents = [e for e in extract(args.tmp, name) if len(e.text) >= MIN_CHARS]
+                extractor = extract_prose if fmt == "prose" else extract
+                ents = [e for e in extractor(args.tmp, name)
+                        if len(e.text) >= MIN_CHARS]
                 rows = district_addresses(rail, src)
-                matched = match_legacy(ents, rows)
-                rec.update(format="legacy", entries=len(ents), matched=matched)
+                matched, tiers = match_by_address(ents, rows)
+                rec.update(format=fmt, entries=len(ents), matched=matched,
+                           tiers=tiers)
             rec["size_mb"] = round(size_mb, 1)
             pct = 100 * rec["matched"] / max(nbins, 1)
             print(f"  {rec['format']}: {rec['entries']} entries, "

@@ -35,8 +35,28 @@ This is deliberately NOT an LLM job. The structure is deterministic, so a parser
 gets exact attribution for free, and every extracted claim stays verbatim from a
 primary source rather than being paraphrased by a model.
 
+Three document shapes, not one
+──────────────────────────────
+The marginal-marker layout above is only one of three, and it is NOT the common
+one. A 94-report survey found 41 of 43 "legacy"-detected reports extracting zero
+entries, because `extract()` was developed against LP-0489 alone:
+
+  legacy — marginal `#13` markers bound to body text by coordinate. `extract()`.
+           LP-0489 Greenwich Village.
+  modern — structured per-building records with a Block/Lot line yielding a BBL.
+           `extract_modern()`. LP-1647, LP-2448.
+  prose  — continuous narrative by STREET BLOCK, buildings named inline. No
+           markers anywhere. `extract_prose()`. LP-0709 Park Slope, LP-2017
+           Clinton Hill, LP-1024 Prospect Lefferts Gardens, LP-1051 Upper East
+           Side, and most of the rest of the "legacy" set.
+
+`detect_format()` picks between them by counting cues in the PDF, not by LP
+number: the changeover was not chronological (LP-0489 is marginal, LP-0709 is
+prose, and they are 220 numbers apart).
+
 Usage:
   python scripts/extract_district_entries.py --pdf lp0489.pdf --report LP-0489
+  python scripts/extract_district_entries.py --pdf lp0709.pdf --report LP-0709 --sample 5
   python scripts/extract_district_entries.py --pdf lp0489.pdf --limit-pages 60 --sample 10
 """
 
@@ -138,6 +158,7 @@ def normalize_street(raw: str) -> str:
     # equal and silently loses every building on such a street.
     s = s.replace(".", " ")
     s = re.sub(r"\s+", " ", s).upper().strip(" .,")
+    s = NUM_ORDINAL_RE.sub(r"\1", s)
     # Longest-first so "TWENTY-FIRST" wins over "FIRST".
     for word in sorted(ORDINALS, key=len, reverse=True):
         if word in s:
@@ -189,6 +210,18 @@ BLOCK_LOT_RE = re.compile(
 # BINs instead, whose first digit IS the borough code.
 BLOCK_LOT_ALT_RE = re.compile(
     r"Tax\s*Map\b[^\d\n]{0,24}?(\d{2,5})\s*[/|jl]\s*(\d{1,5})",
+    re.IGNORECASE,
+)
+
+# A fourth spelling, with no "Tax Map" prefix at all: "Block/Lot: 6692/74"
+# (LP-2208 Fiske Terrace) and "Block/lot 1473/1" (LP-1831 Jackson Heights).
+# Both reports are fully structured per-building records, and both were
+# classified LEGACY purely because the prefix was missing — 937 buildings'
+# worth of labelled records read as an unparseable typewritten scan. Anchored
+# to the start of the line so a block/lot mentioned inside prose cannot open a
+# spurious record.
+BLOCK_LOT_BARE_RE = re.compile(
+    r"^\(?Block\s*/\s*lot\s*:?\s*(\d{2,5})\s*[/|jl]\s*(\d{1,5})",
     re.IGNORECASE,
 )
 
@@ -266,7 +299,7 @@ def extract_modern(pdf_path: str, report_id: str,
                 except (KeyError, ValueError):
                     bbl = None
             elif default_borough:
-                alt = BLOCK_LOT_ALT_RE.search(line)
+                alt = BLOCK_LOT_ALT_RE.search(line) or BLOCK_LOT_BARE_RE.match(line)
                 if alt:
                     try:
                         bbl = (f"{default_borough}"
@@ -322,7 +355,8 @@ def looks_modern(pdf_path: str, probe_pages: int = 40) -> bool:
             text = reader.pages[i].extract_text() or ""
         except Exception:
             continue
-        if BLOCK_LOT_RE.search(text) or BLOCK_LOT_ALT_RE.search(text):
+        if (BLOCK_LOT_RE.search(text) or BLOCK_LOT_ALT_RE.search(text)
+                or any(BLOCK_LOT_BARE_RE.match(l) for l in text.split("\n"))):
             hits += 1
         if hits >= 2:
             return True
@@ -512,7 +546,12 @@ def extract(pdf_path: str, report_id: str, limit_pages: int | None = None) -> li
 # thoroughfare word, so every Park Slope block header fails and the whole report
 # goes unattributed.
 PROSE_STREET_RE = re.compile(
-    r"^[A-Z][A-Z0-9 .,'&\-]{3,60}?"
+    # Lowercase IS allowed in the name portion, because real street names carry
+    # it: "MacDONOUGH STREET" heads eleven pages of Stuyvesant Heights and an
+    # all-caps class rejects every one of them, losing 214 buildings on a single
+    # street. The uppercase-dominance check in `is_street_header` keeps ordinary
+    # prose out; the thoroughfare word itself must still be capitalised.
+    r"^[A-Z][A-Za-z0-9 .,'&\-]{3,60}?"
     r"\b(STREET|AVENUE|PLACE|SQUARE|ROAD|LANE|MEWS|COURT|TERRACE|PARK|ALLEY|WAY|"
     r"BOULEVARD|DRIVE|PARKWAY|PROMENADE|WALK|OVAL|CIRCLE|SLIP|ROW)\b"
     r"(\s+(NORTH|SOUTH|EAST|WEST))?"
@@ -520,10 +559,35 @@ PROSE_STREET_RE = re.compile(
     r"|\s+(NORTH|SOUTH|EAST|WEST)\s+SIDE\b|\s*,)"
 )
 
+# The later prose reports set block headers in Title Case instead of capitals:
+#
+#     East 19th Street between Dorchester Road and Ditmas Avenue West Side
+#     No. 480
+#     Erected 1902 by Benjamin Driesler for Emma Henson
+#
+# LP-1236 (Ditmas Park) is 200 pages of exactly this and extracted ZERO, because
+# an uppercase-only rule never sets a street and every "No. 480" record is then
+# unattributable. Title case is admitted only with a hard terminator — end of
+# line, "(", "between", or a side qualifier — and deliberately NOT a comma,
+# which would swallow ordinary sentences ("Montgomery Street, named after
+# General Richard Montgomery, ...").
+TITLE_STREET_RE = re.compile(
+    r"^(?:[A-Z][A-Za-z'’.\-]*|\d{1,3}(?:st|nd|rd|th))"
+    r"(?:\s+(?:[A-Z][A-Za-z'’.\-]*|\d{1,3}(?:st|nd|rd|th)|of|and|the))*"
+    r"\s+(Street|Avenue|Place|Square|Road|Lane|Mews|Court|Terrace|Park|Alley|"
+    r"Way|Boulevard|Drive|Parkway|Promenade|Walk|Oval|Circle|Slip|Row)\b"
+    r"(?=\s*$|\s*\(|\s+between\b|\s+betw\.|\s+(?:North|South|East|West)\s+Side\b)"
+)
+
+# "19TH" -> "19". The reports write numbered streets as ordinals while the
+# buildings DB stores bare digits ("EAST 19 STREET"); without this the whole
+# street compares unequal. Closed rule, not a vocabulary.
+NUM_ORDINAL_RE = re.compile(r"\b(\d{1,3})(ST|ND|RD|TH)\b")
+
 # Trailing navigation on a block header: "Between X & Y", "(Nos. 162-169)",
 # "North Side". Not part of the address.
 PROSE_TAIL_RE = re.compile(
-    r"\s*,?\s+betw(?:een)?\.?\b.*$|\s*\(.*$"
+    r"\s*,.*$|\s+betw(?:een)?\.?\b.*$|\s*\(.*$"
     r"|\s+(?:north|south|east|west)\s+side\b.*$",
     re.IGNORECASE,
 )
@@ -587,6 +651,19 @@ def _best_tier(a: str, b: str) -> str:
     return a if TIER_RANK.get(a, 0) >= TIER_RANK.get(b, 0) else b
 
 
+def is_street_header(text: str) -> bool:
+    """A block header, not a sentence that happens to start with a capital."""
+    text = text or ""
+    m = PROSE_STREET_RE.match(text)
+    if not m:
+        return bool(TITLE_STREET_RE.match(text))
+    span = m.group(0)
+    letters = [c for c in span if c.isalpha()]
+    if not letters:
+        return False
+    return sum(c.isupper() for c in letters) / len(letters) >= 0.7
+
+
 def parse_number_run(text: str) -> tuple[list[int], int]:
     """Parse a leading run of house numbers. Returns (numbers, chars consumed).
 
@@ -606,11 +683,31 @@ def parse_number_run(text: str) -> tuple[list[int], int]:
     first = int(m.group(1))
     rest = m.group(2) or ""
     parts = re.findall(r"(,|&|and|through|to|[-–—~])\s*(\d{1,4})", rest)
+
+    # `~` is not a separator in these documents — it is OCR damage standing in
+    # for a dash OR for an eaten digit. Alone ("128~146") it reads safely as a
+    # dash. Combined with a SECOND separator it means a digit was destroyed
+    # inside a number: "Nos. 1~5-163" is really 155-163, and parsing it yields
+    # houses 1, 3 and 5 — three real addresses on the street that the paragraph
+    # is not about. Observed on LP-0709 Sixth Avenue. The lost digit cannot be
+    # reconstructed, and a confidently wrong attribution is far worse than a
+    # dropped entry, so the whole run is discarded.
+    if len(parts) > 1 and any(sep in ("~", "_") for sep, _ in parts):
+        return [], 0
+
     prev = first
     nums.append(first)
     for sep, val in parts:
         v = int(val)
         if sep in ("-", "–", "—", "~", "through", "to"):
+            # A range always ascends. A descending one means OCR ate a digit:
+            # "Nos. 262-2€4" parses as 262-2, and expanding that yields house
+            # number 2 — a real address on the same street that the paragraph is
+            # not about, i.e. a confidently wrong attribution. Keeping the low
+            # end is no safer (after the swap IT is the corrupt token), so the
+            # range is discarded and only the first number survives.
+            if v <= prev:
+                continue
             nums = [n for n in nums if n != prev]
             nums.extend(expand_range(prev, v))
         else:
@@ -761,7 +858,7 @@ def extract_prose_pages(pages: "list[tuple[int, list[tuple[int,int,str]]]]",
             if AREA_RE.search(head) and len(head) < 40:
                 area = head
                 continue
-            if PROSE_STREET_RE.match(head):
+            if is_street_header(head):
                 street = normalize_street(PROSE_TAIL_RE.sub("", head))
                 skipping = False
                 current = None
@@ -784,7 +881,15 @@ def extract_prose_pages(pages: "list[tuple[int, list[tuple[int,int,str]]]]",
                 continue
 
             body = _clean(" ".join(para))
-            if len(body) < 40:
+            # A short line is furniture UNLESS it is a record opener. The later
+            # prose reports put the house number on a line of its own —
+            #     East 19th Street between Dorchester Road and Ditmas Avenue
+            #     No. 480
+            #     Erected 1902 by Benjamin Driesler for Emma Henson
+            # — so a length gate applied before the opener check discards the
+            # only line that names the building, and LP-1236's 200 pages of
+            # these yield nothing.
+            if len(body) < 40 and not NUM_HEAD_RE.match(body):
                 continue
 
             sents = [s.strip() for s in SENTENCE_SPLIT_RE.split(body)]
@@ -817,17 +922,29 @@ def extract_prose_pages(pages: "list[tuple[int, list[tuple[int,int,str]]]]",
                 if pno not in current.pages:
                     current.pages.append(pno)
                 current.text_parts.append(body)
+            elif current is not None:
+                # Names nobody, but an entry is open: this is that entry
+                # continuing. The record-style reports depend on it entirely —
+                # "No. 480" is its own paragraph and every field that follows is
+                # a separate one — and in the narrative reports the paragraph
+                # after an entry is its second half ("The first four houses in
+                # the row illustrate the four different types used...").
+                # A street or side header closes the entry, so this cannot run
+                # past the block it belongs to.
+                if pno not in current.pages:
+                    current.pages.append(pno)
+                current.text_parts.append(body)
             else:
-                # Names nobody: shared context for the whole street block.
+                # Names nobody and nothing is open: shared context for the
+                # whole street block.
                 blocks.setdefault(street, []).append(body)
-                current = None
 
             # Sentence-level attribution for everyone else the paragraph names.
             # A head paragraph mentions its neighbours constantly ("similar to
             # Nos. 154 and 156 in the block to the north"), so these are held at
             # the weaker `inline` tier instead of being merged into the entry.
             own = set(nums)
-            for si, sent in enumerate(sents):
+            for sent in sents:
                 if len(sent) < 30:
                     continue
                 for n in _inline_hits(sent):
@@ -840,13 +957,36 @@ def extract_prose_pages(pages: "list[tuple[int, list[tuple[int,int,str]]]]",
                     if sent not in e.inline_parts:
                         e.inline_parts.append(sent)
 
-    out = _canonicalize_streets(list(entries.values()))
+    out, mapping = _canonicalize_streets(list(entries.values()))
+    # Fold the block prose onto the SAME canonical names, or a street whose
+    # header OCR'd two ways keeps its context under the discarded spelling and
+    # every entry on it comes back with an empty block.
+    folded: dict[str, list[str]] = {}
+    for street, parts in blocks.items():
+        folded.setdefault(mapping.get(street, street), []).extend(parts)
+    blocks = folded
     for e in out:
         e.block = _clean(" ".join(blocks.get(e.street, [])))[:1500]
+
+    # One record per street carrying only the block prose. A district has far
+    # more buildings than the report names individually — Park Slope names 664
+    # of 1,925 — and the rest currently get the SAME two-paragraph district
+    # blurb as every other building in Brooklyn. Street-block prose is a
+    # strictly better fallback: still not building-specific, but specific to
+    # that block. Emitted with no numbers so it can never be mistaken for an
+    # entry, and so the address matcher ignores it.
+    for street, parts in blocks.items():
+        text = _clean(" ".join(parts))
+        if len(text) < 200:
+            continue
+        out.append(ProseEntry(report=report_id, area=area, street=street,
+                              numbers=[], text_parts=[text[:1500]],
+                              kind="block", tier="block"))
     return out
 
 
-def _canonicalize_streets(entries: list[ProseEntry]) -> list[ProseEntry]:
+def _canonicalize_streets(
+        entries: list[ProseEntry]) -> tuple[list[ProseEntry], dict[str, str]]:
     """Fold OCR-corrupted street names into their clean twin.
 
     These scans produce "EIGIITH AVENUE", "EIGHI'H AVENUE" and "F'1URTEENTH
@@ -859,9 +999,24 @@ def _canonicalize_streets(entries: list[ProseEntry]) -> list[ProseEntry]:
     for e in entries:
         counts[e.street] = counts.get(e.street, 0) + len(e.numbers)
     ranked = sorted(counts, key=lambda s: (-counts[s], s))
+
+    def digits(s: str) -> frozenset:
+        # Standalone number words only. A digit buried inside a mangled word
+        # ("F'1URTEENTH STREET") is OCR damage, not a street number, and must
+        # not block that name from folding onto its clean twin.
+        return frozenset(re.findall(r"\b\d+\b", s))
+
     mapping: dict[str, str] = {}
     for s in ranked:
-        better = [t for t in ranked if counts[t] > counts[s]]
+        # Fold only onto a name with the SAME digits. Numbered streets sit one
+        # character apart — "EAST 68 STREET" and "EAST 78 STREET" score 0.93
+        # similar — so an unguarded fuzzy merge collapses a numbered grid into a
+        # single street and drops every building on the others. Measured on
+        # LP-1051 (Upper East Side): 85% of bins matched with this guard, 62%
+        # without it.
+        better = [t for t in ranked
+                  if counts[t] > counts[s]
+                  and digits(t) == digits(s)]
         m = difflib.get_close_matches(s, better, n=1, cutoff=0.82)
         mapping[s] = mapping.get(m[0], m[0]) if m else s
 
@@ -876,7 +1031,7 @@ def _canonicalize_streets(entries: list[ProseEntry]) -> list[ProseEntry]:
         prev.pages = sorted(set(prev.pages) | set(e.pages))
         prev.text_parts.extend(p for p in e.text_parts if p not in prev.text_parts)
         prev.inline_parts.extend(p for p in e.inline_parts if p not in prev.inline_parts)
-    return list(merged.values())
+    return list(merged.values()), mapping
 
 
 def _pdf_pages(pdf_path: str, limit_pages: int | None = None):
@@ -930,9 +1085,15 @@ def count_layout_cues(pdf_path: str, probe_pages: int = 60) -> tuple[int, int]:
             continue
         xs = sorted(x for x, _, _ in lines)
         margin_max = xs[len(xs) // 2] - MARGIN_GAP
-        for x, _y, text in lines:
-            if x <= margin_max and MARKER_RE.match(text.replace(" ", "")):
+        # Count markers on the raw FRAGMENTS, not the assembled lines. A marker
+        # shares its line with the body text it labels, so the assembled line
+        # reads "#230-232 Industry, in the form of this..." and matches nothing
+        # — which scores LP-0489, the archetypal marginal-marker report, as
+        # zero markers and routes it away from the parser built for it.
+        for x, _y, frag in items:
+            if x <= margin_max and MARKER_RE.match(frag.replace(" ", "")):
                 marginal += 1
+        for x, _y, text in lines:
             if NUM_HEAD_RE.match(text):
                 prose += 1
     return marginal, prose
@@ -964,12 +1125,41 @@ def main() -> int:
     ap.add_argument("--json-out")
     ap.add_argument("--min-chars", type=int, default=200,
                     help="drop entries thinner than this; they read as stubs")
+    ap.add_argument("--format", choices=("auto", "modern", "legacy", "prose"),
+                    default="auto")
     args = ap.parse_args()
 
-    modern = looks_modern(args.pdf)
-    print(f"format              : {'modern (Block/Lot records)' if modern else 'legacy (marginal markers)'}")
+    fmt = detect_format(args.pdf) if args.format == "auto" else args.format
+    print(f"format              : {fmt}")
 
-    if modern:
+    if fmt == "prose":
+        pentries = [e for e in extract_prose(args.pdf, args.report, args.limit_pages)
+                    if len(e.text) >= args.min_chars]
+        by_tier: dict[str, int] = {}
+        for e in pentries:
+            by_tier[e.confidence] = by_tier.get(e.confidence, 0) + 1
+        print(f"entries >= {args.min_chars} chars : {len(pentries)}")
+        print("by attribution      : " + ", ".join(
+            f"{k}={v}" for k, v in sorted(by_tier.items(), key=lambda kv: -kv[1])))
+        print(f"addresses covered   : {sum(len(e.numbers) for e in pentries)}")
+        if pentries:
+            lens = sorted(len(e.text) for e in pentries)
+            print(f"text length med/max : {lens[len(lens)//2]} / {lens[-1]}")
+        for e in pentries[: args.sample]:
+            nums = ", ".join(str(n) for n in e.numbers)
+            print(f"\n--- {nums} {e.street}  [{e.confidence}] pages={e.pages}")
+            print(f"    {e.text[:400]}")
+        if args.json_out:
+            with open(args.json_out, "w") as fh:
+                json.dump([{"report": e.report, "area": e.area, "street": e.street,
+                            "numbers": e.numbers, "pages": e.pages,
+                            "confidence": e.confidence, "text": e.text,
+                            "block_context": e.block}
+                           for e in pentries], fh, indent=1)
+            print(f"\nwrote {args.json_out}")
+        return 0
+
+    if fmt == "modern":
         mentries = [e for e in extract_modern(args.pdf, args.report, args.limit_pages)
                     if len(e.text) >= args.min_chars]
         print(f"entries >= {args.min_chars} chars : {len(mentries)}")
