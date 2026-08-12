@@ -29,19 +29,22 @@ Provenance is returned alongside the text on purpose:
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.session import get_db
 from services.lore_generator import generate_building_lore_detailed
+from utils.rate_limit import limiter, LIMIT_INFERENCE
 
 router = APIRouter(prefix="/lore", tags=["lore"])
 logger = logging.getLogger(__name__)
 
 
 @router.get("/{bin_val}")
+@limiter.limit(LIMIT_INFERENCE)
 async def get_building_lore(
+    request: Request,
     bin_val: str,
     refresh: bool = Query(False, description="Bypass the cached storytelling column"),
     db: AsyncSession = Depends(get_db),

@@ -132,6 +132,18 @@ app = FastAPI(
     debug=settings.debug
 )
 
+# Per-IP rate limiting. This API has no authentication, so the limiter is the
+# only thing standing between a stranger with the hostname and unbounded
+# inference/storage spend. See utils/rate_limit.py for how the numbers were
+# chosen and why the client IP has to come out of X-Forwarded-For on Railway.
+#
+# The middleware applies LIMIT_DEFAULT to every route that carries no explicit
+# @limiter.limit decorator; decorated routes use their own (stricter) limit
+# instead. Health checks are exempted below so Railway's probe never trips it.
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, rate_limit_handler)
+app.add_middleware(SlowAPIMiddleware)
+
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -174,6 +186,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 # Health check endpoint
 @app.get("/")
+@limiter.exempt
 async def root():
     """Health check endpoint"""
     return {
@@ -185,6 +198,7 @@ async def root():
 
 
 @app.get("/health")
+@limiter.exempt  # Railway's platform probe hits this constantly; never limit it.
 async def health_check():
     """Detailed health check.
 
@@ -209,7 +223,11 @@ async def health_check():
 
 
 @app.get("/api/warm")
-async def warm():
+# Not a platform health check — it loads the embedding model and opens a DB
+# connection, so it is worth a (loose) cap. A cron pre-warm calls it minutes
+# apart; nothing legitimate needs more than a few a minute.
+@limiter.limit("10/minute")
+async def warm(request: Request):
     """Warms the embedding model + search DB connection. Call this from a
     Railway/Render cron or client pre-warm ping to avoid eating the cold-start
     cost on a real user's first search."""

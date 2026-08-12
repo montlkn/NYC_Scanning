@@ -9,7 +9,7 @@ no caller left, client or server. See services/scan_photo.py for the endpoint
 that replaced it (async photo archiving after the client opts in).
 """
 
-from fastapi import APIRouter, Form, HTTPException, Depends
+from fastapi import APIRouter, Form, HTTPException, Depends, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import update
@@ -19,13 +19,16 @@ import logging
 from models.database import Scan
 from models.session import get_db
 from pipeline import telemetry as pipeline_telemetry
+from utils.rate_limit import limiter, LIMIT_SCAN
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
 @router.post("/scans/{scan_id}/confirm")
+@limiter.limit(LIMIT_SCAN)
 async def confirm_building_v2(
+    request: Request,
     scan_id: str,
     confirmed_bin: str = Form(..., description="BIN of confirmed building"),
     confirmation_time_ms: int = Form(None, description="Time taken to confirm (ms)"),
@@ -124,6 +127,7 @@ async def confirm_building_v2(
 
 
 @router.get("/scan/health")
+@limiter.exempt  # health probe: never limited
 async def scan_health_check(db: AsyncSession = Depends(get_db)):
     """
     Health check for V2 scan system.

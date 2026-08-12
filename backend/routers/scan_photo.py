@@ -8,7 +8,7 @@ when the user explicitly opts in — which is async and fire-and-forget from
 the client's perspective, so Render cold start no longer matters.
 """
 
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Request
 from sqlalchemy import update
 from datetime import datetime, timezone
 import logging
@@ -16,6 +16,7 @@ import logging
 from models.database import Scan
 from models.session import AsyncSessionLocal
 from utils.storage import upload_image
+from utils.rate_limit import limiter, LIMIT_SCAN
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -32,7 +33,9 @@ PHOTO_PREFIX = "contributions/"
 
 
 @router.post("/scan-photo")
+@limiter.limit(LIMIT_SCAN)
 async def upload_scan_photo(
+    request: Request,
     scan_id: str = Form(...),
     photo: UploadFile = File(...),
 ):

@@ -16,11 +16,12 @@ import time
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Query
+from fastapi import APIRouter, BackgroundTasks, Query, Request
 from sqlalchemy import text
 
 from models.search_session import get_search_db
 from services.text_embeddings import embed_query
+from utils.rate_limit import limiter, LIMIT_SEARCH
 from services.openai_text import openai_text
 from services.unified_search import (
     HARD_RADIUS_INTENTS,
@@ -131,7 +132,9 @@ LEX_FLOOR = 0.45
 
 
 @router.get("")
+@limiter.limit(LIMIT_SEARCH)
 async def search_buildings(
+    request: Request,
     q: str = Query(..., description="Natural-language search query"),
     limit: int = Query(30, ge=1, le=100),
     lat: Optional[float] = Query(None, description="Center latitude for geo filter/sort"),
@@ -306,7 +309,9 @@ async def search_buildings(
 
 
 @router.get("/venues")
+@limiter.limit(LIMIT_SEARCH)
 async def search_venues(
+    request: Request,
     q: str = Query(..., description="Natural-language venue query, e.g. 'dimly lit speakeasy'"),
     limit: int = Query(20, ge=1, le=100),
     lat: Optional[float] = Query(None, description="Center latitude for geo sort/filter"),
@@ -395,7 +400,9 @@ async def search_venues(
 
 
 @router.get("/layers")
+@limiter.limit(LIMIT_SEARCH)
 async def search_layers(
+    request: Request,
     q: str = Query(..., description="Natural-language query, e.g. '1977 blackout'"),
     limit: int = Query(30, ge=1, le=100),
     lat: Optional[float] = Query(None, description="Center latitude for geo sort/filter"),
@@ -1270,7 +1277,9 @@ def _result_cache_put(key: tuple, resp: Dict[str, Any]) -> None:
 
 
 @router.get("/unified")
+@limiter.limit(LIMIT_SEARCH)
 async def search_unified(
+    request: Request,
     q: str = Query(..., description="Natural-language search query"),
     lat: Optional[float] = Query(None),
     lng: Optional[float] = Query(None),
@@ -1568,7 +1577,8 @@ _FACETS_TTL_S = 3600.0
 
 
 @router.get("/facets")
-async def search_facets() -> Dict[str, Any]:
+@limiter.limit(LIMIT_SEARCH)
+async def search_facets(request: Request) -> Dict[str, Any]:
     """Filter options derived from DISTINCT queries over the search index —
     never a hardcoded list. Returns whatever columns actually exist (style is
     parsed from `snippet` text, not a normalized column — see _leg_buildings).

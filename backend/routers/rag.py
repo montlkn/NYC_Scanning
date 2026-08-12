@@ -4,10 +4,12 @@ RAG Router - Retrieves historical context from NYC Landmarks PDF chunks
 
 import os
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from typing import List, Optional
 import psycopg2
 from psycopg2.extras import RealDictCursor
+
+from utils.rate_limit import limiter, LIMIT_SEARCH
 
 router = APIRouter(prefix="/rag", tags=["rag"])
 
@@ -23,7 +25,9 @@ def get_connection():
 
 
 @router.get("/search")
+@limiter.limit(LIMIT_SEARCH)
 async def search_landmark_chunks(
+    request: Request,
     building_name: Optional[str] = Query(None, description="Building name to search for"),
     bin: Optional[str] = Query(None, description="BIN — exact, and strongly preferred"),
     limit: int = Query(3, description="Max chunks to return"),
@@ -95,7 +99,9 @@ async def search_landmark_chunks(
 
 
 @router.get("/batch")
+@limiter.limit(LIMIT_SEARCH)
 async def search_batch(
+    request: Request,
     building_names: str = Query(..., description="Comma-separated building names"),
     limit: int = Query(3, description="Max chunks per building"),
 ) -> dict:

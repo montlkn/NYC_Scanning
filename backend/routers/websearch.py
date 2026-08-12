@@ -28,10 +28,11 @@ problem the LLM proxy was built to solve.
 import logging
 from typing import Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
 from services import brave_search
+from utils.rate_limit import limiter, LIMIT_INFERENCE
 
 router = APIRouter(prefix="/search", tags=["search"])
 logger = logging.getLogger(__name__)
@@ -60,7 +61,8 @@ class SourcesResponse(BaseModel):
 
 
 @router.post("/sources", response_model=SourcesResponse)
-async def get_sources(req: SourcesRequest) -> SourcesResponse:
+@limiter.limit(LIMIT_INFERENCE)
+async def get_sources(request: Request, req: SourcesRequest) -> SourcesResponse:
     """Run the capped fan-out and return snippets plus their URLs.
 
     Always 200. A search miss, an unconfigured key and a subject too thin to

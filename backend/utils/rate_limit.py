@@ -54,19 +54,19 @@ logger = logging.getLogger(__name__)
 # no honest crowd would exceed per day.
 
 # LLM synthesis + billed Brave queries. Every uncached call costs cents.
-LIMIT_INFERENCE = ["20/minute", "300/day"]
+LIMIT_INFERENCE = "20/minute;300/day"
 
 # Scan bookkeeping: confirm + opt-in photo upload. One per building actually
 # visited. Cheap individually, but the photo path writes to R2.
-LIMIT_SCAN = ["30/minute", "600/day"]
+LIMIT_SCAN = "30/minute;600/day"
 
 # Embedding/vector search and plain DB reads. No per-call vendor cost, but they
 # hold a DB connection and run the fastembed model, so they are not free either.
-LIMIT_SEARCH = ["60/minute", "2000/day"]
+LIMIT_SEARCH = "60/minute;2000/day"
 
 # Everything not explicitly decorated. Wide enough that no normal screen trips
 # it, narrow enough that an unauthenticated crawler cannot walk 35k buildings.
-LIMIT_DEFAULT = ["120/minute", "5000/day"]
+LIMIT_DEFAULT = ["120/minute", "5000/day"]  # list form: slowapi default_limits
 
 
 # --- Client IP behind Railway ------------------------------------------------
