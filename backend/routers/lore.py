@@ -64,7 +64,7 @@ async def get_building_lore(
     try:
         row = (await db.execute(sql_text("""
             SELECT building_name, address, year_built, style, architect,
-                   mat_primary, storytelling
+                   mat_primary, storytelling, storytelling_sources
             FROM buildings_full_merge_scanning
             WHERE replace(bin, '.0', '') = :bin
             LIMIT 1
@@ -76,7 +76,8 @@ async def get_building_lore(
     if not row:
         raise HTTPException(status_code=404, detail="building not found")
 
-    name, address, year_built, style, architect, materials, cached = row
+    (name, address, year_built, style, architect, materials,
+     cached, cached_sources) = row
 
     if cached and not refresh:
         return {
@@ -84,8 +85,12 @@ async def get_building_lore(
             "lore": cached,
             "tier": "cache",
             "specificity": None,
-            "source": None,
-            "sources": [],
+            # Citations stored alongside the text. Before they were persisted,
+            # a cache hit returned prose with NO citations -- and a cache hit is
+            # every read after the first, so the chain's citations never reached
+            # a user despite being produced correctly each time.
+            "source": (cached_sources or [None])[0],
+            "sources": cached_sources or [],
             "synthesized": True,
         }
 

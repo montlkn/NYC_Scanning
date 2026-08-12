@@ -574,16 +574,30 @@ async def _describe_from_fields(
     return None
 
 
-async def _cache_storytelling(session: AsyncSession, bin_val: str, lore: str):
-    """Write generated lore back to buildings_full_merge_scanning."""
+async def _cache_storytelling(session: AsyncSession, bin_val: str, lore: str,
+                              sources: Optional[list[str]] = None):
+    """Write generated lore back to buildings_full_merge_scanning.
+
+    Citations are written WITH the text, in `storytelling_sources`. They used to
+    be computed during generation and discarded, so a cache hit returned prose
+    with no citations at all — and a cache hit is every read after the first,
+    which meant citations effectively never reached the app despite the chain
+    producing them correctly every time.
+    """
+    import json as _json
     try:
         await session.execute(
             text("""
                 UPDATE buildings_full_merge_scanning
-                SET storytelling = :lore
+                SET storytelling = :lore,
+                    -- COALESCE so a regeneration that finds no citations does
+                    -- not erase ones an earlier run did find.
+                    storytelling_sources =
+                      COALESCE(CAST(:sources AS jsonb), storytelling_sources)
                 WHERE REPLACE(bin, '.0', '') = :bin
             """),
-            {'lore': lore, 'bin': bin_val}
+            {'lore': lore, 'bin': bin_val,
+             'sources': _json.dumps(sources) if sources else None}
         )
         await session.commit()
         logger.info(f"Cached lore to DB for BIN {bin_val}")
@@ -748,16 +762,17 @@ async def generate_building_lore_detailed(
         lore = await _synthesize(raw, building_name, address, year_built,
                                            style, architect, block_ctx, arch_n, near)
         if lore:
-            if cache_to_db:
-                await _cache_storytelling(session, bin_val, lore)
             # The designation report is the primary citation; the firm's own
             # page is the one thing it cannot supply, and this tier short-
             # circuits before Brave just as the Wikipedia one does.
+            # Resolved BEFORE caching so the citations are stored with the text.
             from services import brave_search as _bs
             extra = await _bs.architect_citation(architect, building_name or address)
+            all_sources = _merge_sources([src], extra)
+            if cache_to_db:
+                await _cache_storytelling(session, bin_val, lore, all_sources)
             return LoreResult(text=lore, tier="landmark_chunks", specificity=spec,
-                              source=src, synthesized=True,
-                              sources=_merge_sources([src], extra))
+                              source=src, synthesized=True, sources=all_sources)
         # Synthesis failed (missing/failing API key, timeout). Do NOT serve the
         # raw chunk: a designation report opens with hearing boilerplate — "Six
         # witnesses spoke in favor of designation. There were no speakers in
@@ -785,16 +800,18 @@ async def generate_building_lore_detailed(
             synthesized = bool(lore)
             if not lore:
                 lore = raw
-            if cache_to_db:
-                await _cache_storytelling(session, bin_val, lore)
             # One extra query for the firm's own page. This tier answers a lot of
             # the buildings people actually care about, and short-circuiting here
             # meant they cited Wikipedia and nothing else.
+            # Resolved BEFORE caching so the citations are stored with the text.
             from services import brave_search as _bs
             extra = await _bs.architect_citation(architect, building_name or address)
+            all_sources = _merge_sources([wiki_url], extra)
+            if cache_to_db:
+                await _cache_storytelling(session, bin_val, lore, all_sources)
             return LoreResult(text=lore, tier="wikipedia", specificity="building",
                               source=wiki_url, synthesized=synthesized,
-                              sources=_merge_sources([wiki_url], extra))
+                              sources=all_sources)
 
     # 3. Paid search — the ONLY tier that hits the open web, and the only one
     # that costs money beyond tokens. N literal queries in, N billed, always.
@@ -827,9 +844,9 @@ async def generate_building_lore_detailed(
                                                year_built, style, architect,
                                                block_ctx, arch_n, near)
             if lore:
-                if cache_to_db:
-                    await _cache_storytelling(session, bin_val, lore)
                 urls = brave_search.source_urls(results)
+                if cache_to_db:
+                    await _cache_storytelling(session, bin_val, lore, urls)
                 # No extra architect query here: this tier already RAN the
                 # architect query as part of its fan-out, so the firm page is
                 # in `urls` if it exists. Asking again would bill twice.
