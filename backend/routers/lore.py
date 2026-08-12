@@ -47,6 +47,10 @@ async def get_building_lore(
     request: Request,
     bin_val: str,
     refresh: bool = Query(False, description="Bypass the cached storytelling column"),
+    generate: bool = Query(
+        True,
+        description="When false, serve cache only — never run the billed chain",
+    ),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """
@@ -54,6 +58,13 @@ async def get_building_lore(
 
     Serves the cached `storytelling` column when present unless `refresh=true`,
     otherwise runs the tier chain and caches the result.
+
+    `generate=false` is the PREFETCH contract: answer from cache or say nothing,
+    and never spend. The map warms lore for the strongest picks whenever its
+    canon refreshes — on pan AND zoom — which at ~4 Brave queries plus an LLM
+    call per building was real money for buildings nobody tapped. One tester
+    produced 287 search requests before launch. A prefetch wants an instant tap
+    for something already generated; it never justified paying to generate.
     """
     # BINs are stored numeric-as-text and reach us with a '.0' suffix from
     # several callers; normalise once here so every lookup below agrees.
@@ -92,6 +103,22 @@ async def get_building_lore(
             "source": (cached_sources or [None])[0],
             "sources": cached_sources or [],
             "synthesized": True,
+        }
+
+    # Cache miss on a cache-only request. Return the same shape a declined chain
+    # returns, so the caller needs no special case, and spend nothing: no Brave
+    # queries, no LLM call, no `storytelling` write. Returning early here rather
+    # than passing a flag downward keeps the guarantee readable — there is no
+    # path from this branch into the billed chain.
+    if not generate:
+        return {
+            "bin": bin_clean,
+            "lore": None,
+            "tier": None,
+            "specificity": None,
+            "source": None,
+            "sources": [],
+            "synthesized": False,
         }
 
     result = await generate_building_lore_detailed(

@@ -19,6 +19,7 @@ Usage:
     lore = await generate_building_lore(session, bin_val, building_name, ...)
 """
 
+import asyncio
 import math
 import os
 import logging
@@ -778,15 +779,26 @@ async def generate_building_lore_detailed(
         block_ctx = await _get_block_context(session, bin_val)
         arch_n = await _get_architect_catalogue_count(session, architect)
         near = await _get_nearby_lore(session, bin_val)
+        # The designation report is the primary citation; the firm's own page is
+        # the one thing it cannot supply, and this tier short-circuits before
+        # Brave just as the Wikipedia one does.
+        from services import brave_search as _bs
+        cite_task = asyncio.create_task(
+            _bs.architect_citation(architect, building_name or address)
+        )
         lore = await _synthesize(raw, building_name, address, year_built,
                                            style, architect, block_ctx, arch_n, near)
+        extra = await cite_task
         if lore:
-            # The designation report is the primary citation; the firm's own
-            # page is the one thing it cannot supply, and this tier short-
-            # circuits before Brave just as the Wikipedia one does.
-            # Resolved BEFORE caching so the citations are stored with the text.
-            from services import brave_search as _bs
-            extra = await _bs.architect_citation(architect, building_name or address)
+            # Citation lookup starts BEFORE synthesis and is awaited after, so
+            # its Brave round trip overlaps the LLM call instead of following
+            # it. Citation-only -- it never feeds the prompt -- so nothing
+            # depends on the ordering.
+            #
+            # The three context helpers above are deliberately NOT gathered:
+            # they share one AsyncSession, and SQLAlchemy forbids concurrent
+            # operations on a single session. Parallelising them needs separate
+            # sessions, which is a bigger change than this latency is worth.
             all_sources = _merge_sources([src], extra)
             if cache_to_db:
                 await _cache_storytelling(session, bin_val, lore, all_sources)
@@ -811,20 +823,24 @@ async def generate_building_lore_detailed(
             block_ctx = await _get_block_context(session, bin_val)
             arch_n = await _get_architect_catalogue_count(session, architect)
             near = await _get_nearby_lore(session, bin_val)
+            # Same overlap as the landmark tier: the citation query runs while
+            # the model writes.
+            from services import brave_search as _bs
+            cite_task = asyncio.create_task(
+                _bs.architect_citation(architect, building_name or address)
+            )
             lore = await _synthesize(raw, building_name, address, year_built,
                                                style, architect, block_ctx, arch_n, near)
+            extra = await cite_task
             # A Wikipedia extract is at least written prose, so serving it raw is
             # tolerable where raw LPC typescript is not. It is still marked
             # unsynthesized so the cost/quality split stays visible.
             synthesized = bool(lore)
             if not lore:
                 lore = raw
-            # One extra query for the firm's own page. This tier answers a lot of
-            # the buildings people actually care about, and short-circuiting here
-            # meant they cited Wikipedia and nothing else.
-            # Resolved BEFORE caching so the citations are stored with the text.
-            from services import brave_search as _bs
-            extra = await _bs.architect_citation(architect, building_name or address)
+            # One extra query for the firm's own page. This tier answers a lot
+            # of the buildings people actually care about, and short-circuiting
+            # here meant they cited Wikipedia and nothing else.
             all_sources = _merge_sources([wiki_url], extra)
             if cache_to_db:
                 await _cache_storytelling(session, bin_val, lore, all_sources)
