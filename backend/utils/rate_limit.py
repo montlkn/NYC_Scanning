@@ -54,7 +54,15 @@ logger = logging.getLogger(__name__)
 # no honest crowd would exceed per day.
 
 # LLM synthesis + billed Brave queries. Every uncached call costs cents.
-LIMIT_INFERENCE = "20/minute;300/day"
+# 60/min, not 20. The 20 was derived from what a human on foot can do (~2-3
+# scans/min), but the CLIENT does not issue one request per scan: opening the
+# map prefetches lore for every visible building, which is 8-15 requests in a
+# couple of seconds. Real browsing tripped this constantly -- the field test log
+# is a wall of 429s and timeouts on ordinary panning.
+#
+# The daily cap is the real spend guard and stays proportionate; the per-minute
+# figure only needs to be above a legitimate burst, and 20 was below it.
+LIMIT_INFERENCE = "60/minute;600/day"
 
 # Scan bookkeeping: confirm + opt-in photo upload. One per building actually
 # visited. Cheap individually, but the photo path writes to R2.

@@ -359,13 +359,27 @@ async def _synthesize(
         "grounding rules: every factual claim (year, architect, style, "
         "designation, tenant, history) must come from the source material or "
         "a verifiable web search of THIS specific building. Do not invent "
-        "names, dates, or events. If the source material doesn't have "
-        "anything beyond generic district designation, say so plainly using "
-        "only the verified building fields — don't pad with filler.\n\n"
+        "names, dates, or events.\n\n"
+        "NEVER narrate the absence of information. Do not write 'the provided "
+        "source does not document', 'records are unclear', 'little is known', "
+        "or any variant — shipped live as \"Beyond those building fields, the "
+        "provided source does not document its original sponsor, purpose, or "
+        "later tenants.\" The reader came for the building, not a report on our "
+        "sourcing. If the material is thin, write two good sentences about what "
+        "IS known and stop. Length is never the goal.\n\n"
+        # Formatting parity with the CLIENT's narrative prompt. Both write into
+        # the same cached column and the app renders both through the same
+        # markdown view, so a difference here reads as the app randomly getting
+        # worse. This prompt said "no markdown" while the client asks for bold
+        # and italic — so the moment the backend started answering first, every
+        # well-known building silently lost its formatting. That was the most
+        # visible half of what looked like a total quality collapse.
+        "Format with light markdown: **bold** for proper nouns (building "
+        "names, people, organisations) and _italic_ for architectural terms "
+        "and styles. Flowing prose only — no bullets, no headers, no lists.\n\n"
         "Hard bans: 'rose amid', 'quiet sentinel', 'bustling streets', "
         "'whisper of jazz', 'sentinel on a street', 'time capsule', "
-        "'frozen in time', 'turn-of-the-century dreams'. No clichés. No "
-        "markdown, no bullets, no headers.\n\n"
+        "'frozen in time', 'turn-of-the-century dreams'. No clichés.\n\n"
         "The source is OCR'd from scanned reports and contains scanning "
         "errors — 'Buiiding' for 'Building', 'Centw:y' for 'Century', "
         "'AROITTECT' for 'ARCHITECT', stray punctuation inside words. Read "
@@ -557,6 +571,11 @@ async def _describe_from_fields(
         "padded ones. Describing what a style and era MEAN in general terms is "
         "allowed and encouraged; asserting anything specific that is not in the "
         "fields is not.\n\n"
+        "NEVER narrate the absence of information — no 'records do not show', "
+        "no 'the source does not document', no apologising for what you lack. "
+        "Write what is known and stop.\n\n"
+        "Format with light markdown: **bold** for proper nouns and _italic_ "
+        "for architectural terms and styles. Flowing prose only.\n\n"
         "Hard bans: 'rose amid', 'quiet sentinel', 'bustling streets', "
         "'whisper of jazz', 'sentinel on a street', 'time capsule', "
         "'frozen in time'. No clichés. No markdown."
