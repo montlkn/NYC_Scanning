@@ -1,21 +1,30 @@
 """
-OpenAI text client for lore synthesis.
+OpenAI text client. The backend's ONLY LLM client as of 2026-08-11.
 
-Why synthesis moved here
-────────────────────────
+Why everything moved here
+─────────────────────────
 Synthesis is the ideal cheap-model job: the facts are already supplied as
-grounded source text (an LPC designation report or a Wikipedia extract), so the
-model is rewriting, not researching. gpt-5.6-luna is $0.20/$1.20 per 1M tokens,
-and a lore call is ~2K in / ~300 out — a fraction of a cent.
+grounded source text (an LPC designation report, a Wikipedia extract, Brave
+results), so the model is rewriting, not researching. gpt-5.6-luna is
+$0.20/$1.20 per 1M tokens, and a lore call is ~2K in / ~300 out — a fraction of
+a cent.
 
-It also closes a real cost leak. `services.grok.grok_text` defaults to
+It also closes a real cost leak. The Grok client this replaced defaulted to
 `search_enabled=True`, so every tier-1 synthesis over already-free LPC text was
 asking a model to run live web search anyway. The entire point of tier 1 is
-that it costs nothing beyond tokens. This client sends no tools at all, so the
-cheap tier is actually cheap.
+that it costs nothing beyond tokens. This client sends NO TOOLS AT ALL, which is
+the property that makes the cheap tiers actually cheap — and it is deliberate,
+not an oversight. Search belongs to `brave_search`, where the query count is a
+constant we set (MAX_QUERIES) rather than a number a model chooses. Agentic
+search is what reached 13–24 queries and $0.55 on a single building.
 
-Requires OPENAI_API_KEY in the environment. Callers must handle None and fall
-back — the key is not yet set in every deployment.
+If you are tempted to add a `web_search` tool here, you are re-opening that
+leak. Add a capped tier to the chain instead.
+
+Requires OPENAI_API_KEY. Callers must handle None — but note `assert_configured`
+below: a missing key is now logged loudly at startup rather than degrading in
+silence, because three separate env-gated features in this chain each failed
+closed without a word in the logs, and that cost a full debugging session.
 """
 
 import logging
@@ -37,12 +46,32 @@ def is_configured() -> bool:
     return bool(OPENAI_API_KEY)
 
 
+def assert_configured() -> None:
+    """Say plainly, at startup, whether the LLM is wired up.
+
+    Every failure mode in this chain is a silent one: no key means
+    `is_configured()` returns False and callers skip their work without
+    erroring. Requests still return 200 with a null field, which reads as "this
+    building has no lore" rather than "the service is misconfigured". Called
+    from main.py so the answer is in the deploy log, not inferred from latency.
+    """
+    if OPENAI_API_KEY:
+        logger.info(f"[LLM] openai configured, model={OPENAI_TEXT_MODEL}")
+    else:
+        logger.error(
+            "[LLM] OPENAI_API_KEY is NOT set — all lore synthesis will be "
+            "skipped and /api/lore will return null. Set it in the Railway "
+            "service variables."
+        )
+
+
 async def openai_text(
     *,
     system: str,
     user: str,
     max_tokens: int = 1200,
     timeout_s: float = 30.0,
+    cache_key: str = "jink-lore-synth",
 ) -> Optional[str]:
     """Text in, text out. No tools, so no search is ever billed.
 
@@ -72,8 +101,10 @@ async def openai_text(
         # both cuts cost and removes the truncation pressure.
         "reasoning": {"effort": "none"},
         # Stable prefix key so the large, static system prompt is billed at the
-        # cached-input rate across calls.
-        "prompt_cache_key": "jink-lore-synth",
+        # cached-input rate across calls. Per-caller, because the cache keys on
+        # a shared PREFIX: pooling unrelated system prompts under one key means
+        # none of them match and the discount silently never applies.
+        "prompt_cache_key": cache_key,
     }
 
     async def _post(payload: dict) -> Optional[httpx.Response]:

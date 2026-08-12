@@ -20,7 +20,9 @@ from models.config import get_settings
 from models.session import init_db, close_db
 from models.footprints_session import init_footprints_engine, close_footprints_db, footprints_db_ok
 from models.search_session import init_search_engine, close_search_db
-from routers import scan, scan_photo, buildings, stamps, vetting, rag, search, lore
+from routers import (
+    scan, scan_photo, buildings, stamps, vetting, rag, search, lore, websearch,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -65,6 +67,24 @@ async def lifespan(app: FastAPI):
     logger.info("🚀 Starting NYC Scan Backend...")
     logger.info(f"Environment: {settings.env}")
     logger.info(f"Debug Mode: {settings.debug}")
+
+    # Say which external providers are actually wired up. Both of these gate
+    # their features on a bare `if key:` and skip silently when unset, so a
+    # missing variable produces a 200 with an empty field rather than an error.
+    # That is indistinguishable from "this building has no lore" over HTTP, and
+    # it cost a full debugging session to tell apart. The deploy log now answers
+    # it directly.
+    from services.openai_text import assert_configured as _assert_llm
+    from services import brave_search as _brave
+    _assert_llm()
+    if _brave.is_configured():
+        logger.info(f"[SEARCH] brave configured, max {_brave.MAX_QUERIES} queries/building")
+    else:
+        logger.warning(
+            "[SEARCH] BRAVE_API_KEY is NOT set — the web tier is disabled; "
+            "buildings with no LPC report or Wikipedia article fall back to a "
+            "fields-only description."
+        )
 
     # Initialize database connection
     logger.info("Initializing database connection...")
@@ -221,6 +241,10 @@ app.include_router(vetting.router, prefix="/api", tags=["vetting"])
 app.include_router(rag.router, prefix="/api", tags=["rag"])
 app.include_router(lore.router, prefix="/api", tags=["lore"])
 app.include_router(search.router, prefix="/api", tags=["search"])
+# Same /api/search prefix as above, different routes (POST /sources). Kept in
+# its own module because it is a capped Brave fan-out for CLIENTS, not part of
+# the vector-search ranking stack.
+app.include_router(websearch.router, prefix="/api", tags=["search"])
 
 
 if __name__ == "__main__":

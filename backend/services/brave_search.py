@@ -40,8 +40,21 @@ BRAVE_URL = "https://api.search.brave.com/res/v1/web/search"
 
 # Hard ceiling on queries per building. The whole point of moving off agentic
 # search is that this number is OURS. Raising it raises the bill linearly and
-# predictably, which is the property that was missing before.
-MAX_QUERIES = 3
+# predictably, which is the property that was missing before — an agentic model
+# choosing 24 queries could not be reasoned about at all, whereas this is
+# multiplication.
+#
+# 4, not 3. At 3 the list below was cut exactly where the architect query sat,
+# so the highest-value citation we can produce was never searched for. The
+# cheapest fix for "the results are weak" is asking a DIFFERENT question, not
+# asking the same ones again — each query here attacks the subject from its own
+# angle (identity, architect, address, story), so a fourth is a genuinely new
+# chance rather than a retry.
+#
+# Keep this in step with the cost per building: queries x (plan rate). Raising
+# it is a deliberate spend decision, which is exactly the property agentic
+# search denied us.
+MAX_QUERIES = 4
 RESULTS_PER_QUERY = 5
 
 
@@ -78,10 +91,23 @@ def build_queries(building_name: Optional[str], address: Optional[str],
 
     subject = f'"{name}"' if (name and name != "0") else (f'"{addr}"' if addr else "")
 
+    # ORDER IS THE CAP. Everything past MAX_QUERIES is silently discarded
+    # below, so this list is a priority ranking, not a wish list.
+    #
+    # The architect query used to sit LAST and was therefore dropped for every
+    # named building that also had an address and categories — which is most of
+    # the interesting ones. That silently defeated the client's whole citation
+    # ranking: `sourcesBlock` scores firm domains FIRST and takes an `architect`
+    # argument purely to bubble them up, but the firm page could never be in the
+    # result set because nothing ever searched for it. It is second now: a
+    # building's architect page is the single highest-value citation we can
+    # return, and it is the one an encyclopedia link cannot substitute for.
     queries: list[str] = []
     if name and name != "0":
         queries.append(f'"{name}" New York building history')
-    if addr:
+    if arch and (name or addr):
+        queries.append(f'{arch} architect "{name or addr}"')
+    if addr and addr != name:
         queries.append(f'"{addr}" New York City building history')
     if categories and subject:
         # Story sweep — see docstring. Category slugs are used verbatim so the
@@ -90,8 +116,6 @@ def build_queries(building_name: Optional[str], address: Optional[str],
         terms = " OR ".join(sorted({c.strip() for c in categories if c and c.strip()}))
         if terms:
             queries.append(f"{subject} New York {terms}")
-    if arch and (addr or name):
-        queries.append(f'{arch} architect "{addr or name}"')
     if not queries and year_built:
         queries.append(f"New York City building built {year_built} history")
 
@@ -150,6 +174,85 @@ async def search(queries: list[str], timeout_s: float = 12.0) -> list[dict]:
 
     logger.info(f"[BRAVE] {len(queries)} queries -> {len(out)} unique results")
     return out
+
+
+# Domains that answer any address query with a generated page and no history:
+# listing sites, rental aggregators, data scrapers. They rank well and say
+# nothing, and a snippet from one reads to the model as real material about the
+# building — the failure is silent because the prose that results is fluent.
+_JUNK_HOSTS = (
+    "zillow.com", "trulia.com", "streeteasy.com", "realtor.com", "redfin.com",
+    "apartments.com", "rentcafe.com", "loopnet.com", "propertyshark.com",
+    "yelp.com", "tripadvisor.com", "mapquest.com", "zolo.com",
+)
+
+
+# Words that carry no identifying power here: they appear in a large share of
+# NYC building names AND in unrelated pages, so matching on one is the same as
+# not filtering. Left as a literal set rather than derived — this is a property
+# of English and NYC addressing, not of our data, so there is nothing to query.
+_GENERIC_TOKENS = frozenset({
+    "building", "buildings", "house", "tower", "towers", "center", "centre",
+    "hall", "apartments", "apartment", "street", "avenue", "place", "road",
+    "york", "city", "york's", "west", "east", "north", "south", "the", "and",
+})
+
+
+def filter_relevant(results: list[dict], building_name: Optional[str],
+                    address: Optional[str]) -> list[dict]:
+    """Drop results that are obviously not about this subject.
+
+    Answers the "what if the results are junk?" case, which is NOT the same as
+    the empty case: empty falls through to the next tier honestly, whereas junk
+    gets synthesized into confident prose about the wrong building. Address
+    queries in particular pull listing sites that carry the address and no
+    history at all.
+
+    Deliberately conservative, in two ways. It only removes a result on POSITIVE
+    evidence of irrelevance — a known junk host, or a total miss on every
+    subject token — rather than scoring relevance and keeping the top N. And it
+    NEVER returns empty when it was given input: if every result fails, the
+    filter is more likely wrong than the whole result set, so the originals are
+    returned and the synthesis prompt's own grounding rules take over. A filter
+    that can starve the model is worse than no filter.
+    """
+    if not results:
+        return results
+
+    tokens = set()
+    for src in (building_name, address):
+        for t in (src or "").lower().replace(",", " ").split():
+            # Short tokens ("the", "st") match everything, and the generic
+            # architecture vocabulary below appears in most NYC building names
+            # AND most unrelated pages — matching on "building" makes the check
+            # meaningless, which is what the first version of this did.
+            if len(t) >= 4 and not t.isdigit() and t not in _GENERIC_TOKENS:
+                tokens.add(t)
+    # A house number IS distinctive when present, unlike a bare short word.
+    for t in (address or "").split():
+        if t.isdigit() and len(t) >= 2:
+            tokens.add(t)
+
+    kept = []
+    for r in results:
+        host = (r.get("url") or "").lower()
+        if any(j in host for j in _JUNK_HOSTS):
+            continue
+        if tokens:
+            hay = f"{r.get('title','')} {r.get('description','')}".lower()
+            if not any(t in hay for t in tokens):
+                continue
+        kept.append(r)
+
+    if not kept:
+        logger.info(
+            f"[BRAVE] relevance filter rejected all {len(results)} results; "
+            f"keeping originals rather than starving synthesis"
+        )
+        return results
+    if len(kept) < len(results):
+        logger.info(f"[BRAVE] relevance filter {len(results)} -> {len(kept)}")
+    return kept
 
 
 def as_source_text(results: list[dict], max_chars: int = 3000) -> Optional[str]:

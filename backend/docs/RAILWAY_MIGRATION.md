@@ -53,14 +53,20 @@ Copy every value from the current Render service (Render dashboard → nyc-scan-
   live in the same project; verify with `psql` before cutover)
 - `FOOTPRINTS_DB_URL` — Railway PostGIS footprints DB (`Settings.footprints_db_url`)
 - `SUPABASE_SERVICE_KEY` — service-role key, used by write paths
-- `GROK_API_KEY` (or `XAI_API_KEY`) — lore generation + unified-search prose
-  interpretation refinement (`services/grok.py`)
+- `OPENAI_API_KEY` — the backend's only LLM. Drives all lore synthesis and
+  unified-search interpretation (`services/openai_text.py`). Without it
+  `/api/lore` returns `null` for every uncached building; the startup log says
+  so explicitly.
+- `BRAVE_API_KEY` — the only tier that searches the open web
+  (`services/brave_search.py`). Without it the chain still answers from LPC
+  reports and Wikipedia, then drops to a fields-only description; buildings with
+  no designation report lose their researched history.
 - `REDIS_URL` — caching; app runs without it but loses cache benefits
 - `R2_BUCKET` (default `"building-images"` if unset)
 - `R2_USER_IMAGES_BUCKET` / `R2_USER_IMAGES_PUBLIC_URL`
 
 **Optional:**
-- `GROK_TEXT_MODEL` (defaults to `grok-4-1-fast-non-reasoning`)
+- `OPENAI_TEXT_MODEL` (defaults to `gpt-5.6-luna`)
 - `PERPLEXITY_API_KEY`
 - `SENTRY_DSN` (has a hardcoded fallback in `main.py` — override if you want
   a separate Sentry project for Railway vs Render during dual-run)

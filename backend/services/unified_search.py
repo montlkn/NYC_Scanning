@@ -16,8 +16,8 @@ from typing import Any, Dict, List, Optional, Sequence
 
 # ---------------------------------------------------------------------------
 # Intent router — cheap, deterministic, rules-first. No LLM call on this path;
-# Grok is reserved for `prose` intent refinement (off the critical path, see
-# routers/search.py::_maybe_refine_with_grok).
+# the LLM is reserved for `prose` intent refinement (off the critical path, see
+# routers/search.py::_refine_and_cache_interpretation).
 # ---------------------------------------------------------------------------
 
 INTENTS = ("name", "address", "poi", "architect", "style", "lore", "event", "prose")
