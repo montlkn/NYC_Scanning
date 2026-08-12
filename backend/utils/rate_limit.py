@@ -111,8 +111,34 @@ def client_ip(request: Request) -> str:
 # Redis the effective limit is N times the configured one, which still bounds
 # the damage but is not exact — set REDIS_URL in Railway if you scale out.
 _storage_uri = os.getenv("REDIS_URL") or os.getenv("RATE_LIMIT_STORAGE_URI")
+
 if _storage_uri:
-    logger.info("[ratelimit] using shared storage backend")
+    # VERIFY the backend before handing it to the limiter. `limits` connects
+    # LAZILY, so an unreachable Redis does not fail at startup — it fails on the
+    # first request to every limited route, as an unhandled exception, which
+    # FastAPI renders as a 500. The limiter then takes down precisely the routes
+    # it exists to protect, and the logs blame the endpoint rather than the
+    # storage. Observed in production 2026-08-11: /health (limiter-exempt)
+    # served 200 while /api/lore and /api/search/sources both 500'd.
+    #
+    # Falling back to in-memory is strictly better than failing closed. Counters
+    # stop being shared across replicas, so the effective limit becomes N times
+    # the configured one — still bounded, still far below what an abuser needs
+    # to matter, and the service stays up.
+    try:
+        from limits.storage import storage_from_string
+
+        _probe = storage_from_string(_storage_uri)
+        if not _probe.check():
+            raise RuntimeError("storage health check returned False")
+        logger.info("[ratelimit] using shared storage backend (verified)")
+    except Exception as e:
+        logger.error(
+            f"[ratelimit] storage {_storage_uri.split('@')[-1]} unusable ({e}); "
+            f"falling back to in-memory counters. Limits are now PER-PROCESS — "
+            f"fix REDIS_URL rather than leaving this in place."
+        )
+        _storage_uri = None
 else:
     logger.info("[ratelimit] no REDIS_URL — using in-memory counters (per-process)")
 
@@ -120,13 +146,32 @@ else:
 # redeploy of code, for the case where a bad limit is locking out real users.
 _enabled = os.getenv("RATE_LIMIT_ENABLED", "true").lower() not in ("0", "false", "no")
 
-limiter = Limiter(
+_limiter_kwargs = dict(
     key_func=client_ip,
     default_limits=LIMIT_DEFAULT,
     storage_uri=_storage_uri,
     enabled=_enabled,
     headers_enabled=True,  # emits X-RateLimit-* on every response
 )
+
+# `swallow_errors` makes a storage failure DURING operation degrade to "allow
+# the request" instead of raising into the response — the same fail-open stance
+# as the probe above, but for a backend that dies after startup rather than
+# before it. The probe cannot cover that case; together they do.
+#
+# Introduced conditionally because the keyword is not in every slowapi release
+# and an unexpected kwarg is a TypeError at import time, which would take the
+# whole service down to guard against the service going down. Verified by
+# construction rather than by version string, since the installed version is
+# whatever Railway resolved.
+try:
+    limiter = Limiter(**_limiter_kwargs, swallow_errors=True)
+except TypeError:
+    logger.warning(
+        "[ratelimit] slowapi build has no swallow_errors; a mid-life storage "
+        "failure will surface as 5xx on limited routes"
+    )
+    limiter = Limiter(**_limiter_kwargs)
 
 
 async def rate_limit_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
