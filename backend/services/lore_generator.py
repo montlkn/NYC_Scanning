@@ -81,6 +81,36 @@ async def _get_lore_categories() -> Optional[list[str]]:
     return _LORE_CATEGORIES
 
 
+# Enrichment context is NICE-TO-HAVE, never load-bearing: block comparisons,
+# the architect's catalogue count, nearby lore. The narrative reads fine without
+# any of them, so none of them should be allowed to dominate the response.
+#
+# Measured 2026-08-12: a forced regeneration took 20.2s while the CLIENT does the
+# same synthesis on the same model in 2.9s. The gap is not the LLM and it was not
+# the citation query (overlapping that changed nothing) -- it is these lookups.
+# `_get_block_context` runs ST_DWithin across 1.08M footprints and
+# `_get_nearby_lore` scans the search index, both on a remote Railway database.
+#
+# Bounding them converts an unpredictable multi-second stall into a known
+# ceiling. A timeout costs one sentence of colour; it does not cost the lore.
+CONTEXT_TIMEOUT_S = 3.0
+
+
+async def _bounded(coro, label: str):
+    """Await `coro`, giving up after CONTEXT_TIMEOUT_S. Returns None on timeout
+    or error -- every caller already treats None as "no extra context"."""
+    try:
+        return await asyncio.wait_for(coro, timeout=CONTEXT_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        logger.warning(
+            f"[lore] {label} exceeded {CONTEXT_TIMEOUT_S}s; continuing without it"
+        )
+        return None
+    except Exception as e:
+        logger.warning(f"[lore] {label} failed: {e}")
+        return None
+
+
 async def _get_block_context(session: AsyncSession, bin_val: str) -> Optional[str]:
     """Computed facts about how this building sits among its ACTUAL neighbours.
 
@@ -776,9 +806,9 @@ async def generate_building_lore_detailed(
     # 1. Landmark chunks (LPC-sourced, free) — stored on Railway → synthesize
     raw, spec, src = await _get_raw_chunks_detailed(bin_val, building_name)
     if raw:
-        block_ctx = await _get_block_context(session, bin_val)
-        arch_n = await _get_architect_catalogue_count(session, architect)
-        near = await _get_nearby_lore(session, bin_val)
+        block_ctx = await _bounded(_get_block_context(session, bin_val), 'block_context')
+        arch_n = await _bounded(_get_architect_catalogue_count(session, architect), 'architect_count')
+        near = await _bounded(_get_nearby_lore(session, bin_val), 'nearby_lore')
         # The designation report is the primary citation; the firm's own page is
         # the one thing it cannot supply, and this tier short-circuits before
         # Brave just as the Wikipedia one does.
@@ -820,9 +850,9 @@ async def generate_building_lore_detailed(
         wiki = await _get_lore_from_wikipedia(building_name, address)
         if wiki:
             raw, wiki_url = wiki
-            block_ctx = await _get_block_context(session, bin_val)
-            arch_n = await _get_architect_catalogue_count(session, architect)
-            near = await _get_nearby_lore(session, bin_val)
+            block_ctx = await _bounded(_get_block_context(session, bin_val), 'block_context')
+            arch_n = await _bounded(_get_architect_catalogue_count(session, architect), 'architect_count')
+            near = await _bounded(_get_nearby_lore(session, bin_val), 'nearby_lore')
             # Same overlap as the landmark tier: the citation query runs while
             # the model writes.
             from services import brave_search as _bs
@@ -872,9 +902,9 @@ async def generate_building_lore_detailed(
         )
         raw = brave_search.as_source_text(results)
         if raw:
-            block_ctx = await _get_block_context(session, bin_val)
-            arch_n = await _get_architect_catalogue_count(session, architect)
-            near = await _get_nearby_lore(session, bin_val)
+            block_ctx = await _bounded(_get_block_context(session, bin_val), 'block_context')
+            arch_n = await _bounded(_get_architect_catalogue_count(session, architect), 'architect_count')
+            near = await _bounded(_get_nearby_lore(session, bin_val), 'nearby_lore')
             lore = await _synthesize(raw, building_name, address,
                                                year_built, style, architect,
                                                block_ctx, arch_n, near)
