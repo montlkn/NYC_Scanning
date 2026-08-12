@@ -141,10 +141,18 @@ async def search(queries: list[str], timeout_s: float = 12.0) -> list[dict]:
         "X-Subscription-Token": BRAVE_API_KEY,
     }
     seen_urls: set[str] = set()
-    out: list[dict] = []
+    # Per-query buckets, interleaved at the end. Appending query-by-query into
+    # one flat list looked harmless but was not: callers truncate (source_urls
+    # takes the first 3, as_source_text fills a char budget), so a flat list
+    # meant the truncation fell entirely inside QUERY 1 and every later query
+    # was structurally unable to contribute a citation. Reordering the queries
+    # could not fix that -- whichever query ran first took every slot.
+    buckets: list[list[dict]] = []
 
     async with httpx.AsyncClient(timeout=timeout_s) as client:
         for q in queries[:MAX_QUERIES]:
+            bucket: list[dict] = []
+            buckets.append(bucket)
             try:
                 resp = await client.get(
                     BRAVE_URL, headers=headers,
@@ -166,13 +174,27 @@ async def search(queries: list[str], timeout_s: float = 12.0) -> list[dict]:
                 if not url or url in seen_urls:
                     continue
                 seen_urls.add(url)
-                out.append({
+                bucket.append({
                     "title": (r.get("title") or "").strip(),
                     "url": url,
                     "description": (r.get("description") or "").strip(),
                 })
 
-    logger.info(f"[BRAVE] {len(queries)} queries -> {len(out)} unique results")
+    # Round-robin: every query's best result before any query's second. The
+    # architect query is the reason this matters — its top hit is usually the
+    # firm's own page, the highest-value citation available and the one the
+    # client's ranking exists to promote, and under the old flat order it never
+    # survived truncation.
+    out: list[dict] = []
+    for rank in range(RESULTS_PER_QUERY):
+        for bucket in buckets:
+            if rank < len(bucket):
+                out.append(bucket[rank])
+
+    logger.info(
+        f"[BRAVE] {len(queries)} queries -> {len(out)} unique results "
+        f"(per-query: {[len(b) for b in buckets]})"
+    )
     return out
 
 
@@ -275,10 +297,16 @@ def as_source_text(results: list[dict], max_chars: int = 3000) -> Optional[str]:
     return "\n".join(lines) if lines else None
 
 
-def source_urls(results: list[dict], limit: int = 3) -> list[str]:
+def source_urls(results: list[dict], limit: int = 4) -> list[str]:
     """URLs actually handed to the model, for a deterministic SOURCES block.
 
     These are ours, not the model's: it cannot cite a page it was never given,
     which removes the whole class of invented and wrong-building citations.
+
+    `limit` tracks MAX_QUERIES because `search` returns results round-robin
+    across queries: at 4 the top hit from each of the four angles (identity,
+    architect, address, story) gets a slot. At the old 3 the story sweep was
+    always cut, and before the interleave the first three slots were all query
+    one — so the architect and address angles could never appear at all.
     """
     return [r["url"] for r in results[:limit]]
