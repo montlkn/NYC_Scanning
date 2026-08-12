@@ -130,6 +130,38 @@ def build_queries(building_name: Optional[str], address: Optional[str],
     return out[:MAX_QUERIES]
 
 
+def _dedupe_key(url: str) -> str:
+    """Collapse URLs that are the same page wearing different clothes.
+
+    Exact-URL dedupe left near-duplicates in place, and because the caller only
+    keeps the top few, a duplicate does not merely repeat — it EVICTS a
+    different source. Observed on VIA 57 West, where two casings of the same
+    Wikipedia article and two cityrealty URLs differing by one path segment
+    took all four citation slots between them.
+
+    Two normalisations, both conservative:
+      * lowercase — `/wiki/VIA_57_West` and `/wiki/Via_57_West` are one article
+      * host + last path segment — `/review/57292` and `/57292` are one page,
+        the extra segment being a site's own view of its record
+
+    The second is the aggressive one, so it is applied only when that segment
+    is distinctive (>= 4 chars): collapsing on `/en` or `/1` would merge pages
+    that genuinely differ.
+    """
+    u = url.strip().lower().rstrip("/")
+    u = u.split("#", 1)[0].split("?", 1)[0]
+    try:
+        rest = u.split("://", 1)[1]
+    except IndexError:
+        return u
+    host, _, path = rest.partition("/")
+    host = host.removeprefix("www.")
+    segs = [s for s in path.split("/") if s]
+    if segs and len(segs[-1]) >= 4:
+        return f"{host}/{segs[-1]}"
+    return f"{host}/{path}"
+
+
 async def search(queries: list[str], timeout_s: float = 12.0) -> list[dict]:
     """Run each query once. Returns [{title, url, description}], de-duplicated
     by URL. Never raises — a search failure degrades to no lore, not an error."""
@@ -171,9 +203,12 @@ async def search(queries: list[str], timeout_s: float = 12.0) -> list[dict]:
                 continue
             for r in results:
                 url = r.get("url")
-                if not url or url in seen_urls:
+                if not url:
                     continue
-                seen_urls.add(url)
+                key = _dedupe_key(url)
+                if key in seen_urls:
+                    continue
+                seen_urls.add(key)
                 bucket.append({
                     "title": (r.get("title") or "").strip(),
                     "url": url,

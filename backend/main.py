@@ -23,6 +23,9 @@ from models.search_session import init_search_engine, close_search_db
 from routers import (
     scan, scan_photo, buildings, stamps, vetting, rag, search, lore, websearch,
 )
+from utils.rate_limit import limiter, rate_limit_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
 # Configure logging
 logging.basicConfig(
