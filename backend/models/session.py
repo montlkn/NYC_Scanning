@@ -68,7 +68,20 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
             # Don't log HTTP/validation errors — those are expected client errors, not DB issues
             from fastapi import HTTPException
             from fastapi.exceptions import RequestValidationError
-            if not isinstance(e, (HTTPException, RequestValidationError)):
+
+            expected = [HTTPException, RequestValidationError]
+            # slowapi's RateLimitExceeded is NOT an HTTPException, so without
+            # this a rate-limited request logs a full ERROR traceback through
+            # the session generator and lands in Sentry as if the database had
+            # failed. Imported defensively: this module is also used by scripts
+            # that do not install the web dependencies.
+            try:
+                from slowapi.errors import RateLimitExceeded
+                expected.append(RateLimitExceeded)
+            except ImportError:
+                pass
+
+            if not isinstance(e, tuple(expected)):
                 logger.error(f"Database session error: {e}", exc_info=True)
             raise
         finally:
