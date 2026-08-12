@@ -62,9 +62,40 @@ def is_configured() -> bool:
     return bool(BRAVE_API_KEY)
 
 
+def _claim_terms(claim: str, limit: int = 6) -> str:
+    """Distinctive words from a user's claim, for anchoring a verification query.
+
+    The claim is arbitrary user text, so it is reduced to terms and always
+    combined with a quoted subject rather than sent as its own query. That is
+    the line that keeps this from being a general-purpose search proxy: every
+    query we bill still names a specific NYC building.
+
+    Stopwords and short words go, because "there was a in the" retrieves the
+    whole web and dilutes the subject anchor it is attached to.
+    """
+    stop = {
+        "the", "there", "this", "that", "with", "was", "were", "and", "but",
+        "for", "from", "have", "has", "had", "here", "used", "into", "about",
+        "they", "them", "some", "said", "says", "then", "than", "when", "what",
+        "which", "who", "whom", "been", "being", "its", "it's", "you", "your",
+        "building", "place", "spot", "york", "new", "city", "nyc",
+    }
+    seen, out = set(), []
+    for raw in claim.lower().split():
+        w = "".join(ch for ch in raw if ch.isalnum() or ch == "'")
+        if len(w) < 4 or w in stop or w in seen:
+            continue
+        seen.add(w)
+        out.append(w)
+        if len(out) >= limit:
+            break
+    return " ".join(out)
+
+
 def build_queries(building_name: Optional[str], address: Optional[str],
                   architect: Optional[str], year_built: Optional[str],
-                  categories: Optional[list[str]] = None) -> list[str]:
+                  categories: Optional[list[str]] = None,
+                  claim: Optional[str] = None) -> list[str]:
     """Literal queries from what we already know, most specific first.
 
     Deliberately not model-generated: a model writing its own queries is how the
@@ -105,6 +136,14 @@ def build_queries(building_name: Optional[str], address: Optional[str],
     queries: list[str] = []
     if name and name != "0":
         queries.append(f'"{name}" New York building history')
+    # A claim outranks the architect: when a caller supplies one, corroborating
+    # it IS the request, and a generic identity/architect sweep will not surface
+    # the jazz club or the fire it is asking about. Still anchored to the quoted
+    # subject, so it narrows rather than opens the search.
+    if claim and subject:
+        terms = _claim_terms(claim)
+        if terms:
+            queries.append(f"{subject} New York {terms}")
     if arch and (name or addr):
         queries.append(f'{arch} architect "{name or addr}"')
     if addr and addr != name:
@@ -256,7 +295,8 @@ _GENERIC_TOKENS = frozenset({
 
 
 def filter_relevant(results: list[dict], building_name: Optional[str],
-                    address: Optional[str]) -> list[dict]:
+                    address: Optional[str],
+                    claim: Optional[str] = None) -> list[dict]:
     """Drop results that are obviously not about this subject.
 
     Answers the "what if the results are junk?" case, which is NOT the same as
@@ -289,6 +329,14 @@ def filter_relevant(results: list[dict], building_name: Optional[str],
     for t in (address or "").split():
         if t.isdigit() and len(t) >= 2:
             tokens.add(t)
+
+    # Claim terms count as subject evidence. Without this the filter would
+    # discard precisely the pages a verification request went looking for: a
+    # source corroborating "Sid Vicious stabbed Nancy Spungen here" often names
+    # the people and the year without repeating the building's name, and would
+    # fail a building-tokens-only test despite being the best evidence returned.
+    if claim:
+        tokens.update(_claim_terms(claim).split())
 
     kept = []
     for r in results:

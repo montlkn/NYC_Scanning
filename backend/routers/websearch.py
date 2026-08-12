@@ -41,16 +41,22 @@ logger = logging.getLogger(__name__)
 class SourcesRequest(BaseModel):
     """Structured subject fields, NOT a free-text query.
 
-    Deliberate: `build_queries` composes literal queries from known fields, so
-    the shape of a query is fixed here rather than chosen by a caller. A free
-    `q` would make this an open search proxy — anyone with a user token could
-    bill our Brave subscription for arbitrary searches.
+    The caller supplies SUBJECT TERMS; `build_queries` owns the query template.
+    That distinction is what keeps this from being an open search proxy: a bare
+    `q` would let a token holder bill our Brave subscription for anything,
+    whereas here every query we send still names a specific NYC building.
     """
     building_name: Optional[str] = None
     address: Optional[str] = None
     architect: Optional[str] = None
     year_built: Optional[str] = None
     categories: Optional[list[str]] = Field(default=None, max_length=32)
+    # A specific assertion to corroborate — a user's lore lead, or a sentence
+    # from a draft being fact-checked. Reduced to distinctive terms and ALWAYS
+    # combined with the quoted subject, never sent as a query of its own, so the
+    # anchoring rule above still holds. Length-capped because the caller
+    # controls it; only the first handful of terms survive `_claim_terms`.
+    claim: Optional[str] = Field(default=None, max_length=2000)
 
 
 class SourcesResponse(BaseModel):
@@ -87,10 +93,11 @@ async def get_sources(request: Request, req: SourcesRequest) -> SourcesResponse:
 
     queries = brave_search.build_queries(
         req.building_name, req.address, req.architect,
-        req.year_built, categories=req.categories,
+        req.year_built, categories=req.categories, claim=req.claim,
     )
     results = brave_search.filter_relevant(
-        await brave_search.search(queries), req.building_name, req.address,
+        await brave_search.search(queries),
+        req.building_name, req.address, claim=req.claim,
     )
     return SourcesResponse(
         source_text=brave_search.as_source_text(results),
