@@ -380,6 +380,31 @@ def as_source_text(results: list[dict], max_chars: int = 3000) -> Optional[str]:
     return "\n".join(lines) if lines else None
 
 
+async def architect_citation(architect: Optional[str], subject: Optional[str]) -> list[str]:
+    """ONE query for the architect's own page on a building. Citation only.
+
+    The tier chain is cost-ordered and short-circuits, so a building with a
+    Wikipedia article never reaches the Brave tier — and therefore never gets
+    the firm's own project page, even though a single query reliably finds it
+    (verified: 56 Leonard -> herzogdemeuron.com/projects/305-56-leonard-street).
+    The prose is already written by then; this only enriches the citations.
+
+    Deliberately ONE query, not the full fan-out. A fan-out here would roughly
+    double search spend across every Wikipedia-tier building for material the
+    narrative does not even use. One query is the smallest thing that can return
+    the highest-value citation we have.
+    """
+    if not (architect and subject) or not is_configured():
+        return []
+    arch = architect.strip()
+    if arch.lower() in ("not determined", "unknown"):
+        return []
+    results = await search([f'{arch} architect "{subject}"'])
+    # Filtered against the ARCHITECT as well, so a page about a different
+    # building by the same firm does not get cited as this one's source.
+    return source_urls(filter_relevant(results, subject, None, claim=arch), limit=2)
+
+
 def source_urls(results: list[dict], limit: int = 4) -> list[str]:
     """URLs actually handed to the model, for a deterministic SOURCES block.
 

@@ -24,7 +24,7 @@ import os
 import logging
 import re
 import httpx
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -442,8 +442,17 @@ async def _synthesize(
     return None
 
 
-async def _wikipedia_fetch(query: str) -> Optional[str]:
-    """Fetch Wikipedia summary for a single query string. Returns extract or None."""
+async def _wikipedia_fetch(query: str) -> Optional[tuple[str, Optional[str]]]:
+    """Fetch a Wikipedia summary. Returns (extract, article_url) or None.
+
+    The URL was previously discarded, which left every Wikipedia-tier answer
+    with `source=None` and therefore NO citation at all — on what turns out to
+    be a very common tier (both VIA 57 West and 56 Leonard land here). The
+    response carries the canonical article link already, so the citation was
+    free and simply thrown away. `canonical` is preferred over the request URL
+    because Wikipedia resolves redirects: asking for "Jenga Tower" should cite
+    the article it actually served.
+    """
     title = query.strip().replace(' ', '_')
     url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{title}"
     async with httpx.AsyncClient(timeout=5.0) as client:
@@ -452,16 +461,20 @@ async def _wikipedia_fetch(query: str) -> Optional[str]:
         data = resp.json()
         extract = data.get('extract', '')
         if extract and len(extract) > 50:
-            return extract
+            page_url = (
+                ((data.get('content_urls') or {}).get('desktop') or {}).get('page')
+                or url
+            )
+            return extract, page_url
     return None
 
 
 async def _get_lore_from_wikipedia(
     building_name: Optional[str],
     address: Optional[str] = None
-) -> Optional[str]:
+) -> Optional[tuple[str, Optional[str]]]:
     """
-    Fetch building description from Wikipedia.
+    Fetch building description from Wikipedia. Returns (extract, article_url).
     Tries building name first, then falls back to address (street name only).
     """
     # Try building name
@@ -672,10 +685,15 @@ class LoreResult:
     us either number.
     """
     text: str
-    tier: str                      # landmark_chunks | wikipedia | web_search
+    tier: str                      # landmark_chunks | wikipedia | brave_search | fields_only
     specificity: Optional[str]     # 'building' | None (district-level)
-    source: Optional[str]          # report URL / article / None
+    source: Optional[str]          # primary: report URL / article / None
     synthesized: bool              # False when raw source text was served as-is
+    # Every citation, primary first. `source` stays the single primary for
+    # existing callers; this carries the extras — chiefly the architect's own
+    # page, which the tier chain cannot reach on its own because it
+    # short-circuits at whichever tier answers first.
+    sources: list[str] = field(default_factory=list)
 
 
 async def generate_building_lore_detailed(
@@ -708,8 +726,14 @@ async def generate_building_lore_detailed(
         if lore:
             if cache_to_db:
                 await _cache_storytelling(session, bin_val, lore)
+            # The designation report is the primary citation; the firm's own
+            # page is the one thing it cannot supply, and this tier short-
+            # circuits before Brave just as the Wikipedia one does.
+            from services import brave_search as _bs
+            extra = await _bs.architect_citation(architect, building_name or address)
             return LoreResult(text=lore, tier="landmark_chunks", specificity=spec,
-                              source=src, synthesized=True)
+                              source=src, synthesized=True,
+                              sources=[u for u in ([src] + extra) if u])
         # Synthesis failed (missing/failing API key, timeout). Do NOT serve the
         # raw chunk: a designation report opens with hearing boilerplate — "Six
         # witnesses spoke in favor of designation. There were no speakers in
@@ -723,8 +747,9 @@ async def generate_building_lore_detailed(
 
     # 2. Wikipedia (free, no key) — tries name then address → synthesize
     if building_name or address:
-        raw = await _get_lore_from_wikipedia(building_name, address)
-        if raw:
+        wiki = await _get_lore_from_wikipedia(building_name, address)
+        if wiki:
+            raw, wiki_url = wiki
             block_ctx = await _get_block_context(session, bin_val)
             arch_n = await _get_architect_catalogue_count(session, architect)
             near = await _get_nearby_lore(session, bin_val)
@@ -738,8 +763,14 @@ async def generate_building_lore_detailed(
                 lore = raw
             if cache_to_db:
                 await _cache_storytelling(session, bin_val, lore)
+            # One extra query for the firm's own page. This tier answers a lot of
+            # the buildings people actually care about, and short-circuiting here
+            # meant they cited Wikipedia and nothing else.
+            from services import brave_search as _bs
+            extra = await _bs.architect_citation(architect, building_name or address)
             return LoreResult(text=lore, tier="wikipedia", specificity="building",
-                              source=None, synthesized=synthesized)
+                              source=wiki_url, synthesized=synthesized,
+                              sources=[u for u in ([wiki_url] + extra) if u])
 
     # 3. Paid search — the ONLY tier that hits the open web, and the only one
     # that costs money beyond tokens. N literal queries in, N billed, always.
@@ -775,10 +806,13 @@ async def generate_building_lore_detailed(
                 if cache_to_db:
                     await _cache_storytelling(session, bin_val, lore)
                 urls = brave_search.source_urls(results)
+                # No extra architect query here: this tier already RAN the
+                # architect query as part of its fan-out, so the firm page is
+                # in `urls` if it exists. Asking again would bill twice.
                 return LoreResult(text=lore, tier="brave_search",
                                   specificity="building",
                                   source=urls[0] if urls else None,
-                                  synthesized=True)
+                                  synthesized=True, sources=urls)
             logger.warning(f"brave results found but synthesis failed for {bin_val}")
 
     # 4. Fields only. Named `fields_only`, not `web_search`, because it no

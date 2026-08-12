@@ -85,6 +85,7 @@ async def get_building_lore(
             "tier": "cache",
             "specificity": None,
             "source": None,
+            "sources": [],
             "synthesized": True,
         }
 
@@ -106,6 +107,7 @@ async def get_building_lore(
             "tier": None,
             "specificity": None,
             "source": None,
+            "sources": [],
             "synthesized": False,
         }
 
@@ -119,5 +121,7 @@ async def get_building_lore(
         "tier": result.tier,
         "specificity": result.specificity,
         "source": result.source,
+        # Every citation, primary first. `source` stays for older clients.
+        "sources": result.sources or ([result.source] if result.source else []),
         "synthesized": result.synthesized,
     }
