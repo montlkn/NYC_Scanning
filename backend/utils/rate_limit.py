@@ -151,7 +151,19 @@ _limiter_kwargs = dict(
     default_limits=LIMIT_DEFAULT,
     storage_uri=_storage_uri,
     enabled=_enabled,
-    headers_enabled=True,  # emits X-RateLimit-* on every response
+    # MUST stay False. With it on, slowapi injects X-RateLimit-* by mutating the
+    # value the endpoint returned, which it requires to be a starlette Response.
+    # Our handlers return plain dicts and let FastAPI serialise them, so
+    # _inject_headers raised
+    #     "parameter `response` must be an instance of starlette.responses.Response"
+    # on EVERY limited route -- a 100% 500 rate on /api/lore and
+    # /api/search/sources while limiter-exempt /health stayed green.
+    #
+    # Turning it on again means adding `response: Response` to every decorated
+    # endpoint, not flipping this flag. The headers are informational; the 429
+    # still carries Retry-After from rate_limit_handler, which is the part
+    # clients actually need.
+    headers_enabled=False,
 )
 
 # `swallow_errors` makes a storage failure DURING operation degrade to "allow
