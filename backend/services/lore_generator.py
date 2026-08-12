@@ -670,6 +670,30 @@ async def _reindex_building(session: AsyncSession, bin_val: str):
         logger.warning(f"Search re-index skipped for BIN {bin_val}: {e}")
 
 
+def _merge_sources(*groups) -> list[str]:
+    """Combine citation lists, order-preserving, without near-duplicates.
+
+    The tier's own citation and the architect lookup are produced by different
+    code paths, so `search`'s internal dedupe never sees them together. Observed
+    live: VIA 57 West cited en.wikipedia.org/wiki/Via_57_West AND
+    /wiki/VIA_57_West, one article rendered twice in a four-line SOURCES block.
+    Reuses the search dedupe key so "same page, different clothes" means the
+    same thing everywhere.
+    """
+    from services.brave_search import _dedupe_key
+    seen, out = set(), []
+    for group in groups:
+        for u in group or []:
+            if not u:
+                continue
+            k = _dedupe_key(u)
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(u)
+    return out
+
+
 @dataclass
 class LoreResult:
     """Lore plus the provenance needed to render honest citations and to measure
@@ -733,7 +757,7 @@ async def generate_building_lore_detailed(
             extra = await _bs.architect_citation(architect, building_name or address)
             return LoreResult(text=lore, tier="landmark_chunks", specificity=spec,
                               source=src, synthesized=True,
-                              sources=[u for u in ([src] + extra) if u])
+                              sources=_merge_sources([src], extra))
         # Synthesis failed (missing/failing API key, timeout). Do NOT serve the
         # raw chunk: a designation report opens with hearing boilerplate — "Six
         # witnesses spoke in favor of designation. There were no speakers in
@@ -770,7 +794,7 @@ async def generate_building_lore_detailed(
             extra = await _bs.architect_citation(architect, building_name or address)
             return LoreResult(text=lore, tier="wikipedia", specificity="building",
                               source=wiki_url, synthesized=synthesized,
-                              sources=[u for u in ([wiki_url] + extra) if u])
+                              sources=_merge_sources([wiki_url], extra))
 
     # 3. Paid search — the ONLY tier that hits the open web, and the only one
     # that costs money beyond tokens. N literal queries in, N billed, always.
