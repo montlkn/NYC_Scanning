@@ -524,6 +524,22 @@ async def _synthesize(
         # to condominiums, and it wrote about lintels instead. Accuracy was
         # never the problem; timidity was. A sourced fact about what HAPPENED
         # beats a sourced fact about masonry, every time.
+        # The shape the app wants, stated as a shape. Left implicit, the model
+        # defaults to an encyclopedia entry: origin, fabric, designation. The
+        # HOOK is the reason anyone reads a second building, and it is almost
+        # always in the middle of a source rather than at the top -- the Graham
+        # Home's motel years sit two thirds down a Brownstoner post.
+        "SHAPE. After establishing what the building is and why it exists, the "
+        "next thing must be the HOOK: the strange, scandalous, funny, "
+        "contested or culturally loaded thing that happened here. A raid, a "
+        "murder, a speakeasy, a famous tenant, a feud, a scam, a demolition "
+        "fight, a scene shot on the steps, what the neighbourhood called it "
+        "and why. If the sources contain one of these, it is NOT optional and "
+        "it does not go last — a reader decides whether to open another "
+        "building based on it.\n\n"
+        "Only its absence excuses it. If the sources genuinely hold no such "
+        "moment, say nothing in its place; an invented or inflated hook is "
+        "far worse than an honest building with none.\n\n"
         "You will often be given FULL PAGES, not just search snippets. Mine "
         "them. If a source says the building later became a notorious motel, "
         "burned down, hid a speakeasy, or was converted to condominiums, that "
@@ -1166,16 +1182,26 @@ async def _synthesize_comparative(subject_name: Optional[str],
         lines.append(f"- {head}: {(n['gist'] or '').strip()}")
 
     system = (
-        "You write one short paragraph for a New York architecture app, placing "
-        "a building in the context of its immediate neighbours.\n\n"
+        "You write the OPENING paragraph of a New York building's story — the "
+        "wide shot before the camera moves in.\n\n"
+        # Renders ABOVE the building's own writeup, so it must set the scene
+        # rather than reflect on one already read. Context, then detail: the
+        # reader should care about the street before they are told about the
+        # cornice. Written as an afterword it kept saying "as noted above",
+        # which is nonsense in the first position.
+        "It appears ABOVE the building's own writeup, so write it as an "
+        "establishing shot, never as a summary or an afterword. Do not refer "
+        "to anything 'above' or 'already mentioned' — this IS the beginning. "
+        "End in a way that hands off naturally to the building itself.\n\n"
         "You are given the building's own writeup and the writeups of buildings "
         "within a few hundred metres. Find the RELATIONSHIP. What was this "
         "block doing in this era? Does this building agree with its neighbours "
         "or argue with them? What does the group say together that none says "
         "alone — about who lived here, what they believed, what the "
         "neighbourhood was for?\n\n"
-        "HARD RULES. Never restate the building's own writeup; the reader has "
-        "just read it. Never transfer a neighbour's history to this building — "
+        "HARD RULES. Do not tell the building's own story — the paragraph "
+        "below yours does that, and repeating it wastes the opening. Never "
+        "transfer a neighbour's history to this building — "
         "their events are theirs, and naming which building something happened "
         "to is mandatory. Every claim must come from the material supplied. If "
         "the neighbours reveal no genuine relationship, reply with exactly "
