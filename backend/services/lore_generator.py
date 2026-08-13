@@ -420,13 +420,28 @@ async def _synthesize(
         "guessing at it."
     )
     user = (
-        "Write 3-4 punchy sentences about this NYC building. Lead with the "
-        "most specific, verifiable, building-specific fact in the source. "
-        "Skip designation dates, LP numbers, and district-level language "
-        "unless they are the building's defining feature. Focus on: who "
-        "built it and why, what makes it architecturally specific, any "
-        "verifiable history or named tenant.\n\n"
-        f"Building: {meta_line}\n"
+        "Write 4-6 sentences about this NYC building.\n\n"
+        # The app renders architect / style / year in a DATA PANEL directly
+        # above this prose. Restating them is the biggest waste in the budget:
+        # the model opened every piece with "built in 1880-81 and designed by
+        # Frederick Weber" while the reader was looking at exactly that three
+        # lines higher — so the measured block context and the nearby lore,
+        # which arrive last, never fit.
+        "The reader can ALREADY SEE the architect, style and year in a table "
+        "above your text. Do not open by restating them and do not spend a "
+        "sentence listing them. Use them as raw material instead: a style name "
+        "is a fact, but what that style was TRYING to do on this street is a "
+        "story.\n\n"
+        "Lead with whatever is most surprising or most specific — who built it "
+        "and why, who lived or worked there, what happened here, what it used "
+        "to be. Skip designation dates, LP numbers and district-level language "
+        "unless they are the building's defining feature.\n\n"
+        "If the source genuinely holds nothing beyond the fabric, write well "
+        "about the fabric — but never pad. Atmosphere standing in for fact is "
+        "obvious and worthless: a sentence like 'its romantic force lies in the "
+        "way the residence preserves the scale of an earlier Brooklyn' says "
+        "nothing and must never be written.\n\n"
+        f"Building (context you may draw on, NOT content to recite): {meta_line}\n"
         f"Source material:\n{raw_text}"
     )
 
