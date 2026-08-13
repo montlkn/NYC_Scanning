@@ -101,7 +101,32 @@ async def _fetch_one(client: httpx.AsyncClient, url: str) -> Optional[str]:
     # snippet was more use than its body.
     if len(text) < 400:
         return None
-    return text[:MAX_CHARS_PER_PAGE]
+    return _trim_to_sentence(text, MAX_CHARS_PER_PAGE)
+
+
+def _trim_to_sentence(text: str, limit: int) -> str:
+    """Cut at a sentence boundary, never mid-word.
+
+    A hard slice at `limit` lands wherever it lands, and the model treats the
+    fragment as the text — one narrative shipped reading "a new organization
+    known as the Union Avenue...", because the source stopped there and it had
+    no way to know the name continued. A truncated source produces a truncated
+    FACT, which is worse than a shorter one: the reader cannot tell the
+    difference between a cut-off name and a real one.
+    """
+    if len(text) <= limit:
+        return text
+    window = text[:limit]
+    # Prefer a paragraph break, then a sentence end, then a space. Only accept
+    # a boundary in the last third, or a page with sparse punctuation would be
+    # cut to almost nothing.
+    floor = int(limit * 0.66)
+    for sep in ("\n\n", ". ", ".\n", "! ", "? "):
+        idx = window.rfind(sep)
+        if idx > floor:
+            return window[: idx + len(sep)].strip()
+    idx = window.rfind(" ")
+    return (window[:idx] if idx > floor else window).strip()
 
 
 async def fetch_pages(urls: list[str], limit: int = MAX_PAGES) -> list[tuple[str, str]]:
@@ -139,7 +164,9 @@ def as_source_text(pages: list[tuple[str, str]], max_chars: int = 7000) -> Optio
     for url, text in pages:
         block = f"--- FULL PAGE: {url} ---\n{text}\n"
         if total + len(block) > max_chars:
-            block = block[: max(0, max_chars - total)]
+            # Same reason as _trim_to_sentence: a hard slice here would hand the
+            # model a half-finished sentence and it would write the fragment.
+            block = _trim_to_sentence(block, max(0, max_chars - total))
             if len(block) < 200:
                 break
         parts.append(block)
