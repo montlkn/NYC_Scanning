@@ -380,6 +380,52 @@ def as_source_text(results: list[dict], max_chars: int = 3000) -> Optional[str]:
     return "\n".join(lines) if lines else None
 
 
+async def enrich_for_building(building_name: Optional[str],
+                              address: Optional[str],
+                              architect: Optional[str],
+                              year_built: Optional[str],
+                              categories: Optional[list[str]] = None) -> list[dict]:
+    """FULL fan-out for a building that already has a free source.
+
+    The tier chain short-circuits: a building with an LPC designation report
+    answers at tier 1 and never reaches the paid tier. That left the ~13k
+    BEST-documented buildings -- the ones people actually tap -- as the ONLY
+    ones getting a single query, which is backwards.
+
+    It showed. A designation report describes fabric: piers, lintels, cornices.
+    Compare two narratives written by the same model on the same day:
+
+      1 query  (Graham Home)  -> accurate fabric, 773 chars, no story
+      4 queries (Jarmulowsky) -> "a Russian immigrant who arrived in 1873...
+                                  purchased for $33 million in 2011"
+
+    The variable was never the model, it was how many sources reached it. The
+    story angles -- identity, the category sweep, the address -- are what
+    surface Brownstoner, village preservation groups and newspaper archives,
+    and none of them are in a designation report.
+
+    Same MAX_QUERIES ceiling as the paid tier, so the spend stays a constant we
+    set. Results are FILTERED and returned as dicts, so the snippets can be fed
+    to the model rather than merely cited.
+    """
+    if not is_configured():
+        return []
+    queries = build_queries(building_name, address, architect, year_built,
+                            categories=categories)
+    if not queries:
+        return []
+    results = await search(queries)
+    # The architect counts as subject evidence here, and the filter is kept
+    # deliberately loose. These queries deliberately ask about PEOPLE and
+    # EVENTS, so the best result often never repeats the building's name -- a
+    # Brownstoner piece on a hot-pillow motel, a preservation-society post about
+    # a demolished tower. A filter tuned to the address would discard exactly
+    # the material this fan-out exists to find, which is worse than letting a
+    # weak result through: the synthesis prompt already refuses off-subject
+    # snippets, and it can see context the filter cannot.
+    return filter_relevant(results, building_name, address, claim=architect)
+
+
 async def architect_citation(architect: Optional[str],
                              subject: Optional[str]) -> list[dict]:
     """ONE query for the architect's own page on a building.

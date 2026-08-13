@@ -177,6 +177,59 @@ async def _get_block_context(session: AsyncSession, bin_val: str) -> Optional[st
     return "; ".join(bits)
 
 
+
+async def _get_block_neighbours(session: AsyncSession, bin_val: str,
+                                radius_m: int = 200, limit: int = 4) -> Optional[str]:
+    """What STANDS around this building, and what we already know about it.
+
+    The single thing a web search structurally cannot do. A search engine knows
+    this building; it does not know that the row opposite went up forty years
+    earlier, or that the corner has a narrative we already wrote. We hold 35k
+    buildings with era, style and architect, and a growing set of cached
+    narratives, so the comparison is ours alone.
+
+    Reads only what is ALREADY generated -- no synthesis, no search, no spend.
+    A neighbour with no narrative simply contributes its era and style.
+
+    The prompt is what keeps this honest: these are OTHER buildings, and their
+    history is theirs. The value is the contrast, not the borrowing.
+    """
+    try:
+        rows = (await session.execute(text("""
+            WITH me AS (
+              SELECT geog FROM buildings_full_merge_scanning
+              WHERE bin = :bin AND geog IS NOT NULL LIMIT 1
+            )
+            SELECT b.building_name, b.year_built, b.style_prim, b.architect,
+                   left(b.storytelling, 260) AS gist,
+                   round(ST_Distance(b.geog, me.geog))::int AS dist_m
+            FROM buildings_full_merge_scanning b, me
+            WHERE b.bin <> :bin
+              AND b.geog IS NOT NULL
+              AND ST_DWithin(b.geog, me.geog, :radius)
+              AND (b.building_name IS NOT NULL OR b.storytelling IS NOT NULL)
+            ORDER BY (b.storytelling IS NULL), dist_m
+            LIMIT :lim
+        """), {"bin": bin_val, "radius": radius_m, "lim": limit})).fetchall()
+    except Exception as e:
+        logger.warning(f"block neighbours failed for {bin_val}: {e}")
+        return None
+
+    if not rows:
+        return None
+    lines = []
+    for name, yr, style, arch, gist, dist in rows:
+        bits = [f"{(name or 'unnamed building')} ({dist}m away)"]
+        if yr:    bits.append(f"built {yr}")
+        if style: bits.append(str(style))
+        if arch:  bits.append(f"by {arch}")
+        line = ", ".join(bits)
+        if gist:
+            line += f" — already documented: {gist.strip()}"
+        lines.append("- " + line)
+    return "\n".join(lines)
+
+
 async def _get_nearby_lore(session: AsyncSession, bin_val: str,
                            radius_m: int = 150, limit: int = 3) -> Optional[str]:
     """Lore events and plaques near this building, from the indexed layers.
@@ -359,6 +412,7 @@ async def _synthesize(
     block_context: Optional[str] = None,
     architect_count: Optional[int] = None,
     nearby_lore: Optional[str] = None,
+    neighbours: Optional[str] = None,
 ) -> Optional[str]:
     """Synthesize raw LPC/Wikipedia/Brave source text into punchy, grounded copy.
 
@@ -470,6 +524,16 @@ async def _synthesize(
             f"This architect has {architect_count} other buildings in Jink's "
             f"catalogue (say 'in this app' or similar — it is NOT a claim about "
             f"their whole career)."
+        )
+    if neighbours:
+        extras.append(
+            "WHAT STANDS AROUND IT (our own catalogue, not the web). These are "
+            "OTHER buildings and their history is theirs — never transfer it. "
+            "Use them for CONTRAST: what this block was doing in this era, "
+            "whether this building agrees with its neighbours or argues with "
+            "them, what a street of these buildings together meant socially. "
+            "One comparative sentence is worth more than another line of "
+            "fabric description, and no web search can write it:\n" + neighbours
         )
     if nearby_lore:
         extras.append(
@@ -837,12 +901,18 @@ async def generate_building_lore_detailed(
         block_ctx = await _bounded(_get_block_context(session, bin_val), 'block_context')
         arch_n = await _bounded(_get_architect_catalogue_count(session, architect), 'architect_count')
         near = await _bounded(_get_nearby_lore(session, bin_val), 'nearby_lore')
+        nbrs = await _bounded(_get_block_neighbours(session, bin_val), 'block_neighbours')
         # The designation report is the primary citation; the firm's own page is
         # the one thing it cannot supply, and this tier short-circuits before
         # Brave just as the Wikipedia one does.
+        # FULL fan-out, not just the architect query. A designation report gives
+        # fabric; the story angles give what happened in the building. Running
+        # while the model writes, so it costs latency only when it is slower
+        # than synthesis.
         from services import brave_search as _bs
         cite_task = asyncio.create_task(
-            _bs.architect_citation(architect, building_name or address)
+            _bs.enrich_for_building(building_name, address, architect,
+                                    year_built, categories=await _get_lore_categories())
         )
         extra = await cite_task
         # Snippets go INTO the prompt, not just into the citation list. They
@@ -853,12 +923,12 @@ async def generate_building_lore_detailed(
         # architect query surfaces (Brownstoner, Architizer, the firm itself)
         # carry what actually happened in the building.
         from services import brave_search as _bs2
-        extra_text = _bs2.as_source_text(extra, max_chars=1500)
+        extra_text = _bs2.as_source_text(extra, max_chars=2500)
         raw_plus = raw if not extra_text else (
             raw + "\n\nAdditional web sources about this building:\n" + extra_text
         )
         lore = await _synthesize(raw_plus, building_name, address, year_built,
-                                           style, architect, block_ctx, arch_n, near)
+                                           style, architect, block_ctx, arch_n, near, nbrs)
         if lore:
             # Citation lookup starts BEFORE synthesis and is awaited after, so
             # its Brave round trip overlaps the LLM call instead of following
@@ -869,7 +939,7 @@ async def generate_building_lore_detailed(
             # they share one AsyncSession, and SQLAlchemy forbids concurrent
             # operations on a single session. Parallelising them needs separate
             # sessions, which is a bigger change than this latency is worth.
-            all_sources = _merge_sources([src], _bs2.source_urls(extra, limit=2))
+            all_sources = _merge_sources([src], _bs2.source_urls(extra, limit=3))
             if cache_to_db:
                 await _cache_storytelling(session, bin_val, lore, all_sources)
             return LoreResult(text=lore, tier="landmark_chunks", specificity=spec,
@@ -893,20 +963,23 @@ async def generate_building_lore_detailed(
             block_ctx = await _bounded(_get_block_context(session, bin_val), 'block_context')
             arch_n = await _bounded(_get_architect_catalogue_count(session, architect), 'architect_count')
             near = await _bounded(_get_nearby_lore(session, bin_val), 'nearby_lore')
-            # Same overlap as the landmark tier: the citation query runs while
-            # the model writes.
+            nbrs = await _bounded(_get_block_neighbours(session, bin_val), 'block_neighbours')
+            # Same overlap as the landmark tier: the search runs while the
+            # model writes.
+            cats_for_enrich = await _get_lore_categories()
             from services import brave_search as _bs
             cite_task = asyncio.create_task(
-                _bs.architect_citation(architect, building_name or address)
+                _bs.enrich_for_building(building_name, address, architect,
+                                        year_built, categories=cats_for_enrich)
             )
             extra = await cite_task
             from services import brave_search as _bs2
-            extra_text = _bs2.as_source_text(extra, max_chars=1500)
+            extra_text = _bs2.as_source_text(extra, max_chars=2500)
             raw_plus = raw if not extra_text else (
                 raw + "\n\nAdditional web sources about this building:\n" + extra_text
             )
             lore = await _synthesize(raw_plus, building_name, address, year_built,
-                                               style, architect, block_ctx, arch_n, near)
+                                               style, architect, block_ctx, arch_n, near, nbrs)
             # A Wikipedia extract is at least written prose, so serving it raw is
             # tolerable where raw LPC typescript is not. It is still marked
             # unsynthesized so the cost/quality split stays visible.
@@ -916,7 +989,7 @@ async def generate_building_lore_detailed(
             # One extra query for the firm's own page. This tier answers a lot
             # of the buildings people actually care about, and short-circuiting
             # here meant they cited Wikipedia and nothing else.
-            all_sources = _merge_sources([wiki_url], _bs2.source_urls(extra, limit=2))
+            all_sources = _merge_sources([wiki_url], _bs2.source_urls(extra, limit=3))
             if cache_to_db:
                 await _cache_storytelling(session, bin_val, lore, all_sources)
             return LoreResult(text=lore, tier="wikipedia", specificity="building",
@@ -950,9 +1023,10 @@ async def generate_building_lore_detailed(
             block_ctx = await _bounded(_get_block_context(session, bin_val), 'block_context')
             arch_n = await _bounded(_get_architect_catalogue_count(session, architect), 'architect_count')
             near = await _bounded(_get_nearby_lore(session, bin_val), 'nearby_lore')
+            nbrs = await _bounded(_get_block_neighbours(session, bin_val), 'block_neighbours')
             lore = await _synthesize(raw, building_name, address,
                                                year_built, style, architect,
-                                               block_ctx, arch_n, near)
+                                               block_ctx, arch_n, near, nbrs)
             if lore:
                 urls = brave_search.source_urls(results)
                 if cache_to_db:
