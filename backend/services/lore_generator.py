@@ -402,6 +402,35 @@ async def _get_raw_chunks(bin_val: str, building_name: Optional[str]) -> Optiona
     return text_
 
 
+async def _read_web_sources(results: list[dict]) -> Optional[str]:
+    """Turn Brave results into source material by READING them, not quoting the
+    blurb.
+
+    Brave returns a ~200-character preview per result. That was the real ceiling
+    on lore quality, and it hid well: for the Graham Home the preview carried
+    "rehab to condos" while the page itself carried the building's whole second
+    life as a hot-pillow motel raided for drugs, boarded up and painted black by
+    1985. More queries buy more previews; only fetching buys the story.
+
+    Falls back to the snippets when a page cannot be fetched -- a bot wall, a JS
+    shell, a dead link -- so this never returns less than the old behaviour.
+
+    Costs nothing against the search quota: a fetch is bandwidth, not a billed
+    query.
+    """
+    if not results:
+        return None
+    from services import brave_search as _bs
+    from services import page_text as _pt
+
+    urls = _bs.source_urls(results, limit=3)
+    pages = await _pt.fetch_pages(urls)
+    full = _pt.as_source_text(pages)
+    if full:
+        return full
+    return _bs.as_source_text(results, max_chars=2500)
+
+
 async def _synthesize(
     raw_text: str,
     building_name: Optional[str],
@@ -489,6 +518,19 @@ async def _synthesize(
         "and why, who lived or worked there, what happened here, what it used "
         "to be. Skip designation dates, LP numbers and district-level language "
         "unless they are the building's defining feature.\n\n"
+        # The grounding rules above made the model TOO cautious once real page
+        # text arrived: the Graham Home's sources said the building spent
+        # decades as a hot-pillow motel raided for drugs and was later converted
+        # to condominiums, and it wrote about lintels instead. Accuracy was
+        # never the problem; timidity was. A sourced fact about what HAPPENED
+        # beats a sourced fact about masonry, every time.
+        "You will often be given FULL PAGES, not just search snippets. Mine "
+        "them. If a source says the building later became a notorious motel, "
+        "burned down, hid a speakeasy, or was converted to condominiums, that "
+        "is the story — write it. Do not retreat to describing the façade "
+        "because the fabric feels safer; a documented scandal is not less "
+        "rigorous than a documented cornice. The only thing that must never "
+        "happen is stating something the sources do not support.\n\n"
         # A designation report is a HISTORICAL document written in the present
         # tense. The Graham Home's report says the building "now operates as the
         # Bull Shippers Plaza Motor Inn" -- true when it was written, false since
@@ -911,7 +953,7 @@ async def generate_building_lore_detailed(
         # architect query surfaces (Brownstoner, Architizer, the firm itself)
         # carry what actually happened in the building.
         from services import brave_search as _bs2
-        extra_text = _bs2.as_source_text(extra, max_chars=2500)
+        extra_text = await _read_web_sources(extra)
         raw_plus = raw if not extra_text else (
             raw + "\n\nAdditional web sources about this building:\n" + extra_text
         )
@@ -961,7 +1003,7 @@ async def generate_building_lore_detailed(
             )
             extra = await cite_task
             from services import brave_search as _bs2
-            extra_text = _bs2.as_source_text(extra, max_chars=2500)
+            extra_text = await _read_web_sources(extra)
             raw_plus = raw if not extra_text else (
                 raw + "\n\nAdditional web sources about this building:\n" + extra_text
             )
