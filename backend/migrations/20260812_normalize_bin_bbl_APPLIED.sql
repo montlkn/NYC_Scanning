@@ -59,3 +59,26 @@ REFRESH MATERIALIZED VIEW similar_candidates;
 -- expression indexes that serve them. They are now no-ops on clean data and
 -- still correct, and ripping them out while the client is mid-release would be
 -- a second migration for no behavioural gain. Delete them opportunistically.
+
+-- ---------------------------------------------------------------------------
+-- FOLLOW-UP, same day: year_built carried the identical float cast (35,229 of
+-- 35,317 stored as '1874.0'). Spotted in a field log where KitCanonService
+-- returned "year_built":"1874.0" AFTER bin/bbl were already clean -- the ingest
+-- float-cast every numeric-looking column, not just the keys.
+--
+-- Lower severity than bin: year_built is not a join key, so it caused no silent
+-- misses. It DID reach the lore prompt verbatim as "Year built: 1874.0", which
+-- the model happened to clean up. That was luck, not design.
+--
+-- Value space checked first: only 'N.0' (35,229) and plain integers (88), no
+-- 'c. 1900' style entries, so the CHECK is safe here too.
+
+UPDATE buildings_full_merge_scanning
+SET year_built = regexp_replace(year_built, '\.0+$', '')
+WHERE year_built ~ '\.0+$';
+
+ALTER TABLE buildings_full_merge_scanning
+  ADD CONSTRAINT year_built_no_float_suffix
+  CHECK (year_built IS NULL OR year_built !~ '\.');
+
+-- Matviews refreshed again after this column changed too.
