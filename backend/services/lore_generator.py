@@ -436,6 +436,19 @@ async def _synthesize(
         "and why, who lived or worked there, what happened here, what it used "
         "to be. Skip designation dates, LP numbers and district-level language "
         "unless they are the building's defining feature.\n\n"
+        # A designation report is a HISTORICAL document written in the present
+        # tense. The Graham Home's report says the building "now operates as the
+        # Bull Shippers Plaza Motor Inn" -- true when it was written, false since
+        # 2001, when it became condominiums. The model repeated it verbatim as
+        # current fact. Any "now/currently/today" in the source describes the
+        # year the report was filed, not the year the reader is standing there.
+        "CRITICAL: the source may be a designation report written decades ago, "
+        "in the present tense. Never repeat its 'now', 'currently', 'today', "
+        "'is used as' or 'operates as' as though it were true today — you have "
+        "no idea what the building is used for now, and stating a former use as "
+        "current is the worst error you can make here. Put such facts firmly in "
+        "the past ('was converted to', 'by the 1970s it housed') or leave them "
+        "out.\n\n"
         "If the source genuinely holds nothing beyond the fabric, write well "
         "about the fabric — but never pad. Atmosphere standing in for fact is "
         "obvious and worthless: a sentence like 'its romantic force lies in the "
@@ -831,9 +844,21 @@ async def generate_building_lore_detailed(
         cite_task = asyncio.create_task(
             _bs.architect_citation(architect, building_name or address)
         )
-        lore = await _synthesize(raw, building_name, address, year_built,
-                                           style, architect, block_ctx, arch_n, near)
         extra = await cite_task
+        # Snippets go INTO the prompt, not just into the citation list. They
+        # used to be cited without ever being shown to the model, so SOURCES
+        # named pages the prose was not written from -- the exact wrong-citation
+        # defect this pipeline exists to prevent. Feeding them also fixes the
+        # thinness: a designation report describes fabric, while the pages an
+        # architect query surfaces (Brownstoner, Architizer, the firm itself)
+        # carry what actually happened in the building.
+        from services import brave_search as _bs2
+        extra_text = _bs2.as_source_text(extra, max_chars=1500)
+        raw_plus = raw if not extra_text else (
+            raw + "\n\nAdditional web sources about this building:\n" + extra_text
+        )
+        lore = await _synthesize(raw_plus, building_name, address, year_built,
+                                           style, architect, block_ctx, arch_n, near)
         if lore:
             # Citation lookup starts BEFORE synthesis and is awaited after, so
             # its Brave round trip overlaps the LLM call instead of following
@@ -844,7 +869,7 @@ async def generate_building_lore_detailed(
             # they share one AsyncSession, and SQLAlchemy forbids concurrent
             # operations on a single session. Parallelising them needs separate
             # sessions, which is a bigger change than this latency is worth.
-            all_sources = _merge_sources([src], extra)
+            all_sources = _merge_sources([src], _bs2.source_urls(extra, limit=2))
             if cache_to_db:
                 await _cache_storytelling(session, bin_val, lore, all_sources)
             return LoreResult(text=lore, tier="landmark_chunks", specificity=spec,
@@ -874,9 +899,14 @@ async def generate_building_lore_detailed(
             cite_task = asyncio.create_task(
                 _bs.architect_citation(architect, building_name or address)
             )
-            lore = await _synthesize(raw, building_name, address, year_built,
-                                               style, architect, block_ctx, arch_n, near)
             extra = await cite_task
+            from services import brave_search as _bs2
+            extra_text = _bs2.as_source_text(extra, max_chars=1500)
+            raw_plus = raw if not extra_text else (
+                raw + "\n\nAdditional web sources about this building:\n" + extra_text
+            )
+            lore = await _synthesize(raw_plus, building_name, address, year_built,
+                                               style, architect, block_ctx, arch_n, near)
             # A Wikipedia extract is at least written prose, so serving it raw is
             # tolerable where raw LPC typescript is not. It is still marked
             # unsynthesized so the cost/quality split stays visible.
@@ -886,7 +916,7 @@ async def generate_building_lore_detailed(
             # One extra query for the firm's own page. This tier answers a lot
             # of the buildings people actually care about, and short-circuiting
             # here meant they cited Wikipedia and nothing else.
-            all_sources = _merge_sources([wiki_url], extra)
+            all_sources = _merge_sources([wiki_url], _bs2.source_urls(extra, limit=2))
             if cache_to_db:
                 await _cache_storytelling(session, bin_val, lore, all_sources)
             return LoreResult(text=lore, tier="wikipedia", specificity="building",

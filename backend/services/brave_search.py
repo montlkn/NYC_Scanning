@@ -380,8 +380,16 @@ def as_source_text(results: list[dict], max_chars: int = 3000) -> Optional[str]:
     return "\n".join(lines) if lines else None
 
 
-async def architect_citation(architect: Optional[str], subject: Optional[str]) -> list[str]:
-    """ONE query for the architect's own page on a building. Citation only.
+async def architect_citation(architect: Optional[str],
+                             subject: Optional[str]) -> list[dict]:
+    """ONE query for the architect's own page on a building.
+
+    Returns RESULT DICTS, not bare URLs. Returning URLs alone produced a real
+    defect: the caller appended them to the citation list while the snippets
+    were never shown to the model, so SOURCES listed pages the prose had not
+    been written from -- precisely the wrong-citation class this pipeline
+    exists to eliminate. Observed live on the Graham Home, which cited
+    brownstoner.com without ever having read a word of it.
 
     The tier chain is cost-ordered and short-circuits, so a building with a
     Wikipedia article never reaches the Brave tier — and therefore never gets
@@ -402,7 +410,7 @@ async def architect_citation(architect: Optional[str], subject: Optional[str]) -
     results = await search([f'{arch} architect "{subject}"'])
     # Filtered against the ARCHITECT as well, so a page about a different
     # building by the same firm does not get cited as this one's source.
-    return source_urls(filter_relevant(results, subject, None, claim=arch), limit=2)
+    return filter_relevant(results, subject, None, claim=arch)[:2]
 
 
 def source_urls(results: list[dict], limit: int = 4) -> list[str]:
