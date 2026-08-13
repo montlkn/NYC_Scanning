@@ -47,3 +47,22 @@ ANALYZE building_footprints;
 -- SELECT count(*) FROM building_footprints f, me
 -- WHERE f.bin <> me.bin
 --   AND ST_DWithin(f.centroid::geography, me.centroid::geography, 100);
+
+-- ---------------------------------------------------------------------------
+-- SAME BUG, DIFFERENT DATABASE. Applied 2026-08-12 to the RAILWAY footprints
+-- Postgres (FOOTPRINTS_DB_URL), not Supabase -- landmark_chunks lives there.
+--
+-- landmark_chunks had indexes on id, building_name and source_file, and NONE on
+-- bin. The tier-1 lookup is `WHERE replace(bin,'.0','') = replace(:bin,'.0','')`,
+-- so every LPC fetch seq-scanned 121,466 rows to return 2: 2,274ms.
+--
+-- 2,274ms -> 0.156ms.
+--
+-- Run against FOOTPRINTS_DB_URL, e.g.
+--   psql "$FOOTPRINTS_DB_URL" -f this_file.sql
+-- (the CREATE INDEX above targets BUILDINGS; this one does not).
+
+CREATE INDEX IF NOT EXISTS idx_landmark_chunks_bin_normalized
+  ON landmark_chunks (replace(bin, '.0', ''));
+
+ANALYZE landmark_chunks;
