@@ -412,7 +412,6 @@ async def _synthesize(
     block_context: Optional[str] = None,
     architect_count: Optional[int] = None,
     nearby_lore: Optional[str] = None,
-    neighbours: Optional[str] = None,
 ) -> Optional[str]:
     """Synthesize raw LPC/Wikipedia/Brave source text into punchy, grounded copy.
 
@@ -524,16 +523,6 @@ async def _synthesize(
             f"This architect has {architect_count} other buildings in Jink's "
             f"catalogue (say 'in this app' or similar — it is NOT a claim about "
             f"their whole career)."
-        )
-    if neighbours:
-        extras.append(
-            "WHAT STANDS AROUND IT (our own catalogue, not the web). These are "
-            "OTHER buildings and their history is theirs — never transfer it. "
-            "Use them for CONTRAST: what this block was doing in this era, "
-            "whether this building agrees with its neighbours or argues with "
-            "them, what a street of these buildings together meant socially. "
-            "One comparative sentence is worth more than another line of "
-            "fabric description, and no web search can write it:\n" + neighbours
         )
     if nearby_lore:
         extras.append(
@@ -901,7 +890,6 @@ async def generate_building_lore_detailed(
         block_ctx = await _bounded(_get_block_context(session, bin_val), 'block_context')
         arch_n = await _bounded(_get_architect_catalogue_count(session, architect), 'architect_count')
         near = await _bounded(_get_nearby_lore(session, bin_val), 'nearby_lore')
-        nbrs = await _bounded(_get_block_neighbours(session, bin_val), 'block_neighbours')
         # The designation report is the primary citation; the firm's own page is
         # the one thing it cannot supply, and this tier short-circuits before
         # Brave just as the Wikipedia one does.
@@ -928,7 +916,7 @@ async def generate_building_lore_detailed(
             raw + "\n\nAdditional web sources about this building:\n" + extra_text
         )
         lore = await _synthesize(raw_plus, building_name, address, year_built,
-                                           style, architect, block_ctx, arch_n, near, nbrs)
+                                           style, architect, block_ctx, arch_n, near)
         if lore:
             # Citation lookup starts BEFORE synthesis and is awaited after, so
             # its Brave round trip overlaps the LLM call instead of following
@@ -963,7 +951,6 @@ async def generate_building_lore_detailed(
             block_ctx = await _bounded(_get_block_context(session, bin_val), 'block_context')
             arch_n = await _bounded(_get_architect_catalogue_count(session, architect), 'architect_count')
             near = await _bounded(_get_nearby_lore(session, bin_val), 'nearby_lore')
-            nbrs = await _bounded(_get_block_neighbours(session, bin_val), 'block_neighbours')
             # Same overlap as the landmark tier: the search runs while the
             # model writes.
             cats_for_enrich = await _get_lore_categories()
@@ -979,7 +966,7 @@ async def generate_building_lore_detailed(
                 raw + "\n\nAdditional web sources about this building:\n" + extra_text
             )
             lore = await _synthesize(raw_plus, building_name, address, year_built,
-                                               style, architect, block_ctx, arch_n, near, nbrs)
+                                               style, architect, block_ctx, arch_n, near)
             # A Wikipedia extract is at least written prose, so serving it raw is
             # tolerable where raw LPC typescript is not. It is still marked
             # unsynthesized so the cost/quality split stays visible.
@@ -1023,10 +1010,9 @@ async def generate_building_lore_detailed(
             block_ctx = await _bounded(_get_block_context(session, bin_val), 'block_context')
             arch_n = await _bounded(_get_architect_catalogue_count(session, architect), 'architect_count')
             near = await _bounded(_get_nearby_lore(session, bin_val), 'nearby_lore')
-            nbrs = await _bounded(_get_block_neighbours(session, bin_val), 'block_neighbours')
             lore = await _synthesize(raw, building_name, address,
                                                year_built, style, architect,
-                                               block_ctx, arch_n, near, nbrs)
+                                               block_ctx, arch_n, near)
             if lore:
                 urls = brave_search.source_urls(results)
                 if cache_to_db:
@@ -1072,3 +1058,138 @@ async def generate_building_lore(
         architect, materials, cache_to_db
     )
     return res.text if res else None
+
+
+# ---------------------------------------------------------------------------
+# Comparative pass — the building read AGAINST its block.
+# ---------------------------------------------------------------------------
+# Deliberately a SECOND pass, run after the building's own lore is cached,
+# rather than a paragraph inside it.
+#
+# The comparison depends on how much of the block has been written yet. Today
+# most neighbours have no narrative; as they get generated the comparison gets
+# better. Baked into `storytelling`, it would be frozen at whatever the block
+# looked like the first time anyone opened this building — a permanent record
+# of an empty street. Cached separately, it can be regenerated when the block
+# fills in, without paying to rewrite the building's own lore.
+#
+# No search. No new sources. It reads what we have already written and finds the
+# relationship, which is the one thing a search engine cannot do: it knows this
+# building, but not that the Quaker meeting house opposite went up in 1867 and
+# public housing arrived on the same street in 1939.
+
+COMPARATIVE_MIN_NEIGHBOURS = 2
+
+
+async def _get_neighbour_lore(session: AsyncSession, bin_val: str,
+                              radius_m: int = 250, limit: int = 5) -> list[dict]:
+    """Neighbours that ALREADY have a narrative. Reads only; never generates."""
+    try:
+        rows = (await session.execute(text("""
+            WITH me AS (
+              SELECT geog FROM buildings_full_merge_scanning
+              WHERE bin = :bin AND geog IS NOT NULL LIMIT 1
+            )
+            SELECT b.building_name, b.year_built, b.style_prim,
+                   left(b.storytelling, 400) AS gist,
+                   round(ST_Distance(b.geog, me.geog))::int AS dist_m
+            FROM buildings_full_merge_scanning b, me
+            WHERE b.bin <> :bin AND b.geog IS NOT NULL
+              AND b.storytelling IS NOT NULL AND b.storytelling <> ''
+              AND ST_DWithin(b.geog, me.geog, :radius)
+            ORDER BY dist_m
+            LIMIT :lim
+        """), {"bin": bin_val, "radius": radius_m, "lim": limit})).fetchall()
+    except Exception as e:
+        logger.warning(f"neighbour lore lookup failed for {bin_val}: {e}")
+        return []
+    return [{"name": r[0], "year": r[1], "style": r[2], "gist": r[3], "dist": r[4]}
+            for r in rows]
+
+
+async def _synthesize_comparative(subject_name: Optional[str],
+                                  subject_lore: str,
+                                  neighbours: list[dict]) -> Optional[str]:
+    """One short paragraph placing this building among its neighbours."""
+    from services.openai_text import openai_text
+
+    lines = []
+    for n in neighbours:
+        head = f"{n['name'] or 'unnamed building'} ({n['dist']}m"
+        if n["year"]:
+            head += f", built {n['year']}"
+        if n["style"]:
+            head += f", {n['style']}"
+        head += ")"
+        lines.append(f"- {head}: {(n['gist'] or '').strip()}")
+
+    system = (
+        "You write one short paragraph for a New York architecture app, placing "
+        "a building in the context of its immediate neighbours.\n\n"
+        "You are given the building's own writeup and the writeups of buildings "
+        "within a few hundred metres. Find the RELATIONSHIP. What was this "
+        "block doing in this era? Does this building agree with its neighbours "
+        "or argue with them? What does the group say together that none says "
+        "alone — about who lived here, what they believed, what the "
+        "neighbourhood was for?\n\n"
+        "HARD RULES. Never restate the building's own writeup; the reader has "
+        "just read it. Never transfer a neighbour's history to this building — "
+        "their events are theirs, and naming which building something happened "
+        "to is mandatory. Every claim must come from the material supplied. If "
+        "the neighbours reveal no genuine relationship, reply with exactly "
+        "NONE — a forced comparison is worse than none, and 'it stands among "
+        "varied neighbours' is not an observation.\n\n"
+        "2-4 sentences. Same voice as the writeup: **bold** proper nouns, "
+        "_italic_ architectural terms, flowing prose, no lists, no heading."
+    )
+    user = (
+        f"THE BUILDING: {subject_name or 'this building'}\n"
+        f"Its writeup:\n{subject_lore[:1600]}\n\n"
+        f"NEIGHBOURS (their history is THEIRS):\n" + "\n".join(lines)
+    )
+    out = await openai_text(system=system, user=user, max_tokens=900,
+                            cache_key="jink-lore-comparative")
+    if not out:
+        return None
+    cleaned = out.strip()
+    # The model is told to decline rather than force a comparison; honour it.
+    if cleaned.upper().startswith("NONE") or len(cleaned) < 80:
+        return None
+    return cleaned
+
+
+async def get_comparative(session: AsyncSession, bin_val: str,
+                          building_name: Optional[str],
+                          subject_lore: Optional[str],
+                          cached: Optional[str],
+                          cached_basis: Optional[int]) -> Optional[str]:
+    """Serve or generate the comparative paragraph.
+
+    Regenerates only when the block has gained materially more lore than the
+    cached version was written from — otherwise a user opening a building twice
+    would pay for the same paragraph twice.
+    """
+    if not subject_lore:
+        return cached
+    neighbours = await _get_neighbour_lore(session, bin_val)
+    if len(neighbours) < COMPARATIVE_MIN_NEIGHBOURS:
+        return cached  # nothing to compare against yet; keep whatever we have
+
+    if cached and cached_basis is not None and len(neighbours) <= cached_basis:
+        return cached
+
+    para = await _synthesize_comparative(building_name, subject_lore, neighbours)
+    if not para:
+        return cached
+    try:
+        await session.execute(text("""
+            UPDATE buildings_full_merge_scanning
+            SET storytelling_comparative = :p, comparative_basis = :n
+            WHERE bin = :bin
+        """), {"p": para, "n": len(neighbours), "bin": bin_val})
+        await session.commit()
+    except Exception as e:
+        logger.warning(f"comparative cache write failed for {bin_val}: {e}")
+        await session.rollback()
+    logger.info(f"[LORE] comparative written for {bin_val} from {len(neighbours)} neighbours")
+    return para

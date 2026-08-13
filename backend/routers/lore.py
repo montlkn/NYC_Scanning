@@ -34,7 +34,7 @@ from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from models.session import get_db
-from services.lore_generator import generate_building_lore_detailed
+from services.lore_generator import generate_building_lore_detailed, get_comparative
 from utils.rate_limit import limiter, LIMIT_INFERENCE
 
 router = APIRouter(prefix="/lore", tags=["lore"])
@@ -75,7 +75,8 @@ async def get_building_lore(
     try:
         row = (await db.execute(sql_text("""
             SELECT building_name, address, year_built, style, architect,
-                   mat_primary, storytelling, storytelling_sources
+                   mat_primary, storytelling, storytelling_sources,
+                   storytelling_comparative, comparative_basis
             FROM buildings_full_merge_scanning
             WHERE replace(bin, '.0', '') = :bin
             LIMIT 1
@@ -88,7 +89,7 @@ async def get_building_lore(
         raise HTTPException(status_code=404, detail="building not found")
 
     (name, address, year_built, style, architect, materials,
-     cached, cached_sources) = row
+     cached, cached_sources, cached_comparative, comparative_basis) = row
 
     if cached and not refresh:
         return {
@@ -103,6 +104,13 @@ async def get_building_lore(
             "source": (cached_sources or [None])[0],
             "sources": cached_sources or [],
             "synthesized": True,
+            # Second pass, generated AFTER the building's own lore and cached
+            # separately: the comparison depends on how much of the block has
+            # been written, so it must be able to improve without rewriting
+            # (and re-paying for) the narrative it sits beside.
+            "comparative": await get_comparative(
+                db, bin_clean, name, cached, cached_comparative, comparative_basis
+            ),
         }
 
     # Cache miss on a cache-only request. Return the same shape a declined chain
@@ -119,6 +127,7 @@ async def get_building_lore(
             "source": None,
             "sources": [],
             "synthesized": False,
+            "comparative": None,
         }
 
     result = await generate_building_lore_detailed(
@@ -141,6 +150,7 @@ async def get_building_lore(
             "source": None,
             "sources": [],
             "synthesized": False,
+            "comparative": None,
         }
 
     logger.info(
@@ -156,4 +166,7 @@ async def get_building_lore(
         # Every citation, primary first. `source` stays for older clients.
         "sources": result.sources or ([result.source] if result.source else []),
         "synthesized": result.synthesized,
+        "comparative": await get_comparative(
+            db, bin_clean, name, result.text, cached_comparative, comparative_basis
+        ),
     }
