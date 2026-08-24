@@ -41,7 +41,20 @@ def init_search_engine():
         max_overflow=2,
         pool_pre_ping=True,
         pool_recycle=300,
-        connect_args={"options": "-c application_name=nyc_scan_search"},
+        # hnsw.ef_search is the HNSW candidate list size, and pgvector defaults
+        # it to 40. That is a CEILING on rows returned, not just a recall knob:
+        # every semantic query came back with exactly 40 results no matter what
+        # LIMIT asked for, against a 225,810-row venue corpus. A `limit=100`
+        # search was silently answering with 40, and which 40 depended on where
+        # the query landed in the graph.
+        #
+        # Set on the connection rather than per query so no vector search can
+        # forget it. 200 comfortably exceeds the largest LIMIT the API allows
+        # (100); pgvector's own guidance is that ef_search must be at least the
+        # LIMIT you intend to serve.
+        connect_args={
+            "options": "-c application_name=nyc_scan_search -c hnsw.ef_search=200"
+        },
     )
     SearchSessionLocal = async_sessionmaker(
         search_engine,
