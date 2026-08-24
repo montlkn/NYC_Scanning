@@ -17,7 +17,7 @@ from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Query, Request
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from models.search_session import get_search_db
 from services.text_embeddings import embed_query
@@ -359,18 +359,22 @@ async def venues_nearby(
         "lng": lng,
         "radius_m": radius_m,
         "limit": limit,
-        "cats": [c.lower() for c in cats],
+        "cats": tuple(c.lower() for c in cats),
     }
     where = [
         "lat IS NOT NULL",
         "lng IS NOT NULL",
-        "lower(category) = ANY(:cats)",
+        "lower(category) IN :cats",
         f"{haversine} <= :radius_m",
     ]
     if require_building:
         where.append("bin IS NOT NULL")
 
-    sql = f"""
+    # `expanding` renders the tuple as a proper IN-list at execution time. A
+    # bare `IN :cats` would bind the tuple as one scalar and match nothing, and
+    # `= ANY(:cats)` depends on the driver expanding a list into an array —
+    # true for asyncpg, not a property worth relying on silently.
+    sql = text(f"""
         SELECT fsq_id, name, category, snippet, lat, lng,
                bin, bbl, building_year, building_style,
                {haversine} AS dist_m
@@ -378,14 +382,14 @@ async def venues_nearby(
         WHERE {" AND ".join(where)}
         ORDER BY dist_m ASC
         LIMIT :limit
-    """
+    """).bindparams(bindparam("cats", expanding=True))
 
     try:
         async with get_search_db() as db:
             if db is None:
                 logger.warning("[venues/nearby] search DB not configured (SEARCH_DB_URL)")
                 return []
-            result = await db.execute(text(sql), params)
+            result = await db.execute(sql, params)
             rows = result.fetchall()
     except Exception as e:
         logger.error(f"[venues/nearby] query failed: {e}", exc_info=True)
