@@ -308,6 +308,134 @@ async def search_buildings(
     ]
 
 
+@router.get("/venues/nearby")
+@limiter.limit(LIMIT_SEARCH)
+async def venues_nearby(
+    request: Request,
+    lat: float = Query(..., description="Center latitude"),
+    lng: float = Query(..., description="Center longitude"),
+    categories: str = Query(
+        ...,
+        description="Comma-separated FSQ category names, e.g. 'Bar,Cocktail Bar,Pub'",
+    ),
+    radius_m: float = Query(800, ge=50, le=5000),
+    limit: int = Query(30, ge=1, le=100),
+    require_building: bool = Query(
+        False,
+        description="Only venues geo-joined to a host building (the provenance moat)",
+    ),
+) -> List[dict]:
+    """Venues of a given CATEGORY near a point, ordered by distance.
+
+    Distinct from `/venues`, which is a semantic search: this one does no
+    embedding at all. "Give me the bars within 800m" is a filter, not a
+    similarity question, and routing it through pgvector was actively harmful —
+    HNSW returns at most `hnsw.ef_search` candidates (default 40), so a category
+    query silently capped at ~40 rows however large the LIMIT, and which 40 you
+    got depended on the embedding of the word you happened to type. Asking for
+    'bar' near Midtown returned nothing at all, because 'bar' as a SENTENCE is
+    not close to a bar's embedded description.
+
+    Ordering by distance also means the caller gets the nearest venues rather
+    than the most semantically bar-like ones, which is what a route builder
+    actually wants.
+
+    `category` is matched case-insensitively and exactly. The values are FSQ's
+    own human-readable labels — Bar, Cocktail Bar, Wine Bar, Pub, Night Club,
+    Diner, Bakery, Coffee Shop, Breakfast Spot, Pizzeria, Deli — so the caller
+    picks the vocabulary and this endpoint stays free of hardcoded taste.
+    """
+    cats = [c.strip() for c in categories.split(",") if c.strip()]
+    if not cats:
+        return []
+
+    haversine = (
+        "6371000 * acos(GREATEST(-1, LEAST(1, "
+        "cos(radians(:lat)) * cos(radians(lat)) * cos(radians(lng) - radians(:lng)) "
+        "+ sin(radians(:lat)) * sin(radians(lat)))))"
+    )
+    params: dict = {
+        "lat": lat,
+        "lng": lng,
+        "radius_m": radius_m,
+        "limit": limit,
+        "cats": [c.lower() for c in cats],
+    }
+    where = [
+        "lat IS NOT NULL",
+        "lng IS NOT NULL",
+        "lower(category) = ANY(:cats)",
+        f"{haversine} <= :radius_m",
+    ]
+    if require_building:
+        where.append("bin IS NOT NULL")
+
+    sql = f"""
+        SELECT fsq_id, name, category, snippet, lat, lng,
+               bin, bbl, building_year, building_style,
+               {haversine} AS dist_m
+        FROM venues
+        WHERE {" AND ".join(where)}
+        ORDER BY dist_m ASC
+        LIMIT :limit
+    """
+
+    try:
+        async with get_search_db() as db:
+            if db is None:
+                logger.warning("[venues/nearby] search DB not configured (SEARCH_DB_URL)")
+                return []
+            result = await db.execute(text(sql), params)
+            rows = result.fetchall()
+    except Exception as e:
+        logger.error(f"[venues/nearby] query failed: {e}", exc_info=True)
+        return []
+
+    return [
+        {
+            "fsq_id": r[0],
+            "name": r[1],
+            "category": r[2],
+            "snippet": r[3],
+            "lat": r[4],
+            "lng": r[5],
+            "bin": str(r[6]).replace(".0", "") if r[6] else None,
+            "bbl": str(r[7]).replace(".0", "") if r[7] else None,
+            "building_year": r[8],
+            "building_style": r[9],
+            "dist_m": round(float(r[10]), 1) if r[10] is not None else None,
+        }
+        for r in rows
+    ]
+
+
+@router.get("/venues/categories")
+@limiter.limit(LIMIT_SEARCH)
+async def venue_categories(request: Request) -> List[dict]:
+    """Every category present in the corpus, with counts.
+
+    Exists so callers never hardcode a category vocabulary they cannot verify.
+    A client that guesses 'Bars' instead of 'Bar' gets silence; this endpoint is
+    how it finds out the real spelling.
+    """
+    sql = """
+        SELECT category, count(*) AS n
+        FROM venues
+        WHERE category IS NOT NULL
+        GROUP BY category
+        ORDER BY n DESC
+    """
+    try:
+        async with get_search_db() as db:
+            if db is None:
+                return []
+            rows = (await db.execute(text(sql))).fetchall()
+    except Exception as e:
+        logger.error(f"[venues/categories] query failed: {e}", exc_info=True)
+        return []
+    return [{"category": r[0], "count": r[1]} for r in rows]
+
+
 @router.get("/venues")
 @limiter.limit(LIMIT_SEARCH)
 async def search_venues(
