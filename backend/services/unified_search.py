@@ -411,7 +411,31 @@ W_LEG_FAME = 0.15
 # counts.
 LORE_INTENTS = frozenset({"style", "prose", "lore", "name", "architect"})
 W_LEG_LORE = 0.45
-LORE_SIM_FLOOR = 0.72
+
+# The leg is LEXICAL-primary, and that is a correction to how it first shipped.
+#
+# It was built vector-only with an absolute 0.72 floor, on the assumption that
+# bge cosine between related passages sits high. Measured against the real
+# chunks, it does not, and it barely discriminates:
+#
+#   "gargoyles"    vector top-500: max 0.543, avg 0.516  -> floor never cleared
+#   "mansard roof" vector top-500: max 0.762, avg 0.721
+#
+# max sits a hair above avg, so the vector signal is close to a constant, and
+# the range moves with query length -- a single absolute floor cannot serve
+# both. Worse, for "gargoyles" the chunk that literally says gargoyle (0.603)
+# was not even inside the vector top-500.
+#
+# The lexical signal separates cleanly on the same corpus:
+#
+#   literal match:  word_similarity = 1.000
+#   non-matching:   avg 0.159, max 0.500
+#
+# which makes sense -- this corpus is full of concrete nouns ("gargoyle",
+# "mansard", "half-timbering") that people type verbatim. So lexical carries
+# the term and the vector adds a smaller margin for paraphrase.
+LORE_LEX_FLOOR = 0.60   # above the 0.500 non-matching max measured above
+LORE_SIM_FLOOR = 0.60   # was 0.72: never cleared by a short query
 
 
 def leg_lore_weight(intent: str) -> float:
@@ -808,6 +832,96 @@ def style_name_decoy_penalty(
     if overlap and overlap <= _STYLE_VOCAB:
         return W_STYLE_NAME_DECOY
     return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Facet decoys: a query token that names a MATERIAL or NEIGHBORHOOD, matched
+# only in a row's name while that row's actual facet column does not satisfy
+# it.
+#
+# "cast iron soho" ranked "565 Broome SoHo" (glass, 2018) first because SoHo is
+# in its NAME, while the actual cast-iron buildings of the SoHo Cast Iron
+# Historic District sat below it. Same shape as style_name_decoy_penalty, one
+# facet over.
+#
+# No vocabulary is needed and none is used. Facet-ness is EMERGENT: a token
+# counts as a facet term for this query only because some other hit in the same
+# result set satisfies it in a real facet column. That is what makes this safe
+# to run on every query -- "empire" is not a material anywhere, so no hit
+# satisfies it in a facet column, so it is never treated as one.
+# ---------------------------------------------------------------------------
+
+W_FACET_MATCH = 0.12   # row's facet column genuinely satisfies a facet token
+W_FACET_DECOY = -0.14  # token is in the NAME only, and the facet column says no
+
+
+def _facet_words(*values: Optional[str]) -> set:
+    out: set = set()
+    for v in values:
+        if v:
+            out |= {t for t in _tokens(v) if len(t) >= 3}
+    return out
+
+
+def facet_adjustments(q_lex: str, hits: Sequence[dict]) -> List[float]:
+    """One additive adjustment per hit, aligned to `hits`.
+
+    Sized post-RRF_SCALE (one rank step ~= 0.016), so a decoy drops ~9 ranks
+    and a genuine facet match climbs ~7 -- enough to reorder a name coincidence
+    under a real match without overriding relevance outright.
+    """
+    q_toks = {t for t in _tokens(q_lex) if len(t) >= 3}
+    if not q_toks or not hits:
+        return [0.0] * len(hits)
+
+    facet_sets = [_facet_words(h.get("material"), h.get("neighborhood")) for h in hits]
+
+    # A token is a facet term for THIS query only if some hit really has it in
+    # a facet column. Emergent, not declared.
+    facet_toks = {t for t in q_toks if any(t in fs for fs in facet_sets)}
+    if not facet_toks:
+        return [0.0] * len(hits)
+
+    out: List[float] = []
+    for h, fs in zip(hits, facet_sets):
+        name_toks = _facet_words(h.get("name"))
+        adj = 0.0
+        for t in facet_toks:
+            if t in fs:
+                adj += W_FACET_MATCH
+            elif t in name_toks:
+                # Named after the thing, but is not the thing.
+                adj += W_FACET_DECOY
+        out.append(adj)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Fuzzy name bonus. exact_name_bonus/W_NAME_SUBSET fire only on exact or
+# subset TOKEN equality, so a misspelling gets nothing from either -- and
+# "chrystler building" put the Chrysler Building second, behind 215 Chrystie
+# Street, whose name genuinely is close to the typo. A typo of a famous name
+# is still a name match and should be ranked as one.
+#
+# Deliberately weaker than W_EXACT_NAME (0.30): a correct name must always
+# outrank a near-miss.
+# ---------------------------------------------------------------------------
+
+W_FUZZY_NAME = 0.18
+FUZZY_NAME_FLOOR = 0.55   # below this, similarity is coincidence not a typo
+
+
+def fuzzy_name_bonus(intent: str, name_sim: Optional[float],
+                     exact_bonus: float = 0.0) -> float:
+    """Scaled by how far above the floor the similarity sits, so a 0.9 match
+    earns far more than a 0.56 one. Skipped when an exact/subset bonus already
+    fired -- they are the same signal, and stacking would double-count."""
+    if intent != "name" or name_sim is None or exact_bonus > 0:
+        return 0.0
+    if name_sim < FUZZY_NAME_FLOOR:
+        return 0.0
+    span = 1.0 - FUZZY_NAME_FLOOR
+    return W_FUZZY_NAME * ((name_sim - FUZZY_NAME_FLOOR) / span)
 
 
 # ---------------------------------------------------------------------------

@@ -26,7 +26,10 @@ from utils.rate_limit import limiter, LIMIT_SEARCH
 from services.openai_text import openai_text
 from services.unified_search import (
     HARD_RADIUS_INTENTS,
+    facet_adjustments,
+    fuzzy_name_bonus,
     LORE_SIM_FLOOR,
+    LORE_LEX_FLOOR,
     leg_lore_weight,
     RankedHit,
     apply_nudges,
@@ -732,7 +735,16 @@ async def _leg_buildings(
     #   strict_word_similarity('terracotta', material_text) = 1.000
     params["q_toks"] = [t for t in re.split(r"[^\w'-]+", q_lex.lower()) if len(t) >= 3]
     params["tok_floor"] = 0.7
-    lore_term = "(:lore_w * GREATEST(0, coalesce(lore.sim, 0) - :lore_floor))"
+    params["lore_lex_floor"] = LORE_LEX_FLOOR
+    # Lexical carries the term (literal chunk match = 1.000 vs 0.159 average),
+    # the vector adds a smaller paraphrase margin. Both normalized by their
+    # headroom so each contributes 0..1 of its own weight.
+    lore_term = (
+        "(:lore_w * ("
+        "  0.75 * GREATEST(0, coalesce(lore.lex, 0) - :lore_lex_floor) / (1 - :lore_lex_floor)"
+        "+ 0.25 * GREATEST(0, coalesce(lore.sim, 0) - :lore_floor) / (1 - :lore_floor)"
+        "))"
+    )
     fused = ("(0.7 * (1 - (b.embedding <=> CAST(:qvec AS vector))) + 0.3 * wl.lex + "
              + lore_term + ")")
 
@@ -832,6 +844,18 @@ async def _leg_buildings(
             ORDER BY (SELECT coalesce(max(strict_word_similarity(t, lower(coalesce(material_text,'')))), 0) FROM unnest(CAST(:q_toks AS text[])) t) DESC
             LIMIT :pool
         ),
+        lore_lex_pool AS (
+            -- Literal recall over the report prose. The vector pool alone did
+            -- not contain the chunk that says "gargoyle" for the query
+            -- "gargoyles", so without this leg the text is in the index and
+            -- still unreachable.
+            SELECT DISTINCT bin FROM (
+                SELECT bin FROM building_lore_index
+                 WHERE word_similarity(lower(:q_lex), lower(text)) > :lore_lex_floor
+                 ORDER BY word_similarity(lower(:q_lex), lower(text)) DESC
+                 LIMIT :lore_scan
+            ) llp LIMIT :pool
+        ),
         lore_pool AS (
             -- 4th leg: per-building LPC designation-report prose. This is the
             -- only corpus that contains ornament/material/feature language, so
@@ -847,7 +871,7 @@ async def _leg_buildings(
             SELECT bin FROM vec_pool UNION SELECT bin FROM lex_pool
             UNION SELECT bin FROM fuzzy_pool UNION SELECT bin FROM fame_pool
             UNION SELECT bin FROM lore_pool UNION SELECT bin FROM mat_pool
-            UNION SELECT bin FROM hood_pool
+            UNION SELECT bin FROM hood_pool UNION SELECT bin FROM lore_lex_pool
         )
         SELECT b.bin, b.bbl, b.snippet, b.year_built, b.is_landmark, b.fame, b.lat, b.lng,
                {fused} AS score,
@@ -857,7 +881,8 @@ async def _leg_buildings(
                -- ALWAYS LAST, and read as r[-2]/r[-1]: everything above is
                -- indexed positionally off extra_offset, so a mid-list insert
                -- silently shifts style_family/borough/material/architect.
-               , lore.sim AS lore_score, lore.text AS lore_text
+               , lore.sim AS lore_score, lore.text AS lore_text, lore.lex AS lore_lex
+               , similarity(lower(:q_lex), lower(coalesce(b.name_norm, ''))) AS name_sim
         FROM building_search_index b
         JOIN pool USING (bin)
         CROSS JOIN LATERAL (
@@ -878,10 +903,16 @@ async def _leg_buildings(
             -- Best-matching report chunk for this BIN: its similarity feeds
             -- the fused score, its text becomes the `why` citation.
             SELECT 1 - (l.embedding <=> CAST(:qvec AS vector)) AS sim,
+                   word_similarity(lower(:q_lex), lower(l.text)) AS lex,
                    l.text AS text
               FROM building_lore_index l
              WHERE l.bin = b.bin
-             ORDER BY l.embedding <=> CAST(:qvec AS vector)
+             -- Pick the chunk that best explains the hit on EITHER signal, so
+             -- the citation is the sentence the user would recognise.
+             ORDER BY GREATEST(
+                        word_similarity(lower(:q_lex), lower(l.text)),
+                        1 - (l.embedding <=> CAST(:qvec AS vector))
+                      ) DESC
              LIMIT 1
         ) lore ON true
         {('WHERE ' + ' AND '.join(enriched_filters)) if (enriched and enriched_filters) else ''}
@@ -964,10 +995,16 @@ async def _leg_buildings(
                 # The designation report carried this hit, not the metadata
                 # template — say so, so "gargoyles" can cite the sentence that
                 # actually says gargoyles instead of claiming "semantic".
-                else ("report" if (r[-2] or 0) > LORE_SIM_FLOOR else "semantic")
+                # Credit the REPORT when the designation text is what matched.
+                # Keyed on the lexical score, not the vector one: the vector
+                # barely separates (avg 0.516 vs max 0.543 for "gargoyles"),
+                # so a vector-keyed test called every lore hit "semantic".
+                else ("report" if (r[-2] or 0) > LORE_LEX_FLOOR else "semantic")
             ),
-            "lore_score": float(r[-2]) if r[-2] is not None else None,
-            "lore_text": r[-1],
+            "lore_score": float(r[-4]) if r[-4] is not None else None,
+            "lore_text": r[-3],
+            "lore_lex": float(r[-2]) if r[-2] is not None else None,
+            "name_sim": float(r[-1]) if r[-1] is not None else None,
             "dist_m": round(float(r[dist_idx]), 1) if geo and len(r) > dist_idx and r[dist_idx] is not None else None,
             "photo_url": photo_url,
             "lore_status": None,
@@ -1691,7 +1728,12 @@ async def search_unified(
     # near-duplicate clusters, and truncating before dedup could keep two
     # duplicates while dropping a genuinely-different lower-ranked hit.
     all_hits: List[Dict[str, Any]] = []
-    for gk, score, ranked_hit in fused:
+    # Facet-ness is emergent from the RESULT SET (a token is a material or
+    # neighborhood term only because some hit really carries it in that
+    # column), so this is computed once over the whole list rather than
+    # per-hit inside the loop.
+    _facet_adj = facet_adjustments(q_lex, [rh.payload for _, _, rh in fused])
+    for idx, (gk, score, ranked_hit) in enumerate(fused):
         h = dict(ranked_hit.payload)
         # personalization_dot is set only on buildings hits, only when the
         # enriched `profile` column exists AND a user_vector param was passed
@@ -1721,7 +1763,14 @@ async def search_unified(
         # Name intent: an exact/subset name match is the answer — this bonus
         # is deliberately dominant over every other nudge (see W_EXACT_NAME).
         if intent == "name":
-            nudged += exact_name_bonus(q_lex, h.get("name"))
+            _exact = exact_name_bonus(q_lex, h.get("name"))
+            nudged += _exact
+            # A typo of a famous name is still a name match. exact_name_bonus
+            # fires only on exact/subset TOKEN equality, so a misspelling got
+            # nothing and "chrystler building" put the Chrysler Building
+            # second, behind 215 Chrystie Street. Skipped when the exact bonus
+            # already fired -- same signal, would double-count.
+            nudged += fuzzy_name_bonus(intent, h.get("name_sim"), _exact)
         # Architect intent: a real column match is the answer, same standing as
         # an exact name match. Previously this intent had no structured field
         # to score against at all.
@@ -1749,6 +1798,11 @@ async def search_unified(
         nudged += hedged_style_penalty(
             query_style_tokens(q, poi_noun), h.get("style")
         )
+        # Facet decoys: "cast iron soho" ranked 565 Broome SoHo (glass, 2018)
+        # first on a NAME match for "soho" while the actual cast-iron district
+        # sat below it. Computed across the whole list (facet-ness is emergent
+        # from it), so it is applied from a precomputed array, not per-hit.
+        nudged += _facet_adj[idx]
         why = build_why(
             matched_field=h.get("matched_field"),
             year=h.get("year"),
