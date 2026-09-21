@@ -114,13 +114,25 @@ class TestFuzzyName:
     """Calibrated on measured similarities, not guessed thresholds."""
 
     def test_a_real_typo_beats_a_coincidental_street_name(self):
-        # "chrystler building": Chrysler scores 0.640, 215 Chrystie 0.182.
-        chrysler = us.fuzzy_name_bonus("name", 0.640)
-        chrystie = us.fuzzy_name_bonus("name", 0.182)
+        # Values measured on what the pipeline ACTUALLY compares: the
+        # stopword-stripped q_lex ("chrystler") against each alias separately.
+        # An earlier version of this test used 0.640/0.182, taken from the raw
+        # query against the concatenated alias blob -- numbers that never occur
+        # in the running code. The floor was set above everything reachable and
+        # the bonus never fired, while this test passed.
+        chrysler = us.fuzzy_name_bonus("name", 0.438)
+        chrystie = us.fuzzy_name_bonus("name", 0.261)
         assert chrystie == 0.0
         # Worth more than ~4 rank steps (one step ~= 0.016), or it cannot
         # reorder the two.
         assert chrysler > 0.064
+
+    def test_the_floor_sits_below_a_realistic_typo_score(self):
+        # Guards the class of bug above: trigram similarity against a short
+        # alias rarely exceeds ~0.6, so a floor set for a full-query match is
+        # unreachable in practice.
+        assert us.FUZZY_NAME_FLOOR < 0.44
+        assert us.FUZZY_NAME_FULL <= 0.6
 
     def test_never_outranks_an_exact_name_match(self):
         assert us.W_FUZZY_NAME < us.W_EXACT_NAME

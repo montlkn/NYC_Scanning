@@ -918,7 +918,21 @@ def facet_adjustments(q_lex: str, hits: Sequence[dict]) -> List[float]:
 # first-shipped 0.55 a 0.640 match cleared the floor by only 20% of the range
 # and earned ~2 rank steps -- not enough, and Chrysler stayed second.
 W_FUZZY_NAME = 0.24       # still below W_EXACT_NAME (0.30): a correct name wins
-FUZZY_NAME_FLOOR = 0.40   # above the ~0.19 coincidence level, below a real typo
+# Calibrated on what the code ACTUALLY compares, which is not what I first
+# measured. q_lex is the STOPWORD-STRIPPED query -- "chrystler building"
+# becomes "chrystler", because "building" is a lexical stopword -- and it is
+# matched per alias. Measured on those real inputs:
+#
+#   Chrysler Building | The Chrysler   0.438   <- the intended answer
+#   10 Chrystie Street                 0.261
+#   215 Chrystie Street                0.250
+#
+# My first calibration (floor 0.55, then 0.40) came from the RAW query against
+# the whole alias blob, which scored 0.640 and does not occur anywhere in the
+# pipeline. Both floors sat above every value the code can actually produce, so
+# the bonus never fired at all.
+FUZZY_NAME_FLOOR = 0.32   # above the ~0.26 coincidence level, below a real typo
+FUZZY_NAME_FULL = 0.55    # at/above this, award the full weight
 
 
 def fuzzy_name_bonus(intent: str, name_sim: Optional[float],
@@ -930,8 +944,13 @@ def fuzzy_name_bonus(intent: str, name_sim: Optional[float],
         return 0.0
     if name_sim < FUZZY_NAME_FLOOR:
         return 0.0
-    span = 1.0 - FUZZY_NAME_FLOOR
-    return W_FUZZY_NAME * ((name_sim - FUZZY_NAME_FLOOR) / span)
+    # Ramp between the floor and FUZZY_NAME_FULL rather than up to 1.0. Trigram
+    # similarity against a short alias rarely exceeds ~0.6 even for an obvious
+    # typo, so normalizing by (1 - floor) wasted most of the weight on a range
+    # the data never reaches.
+    span = FUZZY_NAME_FULL - FUZZY_NAME_FLOOR
+    frac = min(1.0, (name_sim - FUZZY_NAME_FLOOR) / span)
+    return W_FUZZY_NAME * frac
 
 
 # ---------------------------------------------------------------------------

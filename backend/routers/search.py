@@ -882,7 +882,15 @@ async def _leg_buildings(
                -- indexed positionally off extra_offset, so a mid-list insert
                -- silently shifts style_family/borough/material/architect.
                , lore.sim AS lore_score, lore.text AS lore_text, lore.lex AS lore_lex
-               , similarity(lower(:q_lex), lower(coalesce(b.name_norm, ''))) AS name_sim
+               -- MAX over the individual aliases, not the concatenated blob.
+               -- name_norm is "Chrysler Building | The Chrysler"; comparing a
+               -- one-word q_lex against the whole string dilutes it to 0.280,
+               -- against 0.261 for the unrelated "10 Chrystie Street" -- no
+               -- separation. Per alias it is 0.438 vs 0.261. (word_similarity
+               -- is worse still here: 0.583 vs 0.600, i.e. inverted.)
+               , (SELECT max(similarity(lower(:q_lex), lower(a)))
+                    FROM unnest(string_to_array(coalesce(b.name_norm, ''), ' | ')) a)
+                 AS name_sim
         FROM building_search_index b
         JOIN pool USING (bin)
         CROSS JOIN LATERAL (
