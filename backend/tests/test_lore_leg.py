@@ -108,3 +108,25 @@ class TestIntentRegressions:
     def test_a_real_poi_noun_still_routes_to_poi(self):
         # The guard above must not cost us the actual POI behaviour.
         assert us.classify_intent("art deco bar") == "poi"
+
+
+class TestFuzzyName:
+    """Calibrated on measured similarities, not guessed thresholds."""
+
+    def test_a_real_typo_beats_a_coincidental_street_name(self):
+        # "chrystler building": Chrysler scores 0.640, 215 Chrystie 0.182.
+        chrysler = us.fuzzy_name_bonus("name", 0.640)
+        chrystie = us.fuzzy_name_bonus("name", 0.182)
+        assert chrystie == 0.0
+        # Worth more than ~4 rank steps (one step ~= 0.016), or it cannot
+        # reorder the two.
+        assert chrysler > 0.064
+
+    def test_never_outranks_an_exact_name_match(self):
+        assert us.W_FUZZY_NAME < us.W_EXACT_NAME
+
+    def test_suppressed_when_the_exact_bonus_already_fired(self):
+        assert us.fuzzy_name_bonus("name", 0.9, exact_bonus=us.W_EXACT_NAME) == 0.0
+
+    def test_only_applies_to_name_intent(self):
+        assert us.fuzzy_name_bonus("style", 0.9) == 0.0

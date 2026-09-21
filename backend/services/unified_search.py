@@ -907,8 +907,18 @@ def facet_adjustments(q_lex: str, hits: Sequence[dict]) -> List[float]:
 # outrank a near-miss.
 # ---------------------------------------------------------------------------
 
-W_FUZZY_NAME = 0.18
-FUZZY_NAME_FLOOR = 0.55   # below this, similarity is coincidence not a typo
+# Calibrated against the case it exists for, "chrystler building":
+#
+#   Chrysler Building | The Chrysler   similarity 0.640
+#   215 Chrystie Street                similarity 0.182
+#   10 Chrystie Street                 similarity 0.188
+#
+# A real typo of the intended name sits ~3.5x above a coincidental street-name
+# match, so the floor belongs between them, not just under the typo. At the
+# first-shipped 0.55 a 0.640 match cleared the floor by only 20% of the range
+# and earned ~2 rank steps -- not enough, and Chrysler stayed second.
+W_FUZZY_NAME = 0.24       # still below W_EXACT_NAME (0.30): a correct name wins
+FUZZY_NAME_FLOOR = 0.40   # above the ~0.19 coincidence level, below a real typo
 
 
 def fuzzy_name_bonus(intent: str, name_sim: Optional[float],
