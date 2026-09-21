@@ -723,7 +723,10 @@ async def _leg_buildings(
     # chunks because a BIN averages 3.4 of them, so N chunks yield ~N/3.4 BINs.
     params["lore_w"] = lore_weight
     params["lore_floor"] = LORE_SIM_FLOOR
-    params["lore_scan"] = pool * 3
+    # pool, not pool*3: the outer DISTINCT keeps at most `pool` bins anyway,
+    # and a wider scan only costs time. Measured on "stained glass windows":
+    # 600 -> 2.44s/200 bins, 250 -> 1.57s/157 bins.
+    params["lore_scan"] = pool
     # Higher than lex_floor: a neighborhood name is a short, distinctive
     # string, so a loose match here drags in a whole different part of the city.
     params["hood_floor"] = 0.6
@@ -849,10 +852,24 @@ async def _leg_buildings(
             -- not contain the chunk that says "gargoyle" for the query
             -- "gargoyles", so without this leg the text is in the index and
             -- still unreachable.
+            -- `<%` is the INDEXABLE form of word_similarity: the bare
+            -- function call cannot use idx_bli_trgm, and profiling put this
+            -- one pool at 3.81s of a 5.65s buildings leg. The explicit
+            -- predicate stays as the source of truth; the operator only
+            -- prefilters, using pg_trgm.word_similarity_threshold, whose
+            -- default (0.6) is deliberately the same value as
+            -- LORE_LEX_FLOOR. If that floor is ever lowered, this needs a
+            -- matching `SET pg_trgm.word_similarity_threshold` or the
+            -- operator will exclude rows the predicate would accept.
+            --
+            -- No ORDER BY: this pool is a RECALL set, not a ranking -- the
+            -- fused score orders everything downstream. Sorting the matched
+            -- set cost 4.72s vs 1.65s on "mansard roof" for no change in
+            -- which BINs survive.
             SELECT DISTINCT bin FROM (
                 SELECT bin FROM building_lore_index
-                 WHERE word_similarity(lower(:q_lex), lower(text)) > :lore_lex_floor
-                 ORDER BY word_similarity(lower(:q_lex), lower(text)) DESC
+                 WHERE lower(:q_lex) <% lower(text)
+                   AND word_similarity(lower(:q_lex), lower(text)) > :lore_lex_floor
                  LIMIT :lore_scan
             ) llp LIMIT :pool
         ),
