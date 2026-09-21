@@ -629,6 +629,59 @@ async def search_layers(
 # existing silent-fallback contract — a broken leg never breaks the others.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Closed vocabularies used to GATE the material / neighborhood pools.
+#
+# Both pools run a per-row subquery no index can serve, so running one that
+# cannot match costs a full seq scan for zero rows. These sets are small and
+# fixed (20 distinct materials, 197 NTA names), so a query token either is one
+# of them or it isn't -- no heuristic involved.
+#
+# Loaded once per process on first use, directly off the index. Empty set on
+# failure means the gate opens and behaviour is exactly as before.
+# ---------------------------------------------------------------------------
+
+_MATERIAL_VOCAB: Optional[set] = None
+_HOOD_VOCAB: Optional[set] = None
+
+
+def _load_vocab(column: str) -> set:
+    import psycopg  # sync, one-shot, at import-time cost only
+    from models.config import get_settings
+    url = get_settings().search_db_url
+    if not url:
+        return set()
+    try:
+        with psycopg.connect(url, connect_timeout=5) as c, c.cursor() as cur:
+            cur.execute(
+                f"SELECT DISTINCT lower(tok) FROM {column} src, "
+                f"LATERAL unnest(regexp_split_to_array(src.v, '[^a-zA-Z]+')) tok "
+                f"WHERE length(tok) >= 3"
+            )
+            return {r[0] for r in cur.fetchall()}
+    except Exception as e:
+        logger.warning(f"[search] vocab load for {column} failed ({e}); gate opens")
+        return set()
+
+
+def material_vocab() -> set:
+    global _MATERIAL_VOCAB
+    if _MATERIAL_VOCAB is None:
+        _MATERIAL_VOCAB = _load_vocab(
+            "(SELECT DISTINCT material_text AS v FROM building_search_index "
+            " WHERE material_text IS NOT NULL)")
+    return _MATERIAL_VOCAB
+
+
+def neighborhood_vocab() -> set:
+    global _HOOD_VOCAB
+    if _HOOD_VOCAB is None:
+        _HOOD_VOCAB = _load_vocab(
+            "(SELECT DISTINCT neighborhood_text AS v FROM building_search_index "
+            " WHERE neighborhood_text IS NOT NULL)")
+    return _HOOD_VOCAB
+
+
 async def _leg_buildings(
     qvec_lit: str,
     q_lex: str,
@@ -738,6 +791,15 @@ async def _leg_buildings(
     #   strict_word_similarity('terracotta', material_text) = 1.000
     params["q_toks"] = [t for t in re.split(r"[^\w'-]+", q_lex.lower()) if len(t) >= 3]
     params["tok_floor"] = 0.7
+    # Gate: skip the material and neighborhood pools when no query token could
+    # possibly match one. Both run a per-row subquery that no index can serve
+    # (~85ms and ~98ms of a seq scan), and for a query like "cocktail bar" they
+    # scan the whole table to return zero rows. The vocabularies are small and
+    # closed -- 20 material values, 197 NTA names -- so this is a set lookup,
+    # not a heuristic.
+    _toks = set(params["q_toks"])
+    want_mat = bool(_toks & material_vocab())
+    want_hood = bool(_toks & neighborhood_vocab())
     params["lore_lex_floor"] = LORE_LEX_FLOOR
     # Lexical carries the term (literal chunk match = 1.000 vs 0.159 average),
     # the vector adds a smaller paraphrase margin. Both normalized by their
@@ -832,7 +894,8 @@ async def _leg_buildings(
             -- official compound name is otherwise one opaque token.
             SELECT bin FROM building_search_index
             {where + (' AND ' if where else 'WHERE ')}
-                  (SELECT coalesce(max(strict_word_similarity(t, lower(coalesce(neighborhood_text,'')))), 0) FROM unnest(CAST(:q_toks AS text[])) t) > :tok_floor
+                  {'TRUE' if want_hood else 'FALSE'}
+              AND (SELECT coalesce(max(strict_word_similarity(t, lower(coalesce(neighborhood_text,'')))), 0) FROM unnest(CAST(:q_toks AS text[])) t) > :tok_floor
             ORDER BY (SELECT coalesce(max(strict_word_similarity(t, lower(coalesce(neighborhood_text,'')))), 0) FROM unnest(CAST(:q_toks AS text[])) t) DESC
             LIMIT :pool
         ),
@@ -843,7 +906,8 @@ async def _leg_buildings(
             -- coalesce so it is a no-op until backfill_index_material runs.
             SELECT bin FROM building_search_index
             {where + (' AND ' if where else 'WHERE ')}
-                  (SELECT coalesce(max(strict_word_similarity(t, lower(coalesce(material_text,'')))), 0) FROM unnest(CAST(:q_toks AS text[])) t) > :tok_floor
+                  {'TRUE' if want_mat else 'FALSE'}
+              AND (SELECT coalesce(max(strict_word_similarity(t, lower(coalesce(material_text,'')))), 0) FROM unnest(CAST(:q_toks AS text[])) t) > :tok_floor
             ORDER BY (SELECT coalesce(max(strict_word_similarity(t, lower(coalesce(material_text,'')))), 0) FROM unnest(CAST(:q_toks AS text[])) t) DESC
             LIMIT :pool
         ),
