@@ -1544,6 +1544,26 @@ def _result_cache_get(key: tuple):
 
 
 def _result_cache_put(key: tuple, resp: Dict[str, Any]) -> None:
+    """Cache a response, but NEVER an empty one.
+
+    Every leg degrades to [] on exception (the deliberate "a broken leg never
+    breaks the others" contract), so a transient DB stall produces a perfectly
+    valid-looking response with zero hits -- and caching it pinned that exact
+    query to "no results" for the full 300s TTL, long after the database had
+    recovered.
+
+    Observed exactly that: a long-running UPDATE blocked reads of `venues`,
+    and afterwards "art deco" returned 0 hits while "art deco building" and
+    "brutalist" were fine, purely because the one query had been asked during
+    the stall. Nudging the coordinates by a few hundred metres -- a different
+    cache key -- returned 3 hits immediately.
+
+    An empty result is nearly always a failure or a miss, and neither is worth
+    remembering. Re-running a genuinely empty query costs one search; serving
+    a wrong empty one costs the user the feature.
+    """
+    if not resp.get("hits"):
+        return
     _result_cache[key] = (time.monotonic(), resp)
     _result_cache.move_to_end(key)
     while len(_result_cache) > _RESULT_CACHE_MAX:
