@@ -136,10 +136,22 @@ async def lifespan(app: FastAPI):
             # intent. Material retrieval goes through the material_text
             # trigram leg instead, which needs no vocabulary.
             style = {t for k, t in rows if k == "style"}
-            # A term cannot be both: "art" is a venue category head noun, and
-            # as a POI noun it would route "art deco" to the venues corpus.
-            poi = {t for k, t in rows if k == "poi"} - style
-            sizes = install_derived_vocab(style=style, poi=poi)
+            # STYLE ONLY -- deliberately not poi.
+            #
+            # Deriving POI nouns from venue category head nouns looked right
+            # and shipped two regressions, caught in production:
+            #   "chrystler building"      -> poi intent -> Chrystie Street venues
+            #   "gothic church in harlem" -> poi intent -> St. Patrick's (Midtown), a grave
+            # because "building" and "church" are both category heads. POI
+            # intent drops the buildings corpus weight from 1.0 to 0.4, so a
+            # building word landing in that set is strictly harmful -- the
+            # opposite of the gap it was meant to close. Building types need
+            # their own signal, not this one.
+            #
+            # Material is excluded too: material is not part of the embedded
+            # text, so its df_source/df_text is not a discriminativeness
+            # measure, and "and" scored 1.02.
+            sizes = install_derived_vocab(style=style)
             logger.info(f"Derived search vocab installed: {sizes}")
         except Exception as e:
             logger.warning(f"Derived vocab unavailable, using seeds: {e}")

@@ -38,7 +38,7 @@ class TestDerivedVocab:
     def test_seeds_survive_injection(self):
         # The seeds carry plural and colloquial forms ("midcentury",
         # "speakeasies") that no source column spells out.
-        us.install_derived_vocab(style={"italianate"}, poi={"bodega"})
+        us.install_derived_vocab(style={"italianate"})
         assert "midcentury" in us._STYLE_VOCAB
         assert "speakeasies" in us._POI_NOUNS
 
@@ -57,22 +57,54 @@ class TestDerivedVocab:
 
     def test_empty_injection_is_a_noop(self):
         before = set(us._STYLE_VOCAB)
-        us.install_derived_vocab(style=set(), poi=set())
+        us.install_derived_vocab(style=set())
         assert us._STYLE_VOCAB == before
 
     def test_install_reports_sizes(self):
-        sizes = us.install_derived_vocab(style={"a", "b"}, poi={"c"})
+        sizes = us.install_derived_vocab(style={"a", "b"})
         assert sizes["style"] == len(us._STYLE_VOCAB_SEED | {"a", "b"})
-        assert sizes["poi"] == len(us._POI_NOUNS_SEED | {"c"})
+
+    def test_a_poi_kwarg_is_swallowed_not_applied(self):
+        # An old caller must degrade to a no-op, not re-break intent routing.
+        us.install_derived_vocab(style={"adamesque"}, poi={"building", "church"})
+        assert "building" not in us._POI_NOUNS
+        assert "church" not in us._POI_NOUNS
 
 
 class TestIntentRegressions:
     """Queries the audit found misrouted."""
 
+    def setup_method(self):
+        self._style = set(us._STYLE_VOCAB)
+        self._poi = set(us._POI_NOUNS)
+
+    def teardown_method(self):
+        us._STYLE_VOCAB = self._style
+        us._POI_NOUNS = self._poi
+
     def test_brutalist_church_is_not_poi(self):
-        # 'church' must not be a POI noun: POI drops the buildings corpus
-        # weight from 1.0 to 0.4.
         assert us.classify_intent("brutalist church") == "style"
 
     def test_art_deco_stays_style_not_poi(self):
         assert us.classify_intent("art deco") == "style"
+
+    # The three below are the regression this suite MISSED. The earlier tests
+    # asserted against the seed vocabularies only, so they passed while
+    # production installed derived POI nouns from venue category heads --
+    # which include "building" and "church" -- and routed both queries to the
+    # venues corpus at weight 1.0 against buildings at 0.4:
+    #   "chrystler building"      -> Chrystie Street venues
+    #   "gothic church in harlem" -> St. Patrick's (Midtown), and a grave
+    # Any future POI derivation has to keep these passing.
+
+    def test_building_must_never_become_a_poi_noun(self):
+        us.install_derived_vocab(poi={"building"})
+        assert us.classify_intent("chrystler building") != "poi"
+
+    def test_church_must_never_become_a_poi_noun(self):
+        us.install_derived_vocab(poi={"church"})
+        assert us.classify_intent("gothic church in harlem") != "poi"
+
+    def test_a_real_poi_noun_still_routes_to_poi(self):
+        # The guard above must not cost us the actual POI behaviour.
+        assert us.classify_intent("art deco bar") == "poi"

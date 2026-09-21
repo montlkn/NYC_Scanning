@@ -83,17 +83,29 @@ _STYLE_VOCAB = set(_STYLE_VOCAB_SEED)
 _POI_NOUNS = set(_POI_NOUNS_SEED)
 
 
-def install_derived_vocab(style: set | None = None, poi: set | None = None) -> dict:
-    """Merge corpus-derived terms into the live vocabularies.
+def install_derived_vocab(style: set | None = None, **_ignored) -> dict:
+    """Merge corpus-derived STYLE terms into the live vocabulary.
 
-    Union, never replace: the seeds carry plural and colloquial forms ("bars",
-    "speakeasies", "midcentury") that no source column spells out.
+    Union, never replace: the seeds carry plural and colloquial forms
+    ("midcentury", "cast-iron") that no source column spells out.
+
+    STYLE ONLY, and the `poi` door is deliberately bricked up rather than
+    merely left unused. Deriving POI nouns from venue category head nouns
+    looked obviously right and shipped two production regressions:
+
+        "chrystler building"      -> poi -> Chrystie Street venues
+        "gothic church in harlem" -> poi -> St. Patrick's (Midtown), and a grave
+
+    because "building" and "church" are both category heads. A POI
+    classification drops the buildings corpus weight from 1.0 to 0.4, so any
+    building word that lands in _POI_NOUNS is strictly harmful -- the exact
+    opposite of the gap it was meant to close. Building types need a signal of
+    their own, not this one. **_ignored swallows a `poi=` kwarg so an old
+    caller degrades to a no-op instead of quietly re-breaking intent routing.
     """
-    global _STYLE_VOCAB, _POI_NOUNS
+    global _STYLE_VOCAB
     if style:
         _STYLE_VOCAB = set(_STYLE_VOCAB_SEED) | {t.lower() for t in style}
-    if poi:
-        _POI_NOUNS = set(_POI_NOUNS_SEED) | {t.lower() for t in poi}
     return {"style": len(_STYLE_VOCAB), "poi": len(_POI_NOUNS)}
 
 
