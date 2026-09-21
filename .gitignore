@@ -74,3 +74,8 @@ web-build/
 temp/
 .claude/
 tiles_out/
+
+# Search index build artifacts: a ~90MB vector cache and a 4.6MB NTA download,
+# both re-derivable by their scripts.
+backend/scripts/.lore_vecs.pkl
+backend/scripts/.nta_2020.geojson

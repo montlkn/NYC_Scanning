@@ -45,7 +45,7 @@ _ADDRESS_RE = re.compile(
 # swallowed as an address.
 _ADDRESS_LOOSE_RE = re.compile(r"^\s*\d+[\-\d]*\s+[A-Za-z][A-Za-z.'-]*(\s+[A-Za-z][A-Za-z.'-]*){0,2}\s*$")
 
-_POI_NOUNS = frozenset({
+_POI_NOUNS_SEED = frozenset({
     "bar", "bars", "cafe", "cafes", "coffee", "restaurant", "restaurants",
     "club", "clubs", "theater", "theatre", "theaters", "theatres", "diner",
     "diners", "speakeasy", "speakeasies", "bakery", "bakeries", "pizzeria",
@@ -59,13 +59,43 @@ _ARCHITECT_MARKERS = frozenset({
     "architect", "architects", "designed", "designer", "firm", "atelier",
 })
 
-_STYLE_VOCAB = frozenset({
+_STYLE_VOCAB_SEED = frozenset({
     "deco", "beaux-arts", "beaux", "arts", "gothic", "romanesque", "modernist",
     "modernism", "brutalist", "brutalism", "victorian", "federal", "georgian",
     "italianate", "neoclassical", "postmodern", "postmodernism", "moderne",
     "streamline", "cast-iron", "greek", "revival", "mid-century", "midcentury",
     "international", "queen", "renaissance", "colonial", "tudor", "art",
 })
+
+# The two vocabularies above are SEEDS, not the live sets. _STYLE_VOCAB_SEED
+# held 28 words against 761 distinct style_primary values, and _POI_NOUNS_SEED
+# has no "church", "synagogue", "library" or "firehouse" against 442 distinct
+# building_type values. A miss is expensive: it swings _INTENT_WEIGHTS by 2.5x
+# on the buildings/venues split, which is why "cast iron soho" classified as
+# `name` and came back as 2016-2018 glass towers.
+#
+# scripts/build_search_vocab.py measures the real vocabulary off the corpus and
+# routers/search.py installs it at startup via install_derived_vocab(). This
+# module stays DB-free (see the module docstring) so the fusion logic remains
+# unit-testable without SEARCH_DB_URL, and the seeds are the fallback when the
+# table is missing or empty.
+_STYLE_VOCAB = set(_STYLE_VOCAB_SEED)
+_POI_NOUNS = set(_POI_NOUNS_SEED)
+
+
+def install_derived_vocab(style: set | None = None, poi: set | None = None) -> dict:
+    """Merge corpus-derived terms into the live vocabularies.
+
+    Union, never replace: the seeds carry plural and colloquial forms ("bars",
+    "speakeasies", "midcentury") that no source column spells out.
+    """
+    global _STYLE_VOCAB, _POI_NOUNS
+    if style:
+        _STYLE_VOCAB = set(_STYLE_VOCAB_SEED) | {t.lower() for t in style}
+    if poi:
+        _POI_NOUNS = set(_POI_NOUNS_SEED) | {t.lower() for t in poi}
+    return {"style": len(_STYLE_VOCAB), "poi": len(_POI_NOUNS)}
+
 
 _LORE_VOCAB = frozenset({
     "demolished", "demolition", "lost", "former", "formerly", "ghost",
@@ -346,6 +376,36 @@ W_FAME_BOOST = 0.12  # × fame (0–1): Chrysler ≈ +0.095, median row ≈ +0.0
 # high-fame rows from being cut at the leg LIMIT before the post-RRF boost
 # can act. Applied by routers/search.py::_leg_buildings for FAME_BOOST_INTENTS.
 W_LEG_FAME = 0.15
+
+
+# ---------------------------------------------------------------------------
+# LPC designation-report prose leg (building_lore_index).
+#
+# building_search_index.text is a metadata template — "X, an international
+# style office building in Manhattan. designed by Y. built 1950." — and only 51
+# of 35,382 source rows carry any free prose. So the embedding has nothing
+# descriptive to match and ornament/material queries returned pure noise:
+# "gargoyles" gave Jenga Tower (2017), "stained glass" gave 101 Warren Street,
+# "buildings with terracotta" gave the Seagram Building (while 1,502 rows carry
+# mat_prim 'Brick and Terra Cotta').
+#
+# The LPC reports DO carry it ("half-timbering with carved gargoyles"), so the
+# per-building chunks are embedded separately and joined back by BIN.
+#
+# LORE_SIM_FLOOR is load-bearing: bge cosine between any two English passages
+# sits well above zero, so a raw additive lore term would be a near-constant
+# bonus handed to every building that HAS a report — i.e. a proxy for
+# landmark status, not for matching the query. Only the margin above the floor
+# counts.
+LORE_INTENTS = frozenset({"style", "prose", "lore", "name", "architect"})
+W_LEG_LORE = 0.45
+LORE_SIM_FLOOR = 0.72
+
+
+def leg_lore_weight(intent: str) -> float:
+    """Lore weight for a leg query. Zero for address/poi/event, where the
+    designation report's prose is noise against a street number or a bar."""
+    return W_LEG_LORE if intent in LORE_INTENTS else 0.0
 
 
 def proximity_decay_bonus(dist_m: Optional[float]) -> float:
