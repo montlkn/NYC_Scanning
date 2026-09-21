@@ -1589,7 +1589,21 @@ async def search_unified(
         try:
             parts = [float(x) for x in user_vector.split(",")]
             if len(parts) == 9:
-                user_vec_lit = "[" + ",".join(f"{x:.6f}" for x in parts) + "]"
+                # L2-NORMALIZE. The nudge is `W_PERSONALIZATION * dot(profile,
+                # uvec)`, sized in rank-steps on the assumption that dot is a
+                # cosine in [-1, 1]. It was not: stored profile vectors have
+                # magnitudes up to 88 (mean 65), so an un-normalized dot made
+                # the 0.02 weight worth up to ~110 rank steps and personal
+                # taste silently became the primary sort key -- "oculus"
+                # ranked Odyssey House first and The Oculus fifth. The iOS
+                # client has had user_vector hard-disabled over this.
+                # Normalizing both sides is what makes the weight mean what it
+                # says; see the matching UPDATE in
+                # migrations/20260920_normalize_profile_vectors.sql.
+                norm = sum(x * x for x in parts) ** 0.5
+                if norm > 0:
+                    parts = [x / norm for x in parts]
+                    user_vec_lit = "[" + ",".join(f"{x:.6f}" for x in parts) + "]"
         except Exception:
             user_vec_lit = None
 
