@@ -114,6 +114,50 @@ async def lifespan(app: FastAPI):
 
     asyncio.create_task(_warm_embeddings())
 
+    # Install the corpus-derived query vocabulary (search_vocab, built by
+    # scripts/build_search_vocab.py). The intent router's hardcoded seeds cover
+    # 28 style words against 761 distinct style values; a miss swings the
+    # buildings/venues corpus weights by 2.5x. Failure is non-fatal -- the
+    # seeds remain in force.
+    async def _install_vocab():
+        try:
+            from sqlalchemy import text as _sql_text
+            from models.search_session import get_search_db
+            from services.unified_search import install_derived_vocab
+            async with get_search_db() as db:
+                if db is None:
+                    return
+                rows = (await db.execute(_sql_text(
+                    "SELECT kind, term FROM search_vocab"))).fetchall()
+            # style only. The material ratios are not comparable (material is
+            # not part of the embedded text, so df_source/df_text is not a
+            # discriminativeness measure there) and "and" scored 1.02, which
+            # would have classified every query containing "and" as style
+            # intent. Material retrieval goes through the material_text
+            # trigram leg instead, which needs no vocabulary.
+            style = {t for k, t in rows if k == "style"}
+            # STYLE ONLY -- deliberately not poi.
+            #
+            # Deriving POI nouns from venue category head nouns looked right
+            # and shipped two regressions, caught in production:
+            #   "chrystler building"      -> poi intent -> Chrystie Street venues
+            #   "gothic church in harlem" -> poi intent -> St. Patrick's (Midtown), a grave
+            # because "building" and "church" are both category heads. POI
+            # intent drops the buildings corpus weight from 1.0 to 0.4, so a
+            # building word landing in that set is strictly harmful -- the
+            # opposite of the gap it was meant to close. Building types need
+            # their own signal, not this one.
+            #
+            # Material is excluded too: material is not part of the embedded
+            # text, so its df_source/df_text is not a discriminativeness
+            # measure, and "and" scored 1.02.
+            sizes = install_derived_vocab(style=style)
+            logger.info(f"Derived search vocab installed: {sizes}")
+        except Exception as e:
+            logger.warning(f"Derived vocab unavailable, using seeds: {e}")
+
+    asyncio.create_task(_install_vocab())
+
     yield
 
     # Shutdown

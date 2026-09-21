@@ -12,6 +12,7 @@ retrieval (Phase 2b).
 
 import asyncio
 import logging
+import re
 import time
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional
@@ -25,6 +26,8 @@ from utils.rate_limit import limiter, LIMIT_SEARCH
 from services.openai_text import openai_text
 from services.unified_search import (
     HARD_RADIUS_INTENTS,
+    LORE_SIM_FLOOR,
+    leg_lore_weight,
     RankedHit,
     apply_nudges,
     build_facets,
@@ -277,7 +280,10 @@ async def search_buildings(
         CROSS JOIN LATERAL (
             SELECT greatest(
                 word_similarity(lower(:q_lex), lower(b.text)),
-                similarity(lower(:q_lex), lower(b.text))
+                similarity(lower(:q_lex), lower(b.text)),
+                word_similarity(lower(:q_lex), lower(coalesce(b.material_text, ''))),
+                similarity(lower(:q_lex), lower(coalesce(b.name_norm, ''))),
+                word_similarity(lower(:q_lex), lower(coalesce(b.neighborhood_text, '')))
             ) AS lex
         ) wl
         ORDER BY score DESC
@@ -635,6 +641,7 @@ async def _leg_buildings(
     user_vec_lit: Optional[str] = None,
     soft_radius: bool = False,
     fame_weight: float = 0.0,
+    lore_weight: float = 0.0,
 ) -> List[dict]:
     """Buildings leg for /unified — mirrors search_buildings()'s hybrid CTE but
     also returns name/style/year/landmark fields needed for `why`/header/facets.
@@ -709,7 +716,25 @@ async def _leg_buildings(
     params["fame_w"] = fame_weight
     params["lex_floor"] = LEX_FLOOR
     params["fuzzy_floor"] = 0.2
-    fused = "(0.7 * (1 - (b.embedding <=> CAST(:qvec AS vector))) + 0.3 * wl.lex)"
+    # LPC prose leg. lore_w is 0 for address/poi/event; lore_scan over-fetches
+    # chunks because a BIN averages 3.4 of them, so N chunks yield ~N/3.4 BINs.
+    params["lore_w"] = lore_weight
+    params["lore_floor"] = LORE_SIM_FLOOR
+    params["lore_scan"] = pool * 3
+    # Higher than lex_floor: a neighborhood name is a short, distinctive
+    # string, so a loose match here drags in a whole different part of the city.
+    params["hood_floor"] = 0.6
+    # Material and neighborhood are SHORT controlled strings, so they must be
+    # matched per query TOKEN, not against the whole query. Measured on the
+    # live index for "buildings with terracotta" vs "limestone and terra cotta
+    # terracotta terra-cotta":
+    #   word_similarity(whole query, material_text)         = 0.423 (< 0.45)
+    #   strict_word_similarity('terracotta', material_text) = 1.000
+    params["q_toks"] = [t for t in re.split(r"[^\w'-]+", q_lex.lower()) if len(t) >= 3]
+    params["tok_floor"] = 0.7
+    lore_term = "(:lore_w * GREATEST(0, coalesce(lore.sim, 0) - :lore_floor))"
+    fused = ("(0.7 * (1 - (b.embedding <=> CAST(:qvec AS vector))) + 0.3 * wl.lex + "
+             + lore_term + ")")
 
     # Word-boundary guard on the lex_pool (proper-noun recall) ONLY — see
     # _word_boundary_pattern's docstring. fuzzy_pool intentionally skips this:
@@ -738,7 +763,7 @@ async def _leg_buildings(
             # architect: backfilled from LPC gpmc-yuvp (26,430 rows). Until now
             # there was no architect column, so the `architect` intent and
             # infer_matched_field's architect slot had nothing to read.
-            "b.architect AS b_architect"
+            "b.architect AS b_architect, b.neighborhood AS b_neighborhood"
             + (", -(b.profile <#> CAST(:uvec AS vector)) AS b_personalization"
                if (enriched and user_vec_lit) else "")
             if enriched else ""
@@ -754,9 +779,20 @@ async def _leg_buildings(
             ORDER BY word_similarity(lower(:q_lex), lower(text)) DESC LIMIT :pool
         ),
         fuzzy_pool AS (
+            -- Typo tolerance runs against name_norm (names + aliases only),
+            -- NOT the embedded document. similarity() is a whole-string
+            -- trigram comparison, so against a ~200-char text it is
+            -- structurally near zero however good the match:
+            -- similarity('chrystler building', text) = 0.119, under the 0.2
+            -- floor, while against name_norm it is 0.640. That is why
+            -- "woolwoth" found the Woolworth Building but "chrystler" never
+            -- surfaced the Chrysler. coalesce keeps this a no-op until
+            -- backfill_index_name_norm has run.
             SELECT bin FROM building_search_index
-            {where + (' AND ' if where else 'WHERE ')}similarity(lower(:q_lex), lower(text)) > :fuzzy_floor
-            ORDER BY similarity(lower(:q_lex), lower(text)) DESC LIMIT :pool
+            {where + (' AND ' if where else 'WHERE ')}
+                  similarity(lower(:q_lex), lower(coalesce(name_norm, text))) > :fuzzy_floor
+            ORDER BY similarity(lower(:q_lex), lower(coalesce(name_norm, text))) DESC
+            LIMIT :pool
         ),
         fame_pool AS (
             -- Fame-aware retrieval slice: among the corpus's most famous rows
@@ -772,23 +808,82 @@ async def _leg_buildings(
             ) f
             ORDER BY f.embedding <=> CAST(:qvec AS vector) LIMIT :fame_pool
         ),
+        hood_pool AS (
+            -- Neighborhood recall. Search had no neighborhood concept at all,
+            -- so "art deco in tribeca" returned Midtown and "cast iron soho"
+            -- returned 2016-2018 glass towers. neighborhood_text holds the
+            -- NTA name split into its parts ("SoHo-Little Italy-Hudson
+            -- Square" -> "soho little italy hudson square") because the
+            -- official compound name is otherwise one opaque token.
+            SELECT bin FROM building_search_index
+            {where + (' AND ' if where else 'WHERE ')}
+                  (SELECT coalesce(max(strict_word_similarity(t, lower(coalesce(neighborhood_text,'')))), 0) FROM unnest(CAST(:q_toks AS text[])) t) > :tok_floor
+            ORDER BY (SELECT coalesce(max(strict_word_similarity(t, lower(coalesce(neighborhood_text,'')))), 0) FROM unnest(CAST(:q_toks AS text[])) t) DESC
+            LIMIT :pool
+        ),
+        mat_pool AS (
+            -- Material recall. The source spells it "Terra Cotta" (two words,
+            -- 1,502 rows) while people type "terracotta"; material_text holds
+            -- both spellings so the trigram can bridge them. Guarded by a
+            -- coalesce so it is a no-op until backfill_index_material runs.
+            SELECT bin FROM building_search_index
+            {where + (' AND ' if where else 'WHERE ')}
+                  (SELECT coalesce(max(strict_word_similarity(t, lower(coalesce(material_text,'')))), 0) FROM unnest(CAST(:q_toks AS text[])) t) > :tok_floor
+            ORDER BY (SELECT coalesce(max(strict_word_similarity(t, lower(coalesce(material_text,'')))), 0) FROM unnest(CAST(:q_toks AS text[])) t) DESC
+            LIMIT :pool
+        ),
+        lore_pool AS (
+            -- 4th leg: per-building LPC designation-report prose. This is the
+            -- only corpus that contains ornament/material/feature language, so
+            -- it is what lets "gargoyles" or "stained glass" retrieve the
+            -- right BIN at all. Chunks roll up to one row per BIN.
+            SELECT DISTINCT bin FROM (
+                SELECT bin FROM building_lore_index
+                 ORDER BY embedding <=> CAST(:qvec AS vector)
+                 LIMIT :lore_scan
+            ) lp LIMIT :pool
+        ),
         pool AS (
             SELECT bin FROM vec_pool UNION SELECT bin FROM lex_pool
             UNION SELECT bin FROM fuzzy_pool UNION SELECT bin FROM fame_pool
+            UNION SELECT bin FROM lore_pool UNION SELECT bin FROM mat_pool
+            UNION SELECT bin FROM hood_pool
         )
         SELECT b.bin, b.bbl, b.snippet, b.year_built, b.is_landmark, b.fame, b.lat, b.lng,
                {fused} AS score,
                wl.lex AS lex_score
                {select_extra}
                {(', ' + haversine_b + ' AS dist_m') if geo else ''}
+               -- ALWAYS LAST, and read as r[-2]/r[-1]: everything above is
+               -- indexed positionally off extra_offset, so a mid-list insert
+               -- silently shifts style_family/borough/material/architect.
+               , lore.sim AS lore_score, lore.text AS lore_text
         FROM building_search_index b
         JOIN pool USING (bin)
         CROSS JOIN LATERAL (
             SELECT greatest(
                 word_similarity(lower(:q_lex), lower(b.text)),
-                similarity(lower(:q_lex), lower(b.text))
+                similarity(lower(:q_lex), lower(b.text)),
+                -- Retrieval columns the embedded `text` does not carry:
+                -- material spelling variants, a name-only string short enough
+                -- for similarity() to score, and the NTA neighborhood.
+                similarity(lower(:q_lex), lower(coalesce(b.name_norm, ''))),
+                (SELECT coalesce(max(strict_word_similarity(t, lower(coalesce(b.material_text, '')))), 0)
+                   FROM unnest(CAST(:q_toks AS text[])) t),
+                (SELECT coalesce(max(strict_word_similarity(t, lower(coalesce(b.neighborhood_text, '')))), 0)
+                   FROM unnest(CAST(:q_toks AS text[])) t)
             ) AS lex
         ) wl
+        LEFT JOIN LATERAL (
+            -- Best-matching report chunk for this BIN: its similarity feeds
+            -- the fused score, its text becomes the `why` citation.
+            SELECT 1 - (l.embedding <=> CAST(:qvec AS vector)) AS sim,
+                   l.text AS text
+              FROM building_lore_index l
+             WHERE l.bin = b.bin
+             ORDER BY l.embedding <=> CAST(:qvec AS vector)
+             LIMIT 1
+        ) lore ON true
         {('WHERE ' + ' AND '.join(enriched_filters)) if (enriched and enriched_filters) else ''}
         -- fame participates in the LEG's ordering (not just the post-RRF
         -- boost): the leg's LIMIT would otherwise cut a high-fame row (the
@@ -838,8 +933,11 @@ async def _leg_buildings(
         material_val = r[extra_offset + 2] if enriched else None
         photo_url = r[extra_offset + 3] if enriched else None
         architect_val = r[extra_offset + 4] if enriched else None
-        personalization_dot = float(r[extra_offset + 5]) if has_personalization and r[extra_offset + 5] is not None else None
-        dist_idx = extra_offset + (6 if has_personalization else 5) if enriched else extra_offset
+        # neighborhood rides in select_extra AFTER architect, so every index
+        # below it shifts by one. These offsets are positional by design.
+        neighborhood_val = r[extra_offset + 5] if enriched else None
+        personalization_dot = float(r[extra_offset + 6]) if has_personalization and r[extra_offset + 6] is not None else None
+        dist_idx = extra_offset + (7 if has_personalization else 6) if enriched else extra_offset
         hits.append({
             "type": "building",
             "id": str(r[0]).replace(".0", "") if r[0] else None,
@@ -852,6 +950,7 @@ async def _leg_buildings(
             "architect": architect_val,
             "borough": borough_val,
             "material": material_val,
+            "neighborhood": neighborhood_val,
             "category": None,
             "landmark": bool(r[4]) if r[4] is not None else None,
             "fame": float(r[5]) if r[5] is not None else None,
@@ -861,8 +960,14 @@ async def _leg_buildings(
             "matched_field": (
                 infer_matched_field(q_lex, name=name, style=style_family or parsed_style,
                                     architect=architect_val)
-                if (r[9] or 0) > 0.5 else "semantic"
+                if (r[9] or 0) > 0.5
+                # The designation report carried this hit, not the metadata
+                # template — say so, so "gargoyles" can cite the sentence that
+                # actually says gargoyles instead of claiming "semantic".
+                else ("report" if (r[-2] or 0) > LORE_SIM_FLOOR else "semantic")
             ),
+            "lore_score": float(r[-2]) if r[-2] is not None else None,
+            "lore_text": r[-1],
             "dist_m": round(float(r[dist_idx]), 1) if geo and len(r) > dist_idx and r[dist_idx] is not None else None,
             "photo_url": photo_url,
             "lore_status": None,
@@ -1484,7 +1589,21 @@ async def search_unified(
         try:
             parts = [float(x) for x in user_vector.split(",")]
             if len(parts) == 9:
-                user_vec_lit = "[" + ",".join(f"{x:.6f}" for x in parts) + "]"
+                # L2-NORMALIZE. The nudge is `W_PERSONALIZATION * dot(profile,
+                # uvec)`, sized in rank-steps on the assumption that dot is a
+                # cosine in [-1, 1]. It was not: stored profile vectors have
+                # magnitudes up to 88 (mean 65), so an un-normalized dot made
+                # the 0.02 weight worth up to ~110 rank steps and personal
+                # taste silently became the primary sort key -- "oculus"
+                # ranked Odyssey House first and The Oculus fifth. The iOS
+                # client has had user_vector hard-disabled over this.
+                # Normalizing both sides is what makes the weight mean what it
+                # says; see the matching UPDATE in
+                # migrations/20260920_normalize_profile_vectors.sql.
+                norm = sum(x * x for x in parts) ** 0.5
+                if norm > 0:
+                    parts = [x / norm for x in parts]
+                    user_vec_lit = "[" + ",".join(f"{x:.6f}" for x in parts) + "]"
         except Exception:
             user_vec_lit = None
 
@@ -1493,6 +1612,7 @@ async def search_unified(
         borough=borough, material=material, style_family=style_family,
         user_vec_lit=user_vec_lit, soft_radius=soft_radius,
         fame_weight=W_LEG_FAME if intent in FAME_BOOST_INTENTS else 0.0,
+        lore_weight=leg_lore_weight(intent),
     )
     venues_task = _leg_venues(qvec_lit, q_lex, leg_limit, lat, lng, radius_m, year_from, year_to, soft_radius=soft_radius)
     layers_task = _leg_layers(qvec_lit, q_lex, leg_limit, lat, lng, radius_m, layer_filter, soft_radius=soft_radius)
