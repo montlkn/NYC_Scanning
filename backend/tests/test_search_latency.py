@@ -232,3 +232,15 @@ class TestHostileInput:
         from routers.search import _sanitize_query
         for q in ("empire state building", "art deco", "mckim, mead & white"):
             assert _sanitize_query(q) == q
+
+    @pytest.mark.asyncio
+    async def test_the_query_logger_cannot_die_on_a_nul(self):
+        """It runs fire-and-forget, so it must sanitize its own input: a %00
+        query searched fine and then killed the analytics INSERT."""
+        import sys
+        sys.path.insert(0, ".")
+        from models.search_session import init_search_engine
+        from routers.search import _log_query
+        init_search_engine()
+        # Must not raise.
+        await _log_query("empire\x00 state", "style", 1.0, ["1015862"])

@@ -1669,7 +1669,19 @@ async def _refine_and_cache_interpretation(q: str) -> None:
 
 
 async def _log_query(q: str, intent: str, latency_ms: float, result_ids: List[str]) -> None:
-    """Best-effort query log. Never raises into the caller."""
+    """Best-effort query log. Never raises into the caller.
+
+    Sanitizes its OWN input rather than trusting the caller. This runs in a
+    fire-and-forget task, so it can be reached with whatever `q` the endpoint
+    happened to capture -- and it did: a query containing %00 searched fine
+    (the endpoint sanitizes before building params) and then died here on the
+    INSERT, because analytics wrote the value the request arrived with.
+
+    An error from a best-effort logger is pure noise: it cannot help the user,
+    it fires after the response is already built, and it buries real errors in
+    Sentry.
+    """
+    q = _sanitize_query(q)
     try:
         async with get_search_db() as db:
             if db is None:
