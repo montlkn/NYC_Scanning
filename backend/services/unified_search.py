@@ -1522,7 +1522,7 @@ def build_facets(available: Dict[str, List[Any]]) -> List[Dict[str, Any]]:
 # candidates but cannot outrank what was literally asked for.
 # ---------------------------------------------------------------------------
 
-INTERP_VERSION = 4
+INTERP_VERSION = 5
 MAX_EXPANSION_QUERIES = 3
 W_EXPANSION_LEG = 1.0        # a rewrite leg counts as much as a corpus leg...
 # ...and the user's own legs are halved when rewrites run. Rewrites only run
@@ -1582,7 +1582,38 @@ def parse_interpretation(raw: Optional[str], q: str) -> Optional[Dict[str, Any]]
         "boroughs": [b for b in _str_list(d.get("boroughs"), 5, 20)
                      if b.lower() in _BOROUGHS],
         "styles": _str_list(d.get("styles"), 6, 40),
+        "years": _year_range(d.get("years")),
     }
+
+
+def _year_range(v: Any) -> Optional[List[int]]:
+    if not isinstance(v, list) or len(v) != 2:
+        return None
+    try:
+        lo, hi = int(v[0]), int(v[1])
+    except (TypeError, ValueError):
+        return None
+    if not (1600 <= lo <= hi <= 2100):
+        return None
+    return [lo, hi]
+
+
+def spelling_correction(q: str, interp: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The first rewrite, when it is the query with its typos fixed rather
+    than a different phrasing: "tin ceilimgs" -> "tin ceilings".
+
+    Such a rewrite should REPLACE the query, not join it. Left as an extra
+    leg, the misspelt original still ran at half weight and its one real
+    word, "tin", put Tin Pan Alley above every building whose designation
+    report mentions a pressed-tin ceiling."""
+    if not interp or not interp.get("queries"):
+        return None
+    import difflib
+    first = interp["queries"][0]
+    a, b = (q or "").strip().lower(), first.strip().lower()
+    if a == b or len(a.split()) != len(b.split()):
+        return None
+    return first if difflib.SequenceMatcher(None, a, b).ratio() >= 0.8 else None
 
 
 _BOROUGHS = frozenset({"manhattan", "brooklyn", "queens", "bronx", "staten island"})
@@ -1661,6 +1692,30 @@ def llm_style_bonus(interp: Optional[Dict[str, Any]], hit: Dict[str, Any]) -> fl
     return 0.0
 
 
+W_LLM_ERA = 0.06
+
+
+def llm_era_bonus(interp: Optional[Dict[str, Any]], hit: Dict[str, Any]) -> float:
+    """Built in the era the query implies ("modernist" -> 1930-1975).
+
+    Only 24k of 200k searchable venues carry a style label, but 174k carry
+    their building's year, so the era is what lets "modernist bars" prefer a
+    bar in a 1958 tower over one in an 1850s walk-up. Skipped when the style
+    bonus already fired: same evidence, would double-count."""
+    if not interp or not interp.get("years") or llm_style_bonus(interp, hit):
+        return 0.0
+    y = hit.get("year")
+    if not isinstance(y, int):
+        return 0.0
+    lo, hi = interp["years"]
+    return W_LLM_ERA if lo <= y <= hi else 0.0
+
+
+# A report chunk whose word_similarity to the query clears this literally
+# contains the phrase: "tin ceilings" scores 0.846 against "pressed-tin
+# ceiling". That is an answer, not a hint, even when no NAME matched.
+LORE_LEX_DIRECT = 0.8
+
 DIRECT_COVERAGE_HITS = 5
 
 
@@ -1706,6 +1761,8 @@ def has_direct_match(q_lex: str, intent: str, legs: Dict[str, Sequence[Dict[str,
         if entity and _covers_all(h):
             return True
         if intent == "name" and house_number_bonus(q_lex, h.get("name"), h.get("snippet")) > 0:
+            return True
+        if (h.get("lore_lex") or 0.0) >= LORE_LEX_DIRECT:
             return True
     covered = 0
     for leg in ("buildings", "venues", "layers"):

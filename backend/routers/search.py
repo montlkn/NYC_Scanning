@@ -69,6 +69,8 @@ from services.unified_search import (
     W_ORIGINAL_WHEN_EXPANDED,
     has_direct_match,
     llm_style_bonus,
+    llm_era_bonus,
+    spelling_correction,
     token_coverage,
     llm_category_bonus,
     parse_interpretation,
@@ -1676,19 +1678,21 @@ The database holds three things:
 3. Business listings: a venue name, a category such as "Cocktail Bar", "Wine Bar", "Speakeasy", "Coffee Shop", "Art Gallery", and a neighborhood.
 
 Reply with JSON only, no prose, no code fences:
-{"queries": [...], "categories": [...], "neighborhoods": [...], "boroughs": [...], "styles": [...]}
+{"queries": [...], "categories": [...], "neighborhoods": [...], "boroughs": [...], "styles": [...], "years": [from, to] or null}
 
 queries: 1 to 3 phrases of 1 to 5 words, written the way the DATABASE describes things, never the way people search. Turn moods into concrete things a report, a history or a listing would literally say. When the query is vague, give each phrase a DIFFERENT angle (architecture, history, a place to go) rather than three wordings of one idea. When the query asks for a kind of place (a bar, a cafe, a church), EVERY phrase names that kind of place. Use distinctive words only: never "house", "building", "place", "spot", "site", "location", "NYC", "New York", "near me", "best", "ideas", "things to do". If the query names a specific building, business, person or event, return that exact name as the only phrase.
 categories: listing categories, only when the query asks for a kind of place to go. Otherwise [].
 neighborhoods: NYC neighborhoods the query names or clearly implies. Otherwise [].
 boroughs: any of Manhattan, Brooklyn, Queens, Bronx, Staten Island the query names. Otherwise [].
 styles: architectural style names, as a designation report writes them, that the query names or implies ("modernist" -> "international style", "mid-century modern", "brutalist", "modern"). Otherwise [].
+years: [from, to] when the query names or implies a period ("modernist" -> [1930, 1975], "gilded age" -> [1870, 1910], "prewar" -> [1880, 1940]). Otherwise null.
+If the query is misspelt, the FIRST phrase is the query with its spelling fixed and nothing else changed.
 
 Examples:
-"creepy places" -> {"queries":["cemetery mausoleum","haunted ghost story","murder"],"categories":[],"neighborhoods":[],"boroughs":[],"styles":["gothic revival"]}
-"brutalist cafes in soho" -> {"queries":["cafe brutalist concrete","coffee shop modern building"],"categories":["Coffee Shop","Cafe","Café"],"neighborhoods":["SoHo"],"boroughs":[],"styles":["brutalist","modern"]}
-"woolworth bar" -> {"queries":["Woolworth Building"],"categories":["Cocktail Bar","Bar","Lounge"],"neighborhoods":[],"boroughs":[],"styles":[]}
-"date night queens" -> {"queries":["candlelit restaurant","wine bar garden"],"categories":["Restaurant","Wine Bar","Italian Restaurant","French Restaurant"],"neighborhoods":[],"boroughs":["Queens"],"styles":[]}"""
+"creepy places" -> {"queries":["cemetery mausoleum","haunted ghost story","murder"],"categories":[],"neighborhoods":[],"boroughs":[],"styles":["gothic revival"],"years":null}
+"brutalist cafes in soho" -> {"queries":["cafe brutalist concrete","coffee shop modern building"],"categories":["Coffee Shop","Cafe","Café"],"neighborhoods":["SoHo"],"boroughs":[],"styles":["brutalist","modern"],"years":[1950,1980]}
+"woolworth bar" -> {"queries":["Woolworth Building"],"categories":["Cocktail Bar","Bar","Lounge"],"neighborhoods":[],"boroughs":[],"styles":[],"years":null}
+"date night queens" -> {"queries":["candlelit restaurant","wine bar garden"],"categories":["Restaurant","Wine Bar","Italian Restaurant","French Restaurant"],"neighborhoods":[],"boroughs":["Queens"],"styles":[],"years":null}"""
 
 
 async def _get_cached_interpretation(q: str) -> Optional[dict]:
@@ -1754,7 +1758,7 @@ async def _interpret_and_cache(q: str) -> Optional[dict]:
             # answer is ~60 tokens; 300 is headroom, not a target.
             max_tokens=300,
             timeout_s=10.0,
-            cache_key="jink-search-interp-v4",
+            cache_key="jink-search-interp-v5",
         )
         interp = parse_interpretation(raw, q)
         if interp is None:
@@ -1978,19 +1982,21 @@ async def search_unified(
         except Exception:
             user_vec_lit = None
 
-    async def _retrieve(vec_lit: str, lex: str, *, with_personal: bool = True):
+    async def _retrieve(vec_lit: str, lex: str, *, with_personal: bool = True,
+                        soft: Optional[bool] = None):
         """One full leg set (buildings, venues, layers) for one phrasing of
         the query, with the request's filters and POI adjustments applied."""
+        soft_r = soft_radius if soft is None else soft
         b, v, l = await asyncio.gather(
             _leg_buildings(
                 vec_lit, lex, leg_limit, lat, lng, radius_m, year_from, year_to,
                 borough=borough, material=material, style_family=style_family,
-                user_vec_lit=user_vec_lit if with_personal else None, soft_radius=soft_radius,
+                user_vec_lit=user_vec_lit if with_personal else None, soft_radius=soft_r,
                 fame_weight=W_LEG_FAME if intent in FAME_BOOST_INTENTS else 0.0,
                 lore_weight=leg_lore_weight(intent),
             ),
-            _leg_venues(vec_lit, lex, leg_limit, lat, lng, radius_m, year_from, year_to, soft_radius=soft_radius),
-            _leg_layers(vec_lit, lex, leg_limit, lat, lng, radius_m, layer_filter, soft_radius=soft_radius),
+            _leg_venues(vec_lit, lex, leg_limit, lat, lng, radius_m, year_from, year_to, soft_radius=soft_r),
+            _leg_layers(vec_lit, lex, leg_limit, lat, lng, radius_m, layer_filter, soft_radius=soft_r),
         )
         return _post_filter(b, v, l)
 
@@ -2055,7 +2061,11 @@ async def search_unified(
         vec = await asyncio.to_thread(embed_query, phrase)
         # Personalization rides on the user's own query only: applying it
         # to every rewrite would count taste once per phrasing.
-        return await _retrieve(_vec_literal(vec), _lexical_query(phrase), with_personal=False)
+        # A rewrite is not held to the "near me" radius: it is how a query
+        # that names something ("seagram bar" -> "Seagram Building") reaches
+        # it from across town. Only "search this area" bounds a rewrite.
+        return await _retrieve(_vec_literal(vec), _lexical_query(phrase), with_personal=False,
+                               soft=not area_bound)
 
     # A cached rewrite that last time turned out to be NEEDED ("direct":
     # false) runs alongside the user's own legs instead of after them, so a
@@ -2117,9 +2127,15 @@ async def search_unified(
     place_seeking = bool(interp and interp.get("categories")) and intent not in ("poi", "address")
     if place_seeking:
         weights.update(corpus_weights("poi"))
+    correction = spelling_correction(q, interp) if expansion_queries and expanded else None
     if expansion_queries and expanded:
         for corpus in ("buildings", "venues", "layers"):
-            weights[corpus] = weights.get(corpus, 1.0) * W_ORIGINAL_WHEN_EXPANDED
+            # A misspelt query's own legs are noise: the correction replaces them.
+            weights[corpus] = 0.0 if correction else weights.get(corpus, 1.0) * W_ORIGINAL_WHEN_EXPANDED
+        if correction:
+            # And every word-level signal below (name bonuses, coverage,
+            # facets) reads the corrected words, not the typo.
+            q_lex = _lexical_query(correction)
         for n, res in enumerate(expanded):
             if isinstance(res, Exception):
                 logger.warning(f"[unified] expansion leg failed for {expansion_queries[n]!r}: {res}")
@@ -2261,6 +2277,7 @@ async def search_unified(
         # match, because "bars in midtown" names a place either way.
         nudged += _t("llm_category_bonus", llm_category_bonus(interp, h))
         nudged += _t("llm_style_bonus", llm_style_bonus(interp, h))
+        nudged += _t("llm_era_bonus", llm_era_bonus(interp, h))
         nudged += _t("place_adjustment", place_adjustment(place_req, h, neighborhood_vocab()))
         why = build_why(
             matched_field=h.get("matched_field"),

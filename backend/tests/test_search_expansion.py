@@ -166,3 +166,30 @@ def test_llm_style_bonus_matches_the_rows_own_style():
 def test_web_domains_are_not_venue_names():
     assert not is_searchable("Elove.com", "Bar", (), True)
     assert is_searchable("Dante NYC", "Bar", (), True)
+
+
+def test_spelling_correction_replaces_only_a_true_typo_fix():
+    from services.unified_search import spelling_correction
+    assert spelling_correction("tin ceilimgs", {"queries": ["tin ceilings"]}) == "tin ceilings"
+    assert spelling_correction("spooky spots", {"queries": ["cemetery mausoleum"]}) is None
+    assert spelling_correction("tin ceilings", {"queries": ["tin ceilings"]}) is None
+    assert spelling_correction("x", None) is None
+
+
+def test_era_bonus_and_no_double_count_with_style():
+    from services.unified_search import W_LLM_ERA, llm_era_bonus
+    interp = {"years": [1930, 1975], "styles": ["international style"]}
+    assert llm_era_bonus(interp, {"year": 1958, "style": None}) == W_LLM_ERA
+    assert llm_era_bonus(interp, {"year": 1859, "style": None}) == 0.0
+    assert llm_era_bonus(interp, {"year": 1958, "style": "International Style"}) == 0.0
+
+
+def test_parse_keeps_a_sane_year_range_only():
+    d = parse_interpretation('{"queries":["a b"],"years":[1930,1975]}', "q")
+    assert d["years"] == [1930, 1975]
+    assert parse_interpretation('{"queries":["a b"],"years":[1990,1930]}', "q")["years"] is None
+
+
+def test_a_report_that_literally_says_it_is_a_direct_match():
+    legs = {"buildings": [{"name": "340 East 6th Street", "lore_lex": 0.846}]}
+    assert has_direct_match("tin ceilings", "name", legs)
