@@ -135,3 +135,69 @@ class TestFallbackRpcStaysUnderAnonTimeout:
             f"buildings_text_search took {elapsed:.2f}s; anon's statement_timeout "
             "is 3s and this is the client's fallback path."
         )
+
+
+class TestLegsActuallyReturnHits:
+    """The guard that was missing.
+
+    A NUL-byte sentinel ('\\x00') passed as a query parameter made every
+    buildings query raise inside Postgres, so _leg_buildings returned [] for
+    EVERY query and buildings search was entirely dead. It shipped and
+    deployed with 231 tests green, because:
+
+      * test_lore_leg.py tests pure functions and never touches SQL;
+      * test_search_latency.py measured the COST of individual pools, and a
+        query that errors is very fast;
+      * every other test asserts on ranking logic, not retrieval.
+
+    Nothing executed the assembled leg. So this does, and it asserts the one
+    thing no other test does: that real queries come back non-empty.
+    """
+
+    @pytest.mark.asyncio
+    async def test_buildings_leg_returns_hits_for_golden_queries(self):
+        import sys
+        sys.path.insert(0, ".")
+        from models.search_session import init_search_engine
+        from services.text_embeddings import embed_query
+        init_search_engine()
+        from routers import search as S
+
+        # Deliberately mixed: a name, a style, an archetype (which exercises
+        # the sentinel path), and a POI word.
+        for q in ("empire state building", "art deco", "visionary buildings",
+                  "cocktail bar"):
+            vec = embed_query(q)
+            lit = "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
+            hits = await S._leg_buildings(
+                qvec_lit=lit, q_lex=S._lexical_query(q), limit=5,
+                lat=40.7359, lng=-73.9866, radius_m=4000,
+                year_from=None, year_to=None, soft_radius=True,
+                fame_weight=0.15, lore_weight=0.45,
+            )
+            assert hits, (
+                f"buildings leg returned NOTHING for {q!r}. The leg swallows "
+                "SQL errors by design (a broken leg must not break the others), "
+                "so a query that cannot execute looks identical to a query with "
+                "no matches. Check the app logs for the real exception."
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_query_naming_no_archetype_still_works(self):
+        """The exact shape of the bug: no archetype token -> sentinel path."""
+        import sys
+        sys.path.insert(0, ".")
+        from models.search_session import init_search_engine
+        from services.text_embeddings import embed_query
+        init_search_engine()
+        from routers import search as S
+
+        vec = embed_query("woolworth building")
+        lit = "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
+        hits = await S._leg_buildings(
+            qvec_lit=lit, q_lex="woolworth", limit=5,
+            lat=40.7359, lng=-73.9866, radius_m=4000,
+            year_from=None, year_to=None, soft_radius=True,
+            fame_weight=0.15, lore_weight=0.45,
+        )
+        assert hits, "sentinel path for a query naming no archetype is broken"
