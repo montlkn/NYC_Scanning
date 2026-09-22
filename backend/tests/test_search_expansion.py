@@ -207,10 +207,13 @@ class TestTiers:
                                          tier_of, query_content_tokens)
     G = {"bar", "coffee", "shop", "cocktail", "building", "art", "deco", "central"}
 
-    def t(self, h, q, interp=None):
+    def t(self, h, q, interp=None, named=None):
         from services.unified_search import tier_of, query_content_tokens
         qt = query_content_tokens(q)
-        return tier_of(h, qt, {x for x in qt if x not in self.G}, interp, None, None, self.G)
+        # In production a word is a name only if the reports capitalize it;
+        # tests pass the name words explicitly when that matters.
+        named = {x for x in qt if x not in self.G} if named is None else named
+        return tier_of(h, qt, named, interp, None, None, self.G)
 
     def test_the_named_thing_via_its_host_building(self):
         bar = {"type": "venue", "name": "The Bar", "category": "Cocktail Bar",
@@ -231,10 +234,10 @@ class TestTiers:
     def test_report_prose_counts_for_phrases_only(self):
         b = {"type": "building", "name": "340 East 6th Street",
              "lore_text": "historic fire escape; pressed-tin ceiling in front of store"}
-        assert self.t(b, "tin ceilings") == 1
+        assert self.t(b, "tin ceilings", named=set()) == 1  # "tin" is 48% capitalized
         theater = {"type": "building", "name": "Cort Theater",
                    "lore_text": "produced Murder in the Cathedral"}
-        assert self.t(theater, "murder") == 2
+        assert self.t(theater, "murder", named=set()) == 2
 
     def test_matches_sort_nearest_first(self):
         from services.unified_search import order_by_tier

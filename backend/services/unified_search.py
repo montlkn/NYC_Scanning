@@ -1522,7 +1522,7 @@ def build_facets(available: Dict[str, List[Any]]) -> List[Dict[str, Any]]:
 # candidates but cannot outrank what was literally asked for.
 # ---------------------------------------------------------------------------
 
-INTERP_VERSION = 5
+INTERP_VERSION = 6
 MAX_EXPANSION_QUERIES = 3
 W_EXPANSION_LEG = 1.0        # a rewrite leg counts as much as a corpus leg...
 # ...and the user's own legs are halved when rewrites run. Rewrites only run
@@ -1583,7 +1583,24 @@ def parse_interpretation(raw: Optional[str], q: str) -> Optional[Dict[str, Any]]
                      if b.lower() in _BOROUGHS],
         "styles": _str_list(d.get("styles"), 6, 40),
         "years": _year_range(d.get("years")),
+        "about": d.get("about") if d.get("about") in _ABOUT_WEIGHTS else None,
     }
+
+
+# What the query is ABOUT, from the rewrite, as corpus weights. RRF gives each
+# corpus's #1 about the same fused score however weak it is, so "where did
+# famous writers live" put an apartment house called Sussex House (buildings
+# #1 for "residences") above the Poe Cottage. The intent router cannot tell;
+# the model can.
+_ABOUT_WEIGHTS: Dict[str, Dict[str, float]] = {
+    "stories":   {"buildings": 0.5, "venues": 0.2, "layers": 1.0},
+    "buildings": {"buildings": 1.0, "venues": 0.3, "layers": 0.5},
+    "places":    {"buildings": 0.4, "venues": 1.0, "layers": 0.3},
+}
+
+
+def about_weights(interp: Optional[Dict[str, Any]]) -> Optional[Dict[str, float]]:
+    return _ABOUT_WEIGHTS.get((interp or {}).get("about") or "")
 
 
 def _year_range(v: Any) -> Optional[List[int]]:
@@ -1865,8 +1882,16 @@ def tier_of(h: Dict[str, Any], q_toks: set, named_toks: set,
     in_place = place_adjustment(place_req, h, hood_vocab) >= 0 if place_req else True
     if not in_place:
         return 2
-    phrase = len(q_toks) >= 2
-    covered = bool(q_toks) and q_toks <= _hit_match_tokens(h, with_prose=phrase)
+    # Report prose proves a match only for a short phrase ("tin ceilings"):
+    # a long chunk contains every word of a long question by accident.
+    phrase = 2 <= len(q_toks) <= 3
+    # Name words must match a NAME (the hit's own, or its host building's);
+    # the rest may match any field. Independently, "grand" and "central"
+    # matched bars in Grand Concourse and Central Harlem, eight "real matches"
+    # for "bars near grand central", none of them near Grand Central.
+    covered = (bool(q_toks)
+               and (q_toks - named_toks) <= _hit_match_tokens(h, with_prose=phrase)
+               and named_toks <= _hit_name_tokens(h))
     # Only a PLACE can be "the thing itself". A lore title that contains the
     # words ("Murder of ...") is a topical match, sorted by distance like any
     # other real match.
@@ -1884,14 +1909,19 @@ def tier_of(h: Dict[str, Any], q_toks: set, named_toks: set,
         if (distinctive and (named_toks & distinctive) and distinctive <= q_toks
                 and (not via_host_only or asks_for_kind)):
             return 0
-    if (h.get("name_sim") or 0.0) >= FUZZY_NAME_FULL and h.get("type") in ("building", "venue"):
+    # lore_lex and name_sim were scored against whichever phrase retrieved the
+    # hit. From a rewrite leg that phrase is the model's ("ornamental terra
+    # cotta"), so they are evidence for the rewrite, not for the query:
+    # counted, they sorted rewrite hits by distance as if they were answers.
+    own_words = not h.get("_rewrite")
+    if own_words and (h.get("name_sim") or 0.0) >= FUZZY_NAME_FULL and h.get("type") in ("building", "venue"):
         return 0  # a typo of a name is still the name
     # When the rewrite says the query wants a KIND of place ("modernist
     # bars"), only places of that kind are real matches; a modernist bank
     # whose report mentions a bar is context.
     if interp and interp.get("categories") and h.get("type") != "venue":
         return 2
-    if covered or (phrase and (h.get("lore_lex") or 0.0) >= LORE_LEX_DIRECT) or _llm_qualified(interp, h):
+    if covered or (own_words and phrase and (h.get("lore_lex") or 0.0) >= LORE_LEX_DIRECT) or _llm_qualified(interp, h):
         return 1
     return 2
 

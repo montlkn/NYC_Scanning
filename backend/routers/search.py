@@ -68,6 +68,7 @@ from services.unified_search import (
     W_EXPANSION_LEG,
     W_ORIGINAL_WHEN_EXPANDED,
     has_direct_match,
+    about_weights,
     llm_style_bonus,
     llm_era_bonus,
     spelling_correction,
@@ -112,6 +113,11 @@ _LEX_STOPWORDS = frozenset({
     # Spot) on the literal token while the word that carried the intent,
     # "spooky", did the work alone.
     "spot", "spots",
+    # Question words. "where did famous writers live" kept "where" and "did",
+    # and long report chunks contain every one of those words, so apartment
+    # houses counted as real matches for it.
+    "where", "what", "which", "who", "whose", "when", "why", "how", "did",
+    "does", "do", "can", "could", "should", "would", "was", "there", "about",
 })
 
 
@@ -805,12 +811,12 @@ def generic_vocab() -> set:
     return _GENERIC_VOCAB
 
 
-_PROPER_CACHE: "OrderedDict[str, bool]" = OrderedDict()
+_PROPER_CACHE: "OrderedDict[tuple, bool]" = OrderedDict()
 PROPER_NOUN_RATIO = 0.8
 PROPER_NOUN_MIN_SEEN = 5
 
 
-async def _proper_nouns(tokens: set) -> set:
+async def _proper_nouns(tokens: set, unseen_is_proper: bool = True) -> set:
     """The query words the corpus writes as proper nouns.
 
     Not being category/style vocabulary does not make a word a name:
@@ -824,8 +830,9 @@ async def _proper_nouns(tokens: set) -> set:
     appears nowhere in LPC prose."""
     out, todo = set(), []
     for t in tokens:
-        if t in _PROPER_CACHE:
-            if _PROPER_CACHE[t]:
+        key = (t, unseen_is_proper)
+        if key in _PROPER_CACHE:
+            if _PROPER_CACHE[key]:
                 out.add(t)
         else:
             todo.append(t)
@@ -842,8 +849,9 @@ async def _proper_nouns(tokens: set) -> set:
                          GROUP BY t
                     """), {"toks": todo})).fetchall()
                     for t, cap, tot in rows:
-                        proper = tot < PROPER_NOUN_MIN_SEEN or (cap / tot) >= PROPER_NOUN_RATIO
-                        _PROPER_CACHE[t] = proper
+                        proper = ((cap / tot) >= PROPER_NOUN_RATIO if tot >= PROPER_NOUN_MIN_SEEN
+                                  else unseen_is_proper)
+                        _PROPER_CACHE[(t, unseen_is_proper)] = proper
                         if len(_PROPER_CACHE) > 5000:
                             _PROPER_CACHE.popitem(last=False)
                         if proper:
@@ -852,6 +860,28 @@ async def _proper_nouns(tokens: set) -> set:
             logger.info(f"[unified] proper-noun check skipped: {e}")
             out |= set(todo)
     return out
+
+
+async def _named_tokens(q_lex: str, q_toks: set) -> set:
+    """Query words that name something: non-generic words the reports write
+    capitalized, plus both words of any adjacent pair that is capitalized as
+    a pair and has at least one non-generic word. "grand" alone is 78%
+    capitalized ("grand staircase") and fails, but "Grand Central" is 296/300;
+    "art deco" (299/300) is excluded because both words are style vocabulary."""
+    from services.unified_search import _field_tokens
+    gen = generic_vocab()
+    named = await _proper_nouns({t for t in q_toks if t not in gen})
+    words = [w for w in re.split(r"[^a-z0-9]+", q_lex.lower()) if len(w) >= 3]
+    pairs = {f"{a} {b}": (a, b) for a, b in zip(words, words[1:])
+             if not ({x for w in (a, b) for x in _field_tokens(w)} <= gen)}
+    if pairs:
+        # A pair must be SEEN capitalized: "seagram bar" appears nowhere, and
+        # presuming it a name made "bar" a name word too.
+        proper_pairs = await _proper_nouns(set(pairs), unseen_is_proper=False)
+        for p in proper_pairs:
+            for w in pairs[p]:
+                named |= _field_tokens(w)
+    return named
 
 
 def _query_places(q: str) -> tuple:
@@ -1776,7 +1806,7 @@ The database holds three things:
 3. Business listings: a venue name, a category such as "Cocktail Bar", "Wine Bar", "Speakeasy", "Coffee Shop", "Art Gallery", and a neighborhood.
 
 Reply with JSON only, no prose, no code fences:
-{"queries": [...], "categories": [...], "neighborhoods": [...], "boroughs": [...], "styles": [...], "years": [from, to] or null}
+{"queries": [...], "categories": [...], "neighborhoods": [...], "boroughs": [...], "styles": [...], "years": [from, to] or null, "about": "buildings" | "places" | "stories" | "mixed"}
 
 queries: 1 to 3 phrases of 1 to 5 words, written the way the DATABASE describes things, never the way people search. Turn moods into concrete things a report, a history or a listing would literally say. When the query is vague, give each phrase a DIFFERENT angle (architecture, history, a place to go) rather than three wordings of one idea. When the query asks for a kind of place (a bar, a cafe, a church), EVERY phrase names that kind of place. Use distinctive words only: never "house", "building", "place", "spot", "site", "location", "NYC", "New York", "near me", "best", "ideas", "things to do". If the query names a specific building, business, person or event, return that exact name as the only phrase.
 categories: listing categories, only when the query asks for a kind of place to go. Otherwise [].
@@ -1785,12 +1815,13 @@ boroughs: any of Manhattan, Brooklyn, Queens, Bronx, Staten Island the query nam
 styles: architectural style names, as a designation report writes them, that the query names or implies ("modernist" -> "international style", "mid-century modern", "brutalist", "modern"). Otherwise [].
 years: [from, to] when the query names or implies a period ("modernist" -> [1930, 1975], "gilded age" -> [1870, 1910], "prewar" -> [1880, 1940]). Otherwise null.
 If the query is misspelt, the FIRST phrase is the query with its spelling fixed and nothing else changed.
+about: what the answer should mostly be. "buildings" for architecture (styles, features, materials, architects); "places" for somewhere to go (bars, cafes, shops, parks); "stories" for history, people and events (who lived where, crimes, disasters, hauntings, demolished things); "mixed" when it is genuinely several.
 
 Examples:
-"creepy places" -> {"queries":["cemetery mausoleum","haunted ghost story","murder"],"categories":[],"neighborhoods":[],"boroughs":[],"styles":["gothic revival"],"years":null}
-"brutalist cafes in soho" -> {"queries":["cafe brutalist concrete","coffee shop modern building"],"categories":["Coffee Shop","Cafe","Café"],"neighborhoods":["SoHo"],"boroughs":[],"styles":["brutalist","modern"],"years":[1950,1980]}
-"woolworth bar" -> {"queries":["Woolworth Building"],"categories":["Cocktail Bar","Bar","Lounge"],"neighborhoods":[],"boroughs":[],"styles":[],"years":null}
-"date night queens" -> {"queries":["candlelit restaurant","wine bar garden"],"categories":["Restaurant","Wine Bar","Italian Restaurant","French Restaurant"],"neighborhoods":[],"boroughs":["Queens"],"styles":[],"years":null}"""
+"creepy places" -> {"queries":["cemetery mausoleum","haunted ghost story","murder"],"categories":[],"neighborhoods":[],"boroughs":[],"styles":["gothic revival"],"years":null,"about":"mixed"}
+"brutalist cafes in soho" -> {"queries":["cafe brutalist concrete","coffee shop modern building"],"categories":["Coffee Shop","Cafe","Café"],"neighborhoods":["SoHo"],"boroughs":[],"styles":["brutalist","modern"],"years":[1950,1980],"about":"places"}
+"woolworth bar" -> {"queries":["Woolworth Building"],"categories":["Cocktail Bar","Bar","Lounge"],"neighborhoods":[],"boroughs":[],"styles":[],"years":null,"about":"places"}
+"date night queens" -> {"queries":["candlelit restaurant","wine bar garden"],"categories":["Restaurant","Wine Bar","Italian Restaurant","French Restaurant"],"neighborhoods":[],"boroughs":["Queens"],"styles":[],"years":null,"about":"places"}"""
 
 
 async def _get_cached_interpretation(q: str) -> Optional[dict]:
@@ -1856,7 +1887,7 @@ async def _interpret_and_cache(q: str) -> Optional[dict]:
             # answer is ~60 tokens; 300 is headroom, not a target.
             max_tokens=300,
             timeout_s=10.0,
-            cache_key="jink-search-interp-v5",
+            cache_key="jink-search-interp-v6",
         )
         interp = parse_interpretation(raw, q)
         if interp is None:
@@ -2196,14 +2227,19 @@ async def search_unified(
     # the real ones further out (tiered nearest-first below), not fill the
     # list with nearby things that merely scored. "Search this area" is the
     # user's own boundary and never widens.
+    widened = None
     if (not soft_radius and not area_bound and radius_m and lat is not None and lng is not None):
         _q_toks = query_content_tokens(q_lex)
-        _named = await _proper_nouns({t for t in _q_toks if t not in generic_vocab()})
+        _named = await _named_tokens(q_lex, _q_toks)
         _place = {"neighborhoods": q_hoods, "boroughs": q_boros} if (q_hoods or q_boros) else None
-        local_matches = sum(
-            1 for hs in raw_legs.values() for h in hs
-            if tier_of(h, _q_toks, _named, interp, _place, neighborhood_vocab(), generic_vocab()) < 2
-        )
+        # A query that names something ("bars near grand central") is not
+        # satisfied by any bar nearby: the rewrite's category-only notion of
+        # a match is off, exactly as in the final tiering.
+        _interp_for_count = None if _named else interp
+        _local = [h for hs in raw_legs.values() for h in hs
+                  if tier_of(h, _q_toks, _named, _interp_for_count, _place, neighborhood_vocab(), generic_vocab()) < 2]
+        local_matches = len(_local)
+        widened = local_matches
         if local_matches < MIN_LOCAL_MATCHES:
             gb, gv, gl = await _retrieve(qvec_lit, q_lex, soft=True)
             fresh = {"buildings": gb, "venues": gv, "layers": gl}
@@ -2250,6 +2286,11 @@ async def search_unified(
     place_seeking = bool(interp and interp.get("categories")) and intent not in ("poi", "address")
     if place_seeking:
         weights.update(corpus_weights("poi"))
+    # What the query is about, when the model said so and the query needed
+    # its rewrite (a direct match keeps the router's weights).
+    about_w = about_weights(interp) if (interp and not direct and intent != "address") else None
+    if about_w:
+        weights.update(about_w)
     correction = spelling_correction(q, interp) if expansion_queries and expanded else None
     if expansion_queries and expanded:
         for corpus in ("buildings", "venues", "layers"):
@@ -2265,6 +2306,12 @@ async def search_unified(
                 continue
             for corpus, hits in zip(("buildings", "venues", "layers"), res):
                 leg = f"{corpus}~{n}"
+                if not (correction and n == 0):
+                    # lore_lex / name_sim on these hits measure the REWRITE
+                    # phrase, not the user's words; tier_of must not read
+                    # them as proof of a match (see _rewrite in tier_of).
+                    for h in hits:
+                        h["_rewrite"] = True
                 # A rewrite of a POI query is still a POI query, so it keeps the
                 # user's corpus weights: with neutral ones, "modernist bars in
                 # midtown" returned lore ABOUT modernism above any bar. But
@@ -2273,7 +2320,7 @@ async def search_unified(
                 # for "spooky spots" belongs -- so those use neutral weights.
                 basis = ("poi" if place_seeking else
                          intent if intent in ("poi", "style", "architect", "lore", "event") else "prose")
-                weights[leg] = corpus_weights(basis).get(corpus, 1.0) * W_EXPANSION_LEG
+                weights[leg] = (about_w or corpus_weights(basis)).get(corpus, 1.0) * W_EXPANSION_LEG
                 legs[leg] = [RankedHit(corpus, h["id"], i + 1, h) for i, h in enumerate(hits) if h.get("id")]
         logger.info(f"[unified] expanded {q!r} -> {expansion_queries} "
                     f"cats={interp.get('categories')} hoods={interp.get('neighborhoods')} boros={interp.get('boroughs')}")
@@ -2454,7 +2501,7 @@ async def search_unified(
     # Tiers: the actual thing, then real matches NEAREST FIRST, then the rest
     # by relevance. See order_by_tier in services/unified_search.py.
     q_toks = query_content_tokens(q_lex)
-    named_toks = await _proper_nouns({t for t in q_toks if t not in generic_vocab()})
+    named_toks = await _named_tokens(q_lex, q_toks)
     # When the named thing itself is in the list ("seagram bar" -> The Bar),
     # the rewrite's looser "any Cocktail Bar" definition of a match is off:
     # other bars near you are not what was asked for.
@@ -2515,6 +2562,8 @@ async def search_unified(
             "expansion_ms": round((t_expand - t_llm) * 1000),
             "total_ms": round(latency_ms),
             "direct": direct, "pre_expand": pre_expand,
+            "local_matches": widened,
+            "local_names": [h.get("name") for h in _local][:10] if widened is not None else None,
             "expansions": expansion_queries,
         }
     if not debug:
