@@ -804,6 +804,55 @@ def generic_vocab() -> set:
     return _GENERIC_VOCAB
 
 
+_PROPER_CACHE: "OrderedDict[str, bool]" = OrderedDict()
+PROPER_NOUN_RATIO = 0.8
+PROPER_NOUN_MIN_SEEN = 5
+
+
+async def _proper_nouns(tokens: set) -> set:
+    """The query words the corpus writes as proper nouns.
+
+    Not being category/style vocabulary does not make a word a name:
+    "haunted" is neither, and a restaurant called Haunted Manhattan was
+    pinned as THE answer to "haunted". The designation reports settle it --
+    measured 2026-09-22, the share of mentions that are capitalized:
+    Chrysler 119/119, Seagram 106/107, Woolworth 189/194, Genovese 11/11,
+    against haunted 1/8, murder 9/88, gargoyle 5/99, and the ambiguous tin
+    143/300 (Tin Pan Alley) and grand 234/300 (Grand Street, grand stair).
+    A word the reports never use is presumed a name: a bar's name usually
+    appears nowhere in LPC prose."""
+    out, todo = set(), []
+    for t in tokens:
+        if t in _PROPER_CACHE:
+            if _PROPER_CACHE[t]:
+                out.add(t)
+        else:
+            todo.append(t)
+    if todo:
+        try:
+            async with get_search_db() as db:
+                if db is not None:
+                    rows = (await db.execute(text("""
+                        SELECT t, count(*) FILTER (WHERE s.text ~ ('\\m' || initcap(t))), count(s.text)
+                          FROM unnest(CAST(:toks AS text[])) t
+                          LEFT JOIN LATERAL (
+                                SELECT text FROM building_lore_index
+                                 WHERE lower(text) ~ ('\\m' || t) LIMIT 300) s ON true
+                         GROUP BY t
+                    """), {"toks": todo})).fetchall()
+                    for t, cap, tot in rows:
+                        proper = tot < PROPER_NOUN_MIN_SEEN or (cap / tot) >= PROPER_NOUN_RATIO
+                        _PROPER_CACHE[t] = proper
+                        if len(_PROPER_CACHE) > 5000:
+                            _PROPER_CACHE.popitem(last=False)
+                        if proper:
+                            out.add(t)
+        except Exception as e:
+            logger.info(f"[unified] proper-noun check skipped: {e}")
+            out |= set(todo)
+    return out
+
+
 def _query_places(q: str) -> tuple:
     """(neighborhood phrases, boroughs) the query names, whole-word."""
     ql = " " + re.sub(r"[^a-z0-9]+", " ", q.lower().replace("'", "")) + " "
@@ -2144,7 +2193,7 @@ async def search_unified(
     # user's own boundary and never widens.
     if (not soft_radius and not area_bound and radius_m and lat is not None and lng is not None):
         _q_toks = query_content_tokens(q_lex)
-        _named = {t for t in _q_toks if t not in generic_vocab()}
+        _named = await _proper_nouns({t for t in _q_toks if t not in generic_vocab()})
         _place = {"neighborhoods": q_hoods, "boroughs": q_boros} if (q_hoods or q_boros) else None
         local_matches = sum(
             1 for hs in raw_legs.values() for h in hs
@@ -2395,7 +2444,7 @@ async def search_unified(
     # Tiers: the actual thing, then real matches NEAREST FIRST, then the rest
     # by relevance. See order_by_tier in services/unified_search.py.
     q_toks = query_content_tokens(q_lex)
-    named_toks = {t for t in q_toks if t not in generic_vocab()}
+    named_toks = await _proper_nouns({t for t in q_toks if t not in generic_vocab()})
     # When the named thing itself is in the list ("seagram bar" -> The Bar),
     # the rewrite's looser "any Cocktail Bar" definition of a match is off:
     # other bars near you are not what was asked for.

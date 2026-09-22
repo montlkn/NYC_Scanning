@@ -1886,6 +1886,11 @@ def tier_of(h: Dict[str, Any], q_toks: set, named_toks: set,
             return 0
     if (h.get("name_sim") or 0.0) >= FUZZY_NAME_FULL and h.get("type") in ("building", "venue"):
         return 0  # a typo of a name is still the name
+    # When the rewrite says the query wants a KIND of place ("modernist
+    # bars"), only places of that kind are real matches; a modernist bank
+    # whose report mentions a bar is context.
+    if interp and interp.get("categories") and h.get("type") != "venue":
+        return 2
     if covered or (phrase and (h.get("lore_lex") or 0.0) >= LORE_LEX_DIRECT) or _llm_qualified(interp, h):
         return 1
     return 2
