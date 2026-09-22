@@ -77,6 +77,7 @@ from services.unified_search import (
     tier_of,
     resolve_entity_mode,
     carries_name,
+    evidence_why,
     token_coverage,
     llm_category_bonus,
     parse_interpretation,
@@ -1393,7 +1394,7 @@ async def _leg_venues(
         )
         SELECT v.fsq_id, v.name, v.category, v.snippet, v.lat, v.lng,
                v.bin, v.bbl, v.building_year, v.building_style, v.photo_url,
-               v.category_labels, v.neighborhood, v.borough, v.lex_text,
+               v.category_labels, v.neighborhood, v.borough, v.lex_text, v.text,
                {fused} AS score, wl.lex AS lex_score
                {dist_sql}
         FROM venues v
@@ -1429,6 +1430,7 @@ async def _leg_venues(
             "neighborhood": r["neighborhood"],
             "borough": r["borough"],
             "lex_text": r["lex_text"],
+            "text": r["text"],
             "landmark": None,
             "lat": r["lat"],
             "lng": r["lng"],
@@ -2346,13 +2348,13 @@ async def search_unified(
         nudged += _t("llm_style_bonus", llm_style_bonus(interp, h))
         nudged += _t("llm_era_bonus", llm_era_bonus(interp, h))
         nudged += _t("place_adjustment", place_adjustment(place_req, h, neighborhood_vocab()))
-        why = build_why(
-            matched_field=h.get("matched_field"),
-            year=h.get("year"),
-            style=h.get("style"),
-            category=h.get("category"),
-            fallback_snippet=h.get("snippet"),
-        )
+        # Evidence, not internals: see evidence_why. Buildings and venues show
+        # nothing rather than repeat the year/style the row already shows.
+        why = evidence_why(h, q_lex)
+        if why is None:
+            # Nothing to add beyond the row's own meta line (year, style,
+            # category, distance), so say nothing; the client hides it.
+            why = ""
         all_hits.append({
             "type": h.get("type"),
             "id": h.get("id"),

@@ -1931,3 +1931,71 @@ def resolve_entity_mode(tiers: List[int], carries: Optional[List[bool]] = None) 
     if n0 > MAX_ENTITY_HITS:
         return [1 if t == 0 else t for t in tiers]
     return tiers
+
+
+# ---------------------------------------------------------------------------
+# The "why" line: evidence, not internals.
+#
+# Rows showed "italianate, 1859 · matched: semantic" under a meta line that
+# already said "1859 · ITALIANATE". The year and style were duplicated and
+# "matched: semantic" is a debugging term. The backend already knows the
+# evidence -- the sentence in the designation report that matched, or the
+# building a venue sits in -- so that is what the line says. Empty when there
+# is nothing to add; the client hides an empty line.
+# ---------------------------------------------------------------------------
+
+WHY_MAX = 110
+
+
+def _excerpt(text: str, q_toks: set, width: int = WHY_MAX) -> Optional[str]:
+    low = text.lower()
+    best = None
+    for t in sorted(q_toks, key=len, reverse=True):
+        m = re.search(r"\b" + re.escape(t), low)
+        if m:
+            best = m.start()
+            break
+    if best is None:
+        return None
+    start = max(0, best - width // 3)
+    end = min(len(text), start + width)
+    # Snap to word boundaries.
+    if start > 0:
+        sp = text.find(" ", start)
+        start = sp + 1 if 0 <= sp < best else start
+    if end < len(text):
+        sp = text.rfind(" ", start, end)
+        end = sp if sp > best else end
+    frag = re.sub(r"\s+", " ", text[start:end]).strip(" ,;:")
+    return ("…" if start > 0 else "") + frag + ("…" if end < len(text) else "")
+
+
+_VENUE_HOST_RE = re.compile(r"\bin the ([^.]+)")
+# Only with a style: a bare year repeats the row's meta line.
+_VENUE_ERA_RE = re.compile(r"\bin an? (\d{4} [^.]+?) building")
+
+
+def evidence_why(h: Dict[str, Any], q_lex: str) -> Optional[str]:
+    q_toks = query_content_tokens(q_lex)
+    t = h.get("type")
+    if t == "building":
+        lore = h.get("lore_text") or ""
+        if lore and ((h.get("lore_lex") or 0.0) >= LORE_LEX_FLOOR or q_toks & _field_tokens(lore)):
+            ex = _excerpt(lore, q_toks)
+            if ex:
+                return ex
+        return None
+    if t == "venue":
+        text = h.get("text") or ""
+        parts = []
+        host = _VENUE_HOST_RE.search(text)
+        if host:
+            parts.append("In the " + host.group(1).strip())
+        era = _VENUE_ERA_RE.search(text)
+        if era:
+            parts.append(era.group(1).strip())
+        return " · ".join(parts) or None
+    snippet = h.get("snippet") or ""
+    if snippet and snippet.strip().lower() != (h.get("name") or "").strip().lower():
+        return _excerpt(snippet, q_toks) or snippet[:WHY_MAX]
+    return None
