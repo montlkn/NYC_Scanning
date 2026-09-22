@@ -1983,19 +1983,20 @@ async def search_unified(
             user_vec_lit = None
 
     async def _retrieve(vec_lit: str, lex: str, *, with_personal: bool = True,
-                        soft: Optional[bool] = None):
+                        soft: Optional[bool] = None, years: Optional[List[int]] = None):
         """One full leg set (buildings, venues, layers) for one phrasing of
         the query, with the request's filters and POI adjustments applied."""
         soft_r = soft_radius if soft is None else soft
+        yf, yt = (years if years else (year_from, year_to))
         b, v, l = await asyncio.gather(
             _leg_buildings(
-                vec_lit, lex, leg_limit, lat, lng, radius_m, year_from, year_to,
+                vec_lit, lex, leg_limit, lat, lng, radius_m, yf, yt,
                 borough=borough, material=material, style_family=style_family,
                 user_vec_lit=user_vec_lit if with_personal else None, soft_radius=soft_r,
                 fame_weight=W_LEG_FAME if intent in FAME_BOOST_INTENTS else 0.0,
                 lore_weight=leg_lore_weight(intent),
             ),
-            _leg_venues(vec_lit, lex, leg_limit, lat, lng, radius_m, year_from, year_to, soft_radius=soft_r),
+            _leg_venues(vec_lit, lex, leg_limit, lat, lng, radius_m, yf, yt, soft_radius=soft_r),
             _leg_layers(vec_lit, lex, leg_limit, lat, lng, radius_m, layer_filter, soft_radius=soft_r),
         )
         return _post_filter(b, v, l)
@@ -2064,8 +2065,12 @@ async def search_unified(
         # A rewrite is not held to the "near me" radius: it is how a query
         # that names something ("seagram bar" -> "Seagram Building") reaches
         # it from across town. Only "search this area" bounds a rewrite.
+        # The implied era FILTERS the rewrite legs (never the user's own):
+        # re-ranking cannot surface a 1958 bar that was never retrieved.
+        # An explicit year filter from the request wins.
+        era = None if (year_from or year_to) else (interp or {}).get("years")
         return await _retrieve(_vec_literal(vec), _lexical_query(phrase), with_personal=False,
-                               soft=not area_bound)
+                               soft=not area_bound, years=era)
 
     # A cached rewrite that last time turned out to be NEEDED ("direct":
     # false) runs alongside the user's own legs instead of after them, so a

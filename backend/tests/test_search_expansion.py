@@ -184,6 +184,10 @@ def test_era_bonus_and_no_double_count_with_style():
     assert llm_era_bonus(interp, {"year": 1859, "style": None}) == W_LLM_ERA_MISS
     assert llm_era_bonus(interp, {"year": None, "style": None}) == 0.0
     assert llm_era_bonus(interp, {"year": 1958, "style": "International Style"}) == 0.0
+    # out of era cancels the style match
+    from services.unified_search import llm_style_bonus
+    h = {"year": 1910, "style": "International Style"}
+    assert llm_style_bonus(interp, h) + llm_era_bonus(interp, h) == W_LLM_ERA_MISS
 
 
 def test_parse_keeps_a_sane_year_range_only():

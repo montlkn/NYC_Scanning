@@ -1708,13 +1708,18 @@ def llm_era_bonus(interp: Optional[Dict[str, Any]], hit: Dict[str, Any]) -> floa
     their building's year, so the era is what lets "modernist bars" prefer a
     bar in a 1958 tower over one in an 1850s walk-up. Skipped when the style
     bonus already fired: same evidence, would double-count."""
-    if not interp or not interp.get("years") or llm_style_bonus(interp, hit):
+    if not interp or not interp.get("years"):
         return 0.0
     y = hit.get("year")
     if not isinstance(y, int):
         return 0.0
     lo, hi = interp["years"]
-    return W_LLM_ERA if lo <= y <= hi else W_LLM_ERA_MISS
+    if lo <= y <= hi:
+        # In era and already rewarded for the matching style: same evidence.
+        return 0.0 if llm_style_bonus(interp, hit) else W_LLM_ERA
+    # Out of era cancels a style match too: a "Modern" label on a 1910
+    # building (D'or lounge) is a data error, and the year is the harder fact.
+    return W_LLM_ERA_MISS - llm_style_bonus(interp, hit)
 
 
 # A report chunk whose word_similarity to the query clears this literally
