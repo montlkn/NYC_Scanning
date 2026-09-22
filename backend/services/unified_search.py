@@ -1692,7 +1692,11 @@ def llm_style_bonus(interp: Optional[Dict[str, Any]], hit: Dict[str, Any]) -> fl
     return 0.0
 
 
-W_LLM_ERA = 0.06
+W_LLM_ERA = 0.08
+# Known to be from another era. A bonus alone was too weak to matter:
+# "modernist bars" still led with bars in 1907-1910 buildings, because
+# +0.06 is ~4 rank steps and the fused list was that noisy.
+W_LLM_ERA_MISS = -0.08
 
 
 def llm_era_bonus(interp: Optional[Dict[str, Any]], hit: Dict[str, Any]) -> float:
@@ -1708,7 +1712,7 @@ def llm_era_bonus(interp: Optional[Dict[str, Any]], hit: Dict[str, Any]) -> floa
     if not isinstance(y, int):
         return 0.0
     lo, hi = interp["years"]
-    return W_LLM_ERA if lo <= y <= hi else 0.0
+    return W_LLM_ERA if lo <= y <= hi else W_LLM_ERA_MISS
 
 
 # A report chunk whose word_similarity to the query clears this literally

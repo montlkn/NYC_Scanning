@@ -177,10 +177,11 @@ def test_spelling_correction_replaces_only_a_true_typo_fix():
 
 
 def test_era_bonus_and_no_double_count_with_style():
-    from services.unified_search import W_LLM_ERA, llm_era_bonus
+    from services.unified_search import W_LLM_ERA, W_LLM_ERA_MISS, llm_era_bonus
     interp = {"years": [1930, 1975], "styles": ["international style"]}
     assert llm_era_bonus(interp, {"year": 1958, "style": None}) == W_LLM_ERA
-    assert llm_era_bonus(interp, {"year": 1859, "style": None}) == 0.0
+    assert llm_era_bonus(interp, {"year": 1859, "style": None}) == W_LLM_ERA_MISS
+    assert llm_era_bonus(interp, {"year": None, "style": None}) == 0.0
     assert llm_era_bonus(interp, {"year": 1958, "style": "International Style"}) == 0.0
 
 
