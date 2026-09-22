@@ -917,6 +917,29 @@ def facet_adjustments(q_lex: str, hits: Sequence[dict]) -> List[float]:
 # match, so the floor belongs between them, not just under the typo. At the
 # first-shipped 0.55 a 0.640 match cleared the floor by only 20% of the range
 # and earned ~2 rank steps -- not enough, and Chrysler stayed second.
+# Naming one of the nine archetypes is an instruction, not a hint: "austerist"
+# means show me the 169 austerist buildings, not the 570 modernist ones that
+# are stylistically adjacent and more famous. Without this the pool orders by
+# fame and the adjacent-but-wrong ones win.
+#
+# Sized like W_ARCHITECT_MATCH (0.30): a real structured-column match is the
+# answer for that query, the same way an architect match is.
+W_AESTHETIC_MATCH = 0.30
+
+
+def aesthetic_match_bonus(q_lex: str, aesthetic: Optional[str]) -> float:
+    """Bonus when the row's archetype is one the query actually named."""
+    if not aesthetic:
+        return 0.0
+    toks = {t for t in _tokens(q_lex) if len(t) >= 3}
+    if not toks:
+        return 0.0
+    # pop_culturalist is written "pop culturalist" in a query, never with the
+    # underscore, so compare on the parts.
+    parts = {p for p in aesthetic.lower().split("_") if len(p) >= 3}
+    return W_AESTHETIC_MATCH if (toks & parts) else 0.0
+
+
 W_FUZZY_NAME = 0.24       # still below W_EXACT_NAME (0.30): a correct name wins
 # Calibrated on what the code ACTUALLY compares, which is not what I first
 # measured. q_lex is the STOPWORD-STRIPPED query -- "chrystler building"

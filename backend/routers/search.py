@@ -27,6 +27,7 @@ from services.openai_text import openai_text
 from services.unified_search import (
     HARD_RADIUS_INTENTS,
     facet_adjustments,
+    aesthetic_match_bonus,
     fuzzy_name_bonus,
     LORE_SIM_FLOOR,
     LORE_LEX_FLOOR,
@@ -649,6 +650,7 @@ async def search_layers(
 
 _MATERIAL_VOCAB: Optional[set] = None
 _HOOD_VOCAB: Optional[set] = None
+_AESTH_VOCAB: Optional[set] = None
 
 
 def _load_vocab(column: str) -> set:
@@ -668,6 +670,15 @@ def _load_vocab(column: str) -> set:
     except Exception as e:
         logger.warning(f"[search] vocab load for {column} failed ({e}); gate opens")
         return set()
+
+
+def aesthetic_vocab() -> set:
+    global _AESTH_VOCAB
+    if _AESTH_VOCAB is None:
+        _AESTH_VOCAB = _load_vocab(
+            "(SELECT DISTINCT aesthetic_text AS v FROM building_search_index "
+            " WHERE aesthetic_text IS NOT NULL)")
+    return _AESTH_VOCAB
 
 
 def material_vocab() -> set:
@@ -806,6 +817,13 @@ async def _leg_buildings(
     _toks = set(params["q_toks"])
     want_mat = bool(_toks & material_vocab())
     want_hood = bool(_toks & neighborhood_vocab())
+    # The nine archetypes are a CLOSED set, so naming one is an exact
+    # instruction ("show me the visionary ones"), not a similarity guess.
+    # build_text already folds "{archetype} character" into the embedding, so
+    # they were reachable semantically -- but with no structured column there
+    # was no way to return precisely those and nothing else.
+    want_aesth = bool(_toks & aesthetic_vocab())
+    params["aesth_toks"] = sorted(_toks & aesthetic_vocab()) or ['\x00']
     params["lore_lex_floor"] = LORE_LEX_FLOOR
     # Lexical carries the term (literal chunk match = 1.000 vs 0.159 average),
     # the vector adds a smaller paraphrase margin. Both normalized by their
@@ -846,7 +864,8 @@ async def _leg_buildings(
             # architect: backfilled from LPC gpmc-yuvp (26,430 rows). Until now
             # there was no architect column, so the `architect` intent and
             # infer_matched_field's architect slot had nothing to read.
-            "b.architect AS b_architect, b.neighborhood AS b_neighborhood"
+            "b.architect AS b_architect, b.neighborhood AS b_neighborhood, "
+            "b.aesthetic AS b_aesthetic"
             + (", -(b.profile <#> CAST(:uvec AS vector)) AS b_personalization"
                if (enriched and user_vec_lit) else "")
             if enriched else ""
@@ -905,6 +924,16 @@ async def _leg_buildings(
             ORDER BY (SELECT coalesce(max(strict_word_similarity(t, lower(coalesce(neighborhood_text,'')))), 0) FROM unnest(CAST(:q_toks AS text[])) t) DESC
             LIMIT :pool
         ),
+        aesth_pool AS (
+            SELECT bin FROM building_search_index
+            {where + (' AND ' if where else 'WHERE ')}
+                  {'TRUE' if want_aesth else 'FALSE'}
+              AND aesthetic_text IS NOT NULL
+              AND EXISTS (SELECT 1 FROM unnest(CAST(:aesth_toks AS text[])) t
+                           WHERE lower(aesthetic_text) ~ ('\\y' || t || '\\y'))
+            ORDER BY coalesce(fame, 0) DESC
+            LIMIT :pool
+        ),
         mat_pool AS (
             -- Material recall. The source spells it "Terra Cotta" (two words,
             -- 1,502 rows) while people type "terracotta"; material_text holds
@@ -959,6 +988,7 @@ async def _leg_buildings(
             UNION SELECT bin FROM fuzzy_pool UNION SELECT bin FROM fame_pool
             UNION SELECT bin FROM lore_pool UNION SELECT bin FROM mat_pool
             UNION SELECT bin FROM hood_pool UNION SELECT bin FROM lore_lex_pool
+            UNION SELECT bin FROM aesth_pool
         )
         SELECT b.bin, b.bbl, b.snippet, b.year_built, b.is_landmark, b.fame, b.lat, b.lng,
                {fused} AS score,
@@ -1062,8 +1092,9 @@ async def _leg_buildings(
         # neighborhood rides in select_extra AFTER architect, so every index
         # below it shifts by one. These offsets are positional by design.
         neighborhood_val = r[extra_offset + 5] if enriched else None
-        personalization_dot = float(r[extra_offset + 6]) if has_personalization and r[extra_offset + 6] is not None else None
-        dist_idx = extra_offset + (7 if has_personalization else 6) if enriched else extra_offset
+        aesthetic_val = r[extra_offset + 6] if enriched else None
+        personalization_dot = float(r[extra_offset + 7]) if has_personalization and r[extra_offset + 7] is not None else None
+        dist_idx = extra_offset + (8 if has_personalization else 7) if enriched else extra_offset
         hits.append({
             "type": "building",
             "id": str(r[0]).replace(".0", "") if r[0] else None,
@@ -1077,6 +1108,7 @@ async def _leg_buildings(
             "borough": borough_val,
             "material": material_val,
             "neighborhood": neighborhood_val,
+            "aesthetic": aesthetic_val,
             "category": None,
             "landmark": bool(r[4]) if r[4] is not None else None,
             "fame": float(r[5]) if r[5] is not None else None,
@@ -1891,6 +1923,10 @@ async def search_unified(
         # to score against at all.
         if intent == "architect":
             nudged += architect_match_bonus(q_lex, h.get("architect"))
+        # Naming an archetype is an instruction: "austerist" must return the
+        # 169 austerist buildings, not the stylistically adjacent modernists
+        # that happen to be more famous.
+        nudged += aesthetic_match_bonus(q_lex, h.get("aesthetic"))
         # House-number address queries ("469 broome") classify as name/address
         # but their number is the whole signal — a dominant bonus when a
         # building's address range contains it, so the exact address beats fame
