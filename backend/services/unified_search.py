@@ -924,6 +924,44 @@ def facet_adjustments(q_lex: str, hits: Sequence[dict]) -> List[float]:
 #
 # Sized like W_ARCHITECT_MATCH (0.30): a real structured-column match is the
 # answer for that query, the same way an architect match is.
+# A lore entry whose TITLE contains the query is the answer, whatever the
+# intent router decided.
+#
+# The lore corpus retrieves these perfectly -- "kitty genovese" scores the
+# "Kitty Genovese Murder" entry at 0.82, "murder" pulls the Wilkins Murder
+# Trial, the East River Hotel Murder and the Pig Woman Murder. They simply
+# never reached the user: _INTENT_WEIGHTS gives layers 0.6 against buildings
+# 1.0 on `name` intent, and "murder" classifies as `name` because it is in
+# neither _LORE_VOCAB nor _EVENT_VOCAB -- both hand-written lists that happen
+# to contain "ghost" and "demolished" but not "murder", "haunted" or any
+# particular victim's name.
+#
+# Deriving those vocabularies from the lore corpus was the obvious fix and is
+# the wrong one: the same derivation produces "gallery", "train", "where" and
+# "that", and a mis-derived lore word routes an art-gallery search to the
+# layers corpus at weight 1.0. That is the POI-noun regression again.
+#
+# So intent routing is left alone and the evidence is used directly instead:
+# the query's words are in the entry's title, which is not a guess.
+W_LAYER_TITLE_MATCH = 0.28   # just under W_EXACT_NAME (0.30)
+
+
+def layer_title_bonus(q_lex: str, hit_type: Optional[str],
+                      name: Optional[str]) -> float:
+    """Scaled by how much of the title the query actually covers, so a full
+    title match ("kitty genovese") far outweighs a single shared word."""
+    if hit_type not in ("lore", "plaque", "contribution") or not name:
+        return 0.0
+    q_toks = {t for t in _tokens(q_lex) if len(t) >= 4}
+    if not q_toks:
+        return 0.0
+    title_toks = {t for t in _tokens(name) if len(t) >= 4}
+    if not title_toks:
+        return 0.0
+    covered = len(q_toks & title_toks) / len(q_toks)
+    return W_LAYER_TITLE_MATCH * covered
+
+
 W_AESTHETIC_MATCH = 0.30
 
 

@@ -28,6 +28,7 @@ from services.unified_search import (
     HARD_RADIUS_INTENTS,
     facet_adjustments,
     aesthetic_match_bonus,
+    layer_title_bonus,
     fuzzy_name_bonus,
     LORE_SIM_FLOOR,
     LORE_LEX_FLOOR,
@@ -1954,6 +1955,10 @@ async def search_unified(
         # 169 austerist buildings, not the stylistically adjacent modernists
         # that happen to be more famous.
         nudged += aesthetic_match_bonus(q_lex, h.get("aesthetic"))
+        # A lore entry whose title carries the query is the answer regardless
+        # of intent: "kitty genovese" retrieves the Kitty Genovese Murder at
+        # 0.82 and was still buried under buildings by the corpus weights.
+        nudged += layer_title_bonus(q_lex, h.get("type"), h.get("name"))
         # House-number address queries ("469 broome") classify as name/address
         # but their number is the whole signal — a dominant bonus when a
         # building's address range contains it, so the exact address beats fame
