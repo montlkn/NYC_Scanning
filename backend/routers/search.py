@@ -823,7 +823,12 @@ async def _leg_buildings(
     # they were reachable semantically -- but with no structured column there
     # was no way to return precisely those and nothing else.
     want_aesth = bool(_toks & aesthetic_vocab())
-    params["aesth_toks"] = sorted(_toks & aesthetic_vocab()) or ['\x00']
+    # Sentinel must be a VALID text value. '\x00' is not: Postgres rejects NUL
+    # bytes in text outright, so passing one made the whole buildings query
+    # raise, both the enriched and fallback branches fail, and the leg return
+    # zero hits for EVERY query. A string that cannot occur as a query token
+    # does the same job safely.
+    params["aesth_toks"] = sorted(_toks & aesthetic_vocab()) or ["__none__"]
     params["lore_lex_floor"] = LORE_LEX_FLOOR
     # Lexical carries the term (literal chunk match = 1.000 vs 0.159 average),
     # the vector adds a smaller paraphrase margin. Both normalized by their
