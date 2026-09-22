@@ -211,3 +211,24 @@ class TestLegsActuallyReturnHits:
             fame_weight=0.15, lore_weight=0.45,
         )
         assert hits, "sentinel path for a query naming no archetype is broken"
+
+
+class TestHostileInput:
+    """A NUL in a text parameter is rejected by psycopg before the query runs,
+    so every leg raises and the user gets a silent empty result set. A client
+    can send one: %00 decodes to NUL and renders as nothing in a bug report.
+    """
+
+    def test_nul_bytes_are_stripped(self):
+        import sys
+        sys.path.insert(0, ".")
+        from routers.search import _sanitize_query
+        assert "\x00" not in _sanitize_query("empire\x00 state")
+        assert _sanitize_query("empire\x00 state") == "empire state"
+
+    def test_ordinary_queries_are_untouched(self):
+        import sys
+        sys.path.insert(0, ".")
+        from routers.search import _sanitize_query
+        for q in ("empire state building", "art deco", "mckim, mead & white"):
+            assert _sanitize_query(q) == q

@@ -94,6 +94,26 @@ _LEX_STOPWORDS = frozenset({
 })
 
 
+def _sanitize_query(q: str) -> str:
+    """Strip bytes Postgres cannot accept in a text parameter.
+
+    A NUL is rejected outright by psycopg when binding a text value, so it
+    fails BEFORE the query runs -- every leg raises, and because each leg
+    swallows its own errors (a broken leg must not break the others) the user
+    just gets an empty result set with nothing in the logs to explain it.
+
+    A client can send one: %00 in a URL decodes to NUL and renders as nothing
+    in most UIs, so it is invisible in a bug report.
+
+    This is defence in depth, not the fix for the outage of 2026-09-22 -- that
+    NUL was server-side, a sentinel this module passed in params["aesth_toks"],
+    and never touched `q`. Sanitizing input would not have caught it.
+    """
+    if not q:
+        return q
+    return q.replace("\x00", "").replace("\r", " ").strip()
+
+
 def _lexical_query(q: str) -> str:
     """Strip prose stopwords so the trigram pool keys on distinctive terms only.
 
@@ -1769,6 +1789,7 @@ async def search_unified(
     if cached_resp is not None:
         return cached_resp
 
+    q = _sanitize_query(q)
     intent, poi_noun = classify_intent_detailed(q)
     weights = corpus_weights(intent)
     # HARD_RADIUS_INTENTS (poi/name/address/event): radius_m stays a hard
