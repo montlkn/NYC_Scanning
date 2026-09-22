@@ -82,6 +82,12 @@ _LEX_STOPWORDS = frozenset({
     "feel", "feels", "feeling", "kind", "sort", "type", "very", "really", "some",
     "any", "all", "me", "show", "find", "buildings", "building", "place",
     "places", "something", "somewhere", "near", "around",
+    # "spot"/"spots" belongs with "place"/"places": it is how people say
+    # "somewhere", not a thing in the corpus. Left out, "spooky spots" matched
+    # "Lily Spots Llc", "Five Spot Cafe" and "The Picnic Ba Ket" (Sandwich
+    # Spot) on the literal token while the word that carried the intent,
+    # "spooky", did the work alone.
+    "spot", "spots",
 })
 
 
