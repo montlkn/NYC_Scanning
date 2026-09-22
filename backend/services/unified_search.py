@@ -1781,3 +1781,153 @@ def has_direct_match(q_lex: str, intent: str, legs: Dict[str, Sequence[Dict[str,
             if _covers_all(h):
                 covered += 1
     return covered >= DIRECT_COVERAGE_HITS
+
+
+# ---------------------------------------------------------------------------
+# Result tiers: the actual thing, then real matches nearest-first, then the
+# rest by relevance.
+#
+# The product rule (2026-09-22): results close to you first -- but a search
+# for a specific thing ("seagram bar") returns that thing wherever it is, and
+# a descriptive search ("tin ceilings", "art deco bars") returns things that
+# ACTUALLY match, nearest first, before anything that merely scored well.
+# Score order alone cannot express that: distance was a 0.01 nudge, under one
+# rank step, and a real match 800m away sat below a vague one next door.
+# ---------------------------------------------------------------------------
+
+def _fold(t: str) -> str:
+    return t[:-1] if len(t) > 3 and t.endswith("s") else t
+
+
+def _field_tokens(*values: Optional[str]) -> set:
+    out: set = set()
+    for v in values:
+        if v:
+            # Hyphens split: "pressed-tin ceiling" must yield "tin".
+            out |= {_fold(t) for t in re.split(r"[^a-z0-9]+", str(v).lower().replace("'", "")) if len(t) >= 3}
+    return out
+
+
+def query_content_tokens(q_lex: str) -> set:
+    return _field_tokens(q_lex)
+
+
+def _hit_match_tokens(h: Dict[str, Any], with_prose: bool = True) -> set:
+    """Everything a hit can legitimately be matched on. `with_prose` adds the
+    report sentence, which only counts for multi-word queries: the Broadway
+    theaters' shared designation report mentions "Murder in the Cathedral",
+    which does not make every theater a match for "murder"; a report that
+    says "pressed-tin ceiling" IS a match for "tin ceilings"."""
+    return _field_tokens(
+        h.get("name"), h.get("category"), h.get("style"), h.get("neighborhood"),
+        h.get("borough"), h.get("architect"), (h.get("aesthetic") or "").replace("_", " "),
+        h.get("material"), h.get("lex_text"),
+        *( (h.get("lore_text"),) if with_prose else () ),
+        *( (h.get("snippet"),) if with_prose or h.get("type") not in ("building",) else () ),
+    )
+
+
+def _hit_name_tokens(h: Dict[str, Any]) -> set:
+    """The name, plus a venue's HOST building name (lex_text minus its generic
+    parts), so The Bar is named by "seagram"."""
+    toks = _field_tokens(h.get("name"))
+    if h.get("lex_text"):
+        toks |= (_field_tokens(h.get("lex_text"))
+                 - _field_tokens(h.get("category"), h.get("neighborhood"), h.get("borough")))
+    return toks
+
+
+def _llm_qualified(interp: Optional[Dict[str, Any]], h: Dict[str, Any]) -> bool:
+    """For a vague query no hit covers word for word ("modernist bars"), the
+    rewrite's structure defines a real match: the kind of place asked for,
+    in the style or era asked for."""
+    if not interp:
+        return False
+    cats = interp.get("categories") or []
+    wants_form = bool(interp.get("styles") or interp.get("years"))
+    form_ok = llm_style_bonus(interp, h) > 0 or llm_era_bonus(interp, h) > 0
+    if cats:
+        return llm_category_bonus(interp, h) > 0 and (form_ok if wants_form else True)
+    if wants_form and h.get("type") == "building":
+        return llm_style_bonus(interp, h) > 0
+    return False
+
+
+_NAME_FILLER = frozenset({"the", "and", "for"})
+
+
+def tier_of(h: Dict[str, Any], q_toks: set, named_toks: set,
+            interp: Optional[Dict[str, Any]], place_req: Optional[Dict[str, Any]],
+            hood_vocab: Optional[set] = None, generic: Optional[set] = None) -> int:
+    """0 = the actual thing, 1 = a real match, 2 = everything else."""
+    # A place the query asked for is part of the match: a deco bar in Queens
+    # is not a real match for "art deco bars in midtown".
+    in_place = place_adjustment(place_req, h, hood_vocab) >= 0 if place_req else True
+    if not in_place:
+        return 2
+    phrase = len(q_toks) >= 2
+    covered = bool(q_toks) and q_toks <= _hit_match_tokens(h, with_prose=phrase)
+    # Only a PLACE can be "the thing itself". A lore title that contains the
+    # words ("Murder of ...") is a topical match, sorted by distance like any
+    # other real match.
+    if covered and named_toks and h.get("type") in ("building", "venue"):
+        # The query must account for EVERY distinctive word of the name (or
+        # host building name): "chrysler" is the Chrysler Building, but
+        # "gargoyles" is not the gift shop "Dragonflies & Gargoyles".
+        distinctive = _hit_name_tokens(h) - (generic or set()) - _NAME_FILLER
+        own = _field_tokens(h.get("name")) - (generic or set()) - _NAME_FILLER
+        # Matched only through its HOST building: a deli in the Woolworth
+        # Building is not "woolworth building". It is the thing only when the
+        # query also asks for its kind ("seagram bar" -> The Bar).
+        via_host_only = not (named_toks & own)
+        asks_for_kind = bool(q_toks - named_toks)
+        if (distinctive and (named_toks & distinctive) and distinctive <= q_toks
+                and (not via_host_only or asks_for_kind)):
+            return 0
+    if (h.get("name_sim") or 0.0) >= FUZZY_NAME_FULL and h.get("type") in ("building", "venue"):
+        return 0  # a typo of a name is still the name
+    if covered or (phrase and (h.get("lore_lex") or 0.0) >= LORE_LEX_DIRECT) or _llm_qualified(interp, h):
+        return 1
+    return 2
+
+
+def order_by_tier(hits: List[Dict[str, Any]], tiers: List[int], has_geo: bool) -> List[Dict[str, Any]]:
+    """Tier 0 by relevance (the thing itself; distance is irrelevant), tier 1
+    nearest first, tier 2 by relevance. Stable within ties."""
+    idx = list(range(len(hits)))
+    t0 = [i for i in idx if tiers[i] == 0]
+    t1 = [i for i in idx if tiers[i] == 1]
+    t2 = [i for i in idx if tiers[i] == 2]
+    if has_geo:
+        t1.sort(key=lambda i: (hits[i].get("dist_m") is None, hits[i].get("dist_m") or 0.0))
+    return [hits[i] for i in t0 + t1 + t2]
+
+
+# A real match needs this many near the user before the search stops looking
+# further out. Below it, the same query runs again without the radius.
+MIN_LOCAL_MATCHES = 3
+
+# A name that picks out at most this many places is a specific thing
+# ("seagram" -> The Bar; "chrysler" -> the Chrysler Building). More than that
+# and the word is descriptive after all ("haunted" names five haunted-house
+# attractions), so its matches sort by distance like any description.
+MAX_ENTITY_HITS = 3
+
+
+def carries_name(h: Dict[str, Any], named_toks: set) -> bool:
+    """The query's name words are in this hit's own or host building name."""
+    return bool(named_toks & _hit_name_tokens(h))
+
+
+def resolve_entity_mode(tiers: List[int], carries: Optional[List[bool]] = None) -> List[int]:
+    n0 = sum(1 for t in tiers if t == 0)
+    if 1 <= n0 <= MAX_ENTITY_HITS:
+        # The named thing was found. Other hits stay real matches only if
+        # they carry the name too (the bars inside Grand Central Terminal);
+        # the rest is context, ranked by relevance -- a report that merely
+        # MENTIONS the Chrysler Building is not an answer to it.
+        carries = carries or [False] * len(tiers)
+        return [t if t == 0 else (1 if (t == 1 and c) else 2) for t, c in zip(tiers, carries)]
+    if n0 > MAX_ENTITY_HITS:
+        return [1 if t == 0 else t for t in tiers]
+    return tiers

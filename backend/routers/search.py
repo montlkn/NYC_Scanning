@@ -71,6 +71,12 @@ from services.unified_search import (
     llm_style_bonus,
     llm_era_bonus,
     spelling_correction,
+    MIN_LOCAL_MATCHES,
+    order_by_tier,
+    query_content_tokens,
+    tier_of,
+    resolve_entity_mode,
+    carries_name,
     token_coverage,
     llm_category_bonus,
     parse_interpretation,
@@ -762,6 +768,41 @@ def _neighborhood_phrases() -> set:
     return _HOOD_PHRASES
 
 
+_GENERIC_VOCAB: Optional[set] = None
+
+
+def generic_vocab() -> set:
+    """Words that describe a KIND of thing, not a particular one: every venue
+    category, style, archetype, material and neighborhood word in the data.
+    A query word outside this set ("seagram", "chrysler") names something, and
+    a result carrying it in its name is the thing itself. Derived from the
+    corpus, so it grows with it."""
+    global _GENERIC_VOCAB
+    if _GENERIC_VOCAB is None:
+        import psycopg
+        from models.config import get_settings
+        from services.unified_search import _field_tokens
+        words: set = set()
+        url = get_settings().search_db_url
+        try:
+            if url:
+                with psycopg.connect(url, connect_timeout=5) as c, c.cursor() as cur:
+                    cur.execute("SELECT DISTINCT category FROM venues WHERE searchable AND category IS NOT NULL")
+                    for (v,) in cur.fetchall():
+                        words |= _field_tokens(v)
+                    cur.execute("SELECT DISTINCT style_family FROM building_search_index WHERE style_family IS NOT NULL "
+                                "UNION SELECT DISTINCT style_primary FROM building_search_index WHERE style_primary IS NOT NULL")
+                    for (v,) in cur.fetchall():
+                        words |= _field_tokens(v)
+        except Exception as e:
+            logger.warning(f"[search] generic vocab load failed ({e})")
+        for w in aesthetic_vocab() | material_vocab() | neighborhood_vocab():
+            words |= _field_tokens(w)
+        words |= _field_tokens("manhattan brooklyn queens bronx staten island building buildings")
+        _GENERIC_VOCAB = words
+    return _GENERIC_VOCAB
+
+
 def _query_places(q: str) -> tuple:
     """(neighborhood phrases, boroughs) the query names, whole-word."""
     ql = " " + re.sub(r"[^a-z0-9]+", " ", q.lower().replace("'", "")) + " "
@@ -1352,7 +1393,7 @@ async def _leg_venues(
         )
         SELECT v.fsq_id, v.name, v.category, v.snippet, v.lat, v.lng,
                v.bin, v.bbl, v.building_year, v.building_style, v.photo_url,
-               v.category_labels, v.neighborhood, v.borough,
+               v.category_labels, v.neighborhood, v.borough, v.lex_text,
                {fused} AS score, wl.lex AS lex_score
                {dist_sql}
         FROM venues v
@@ -1387,6 +1428,7 @@ async def _leg_venues(
             "category": r["category"],
             "neighborhood": r["neighborhood"],
             "borough": r["borough"],
+            "lex_text": r["lex_text"],
             "landmark": None,
             "lat": r["lat"],
             "lng": r["lng"],
@@ -2093,6 +2135,26 @@ async def search_unified(
     raw_legs = {"buildings": buildings_hits, "venues": venues_hits, "layers": layers_hits}
     t_first = time.monotonic()
 
+    # Not enough REAL matches inside the near-me radius: ask again citywide.
+    # "tin ceilings" or "art deco bars near me" with none close by should show
+    # the real ones further out (tiered nearest-first below), not fill the
+    # list with nearby things that merely scored. "Search this area" is the
+    # user's own boundary and never widens.
+    if (not soft_radius and not area_bound and radius_m and lat is not None and lng is not None):
+        _q_toks = query_content_tokens(q_lex)
+        _named = {t for t in _q_toks if t not in generic_vocab()}
+        _place = {"neighborhoods": q_hoods, "boroughs": q_boros} if (q_hoods or q_boros) else None
+        local_matches = sum(
+            1 for hs in raw_legs.values() for h in hs
+            if tier_of(h, _q_toks, _named, interp, _place, neighborhood_vocab(), generic_vocab()) < 2
+        )
+        if local_matches < MIN_LOCAL_MATCHES:
+            gb, gv, gl = await _retrieve(qvec_lit, q_lex, soft=True)
+            fresh = {"buildings": gb, "venues": gv, "layers": gl}
+            for k in raw_legs:
+                seen = {x.get("id") for x in raw_legs[k]}
+                raw_legs[k] = raw_legs[k] + [h for h in fresh[k] if h.get("id") not in seen]
+
     # Wait for the model only when the user's own words did not already find
     # the answer. "chrysler building" must not pay 2.5s for a rewrite it does
     # not need; "spooky spots" should.
@@ -2308,6 +2370,7 @@ async def search_unified(
             "bbl": h.get("bbl"),
             "lore_status": h.get("lore_status"),
             "snippet": h.get("snippet"),
+            "_src": h,
             **({"_debug": {"rrf": round(score * RRF_SCALE, 4), **dbg,
                            "legs": sorted(k for k, lst in legs.items()
                                           if any(r.key == ranked_hit.key and r.corpus == ranked_hit.corpus for r in lst))}}
@@ -2327,9 +2390,37 @@ async def search_unified(
     # 53 and 47 West 28th Street). Order-preserving -- nothing is dropped,
     # the surplus is pushed below the alternatives.
     diversified = apply_diversity_cap(deduped)
-    # Floor BEFORE the limit: `limit` is a ceiling on how many good results to
-    # show, not a quota to fill with noise.
-    hits = apply_relevance_floor(diversified)[:limit]
+    # Tiers: the actual thing, then real matches NEAREST FIRST, then the rest
+    # by relevance. See order_by_tier in services/unified_search.py.
+    q_toks = query_content_tokens(q_lex)
+    named_toks = {t for t in q_toks if t not in generic_vocab()}
+    # When the named thing itself is in the list ("seagram bar" -> The Bar),
+    # the rewrite's looser "any Cocktail Bar" definition of a match is off:
+    # other bars near you are not what was asked for.
+    tiers = [tier_of(h["_src"], q_toks, named_toks, None, place_req, neighborhood_vocab(), generic_vocab())
+             for h in diversified]
+    if 0 not in tiers and interp:
+        tiers = [tier_of(h["_src"], q_toks, named_toks, interp, place_req, neighborhood_vocab(), generic_vocab())
+                 for h in diversified]
+    # Hits that carry the name stay real matches only when the query also asks
+    # for a KIND of thing ("bars near grand central"). A bare name ("chrysler
+    # building") keeps its context ranked by relevance, not its tenants.
+    _asks_kind = bool(q_toks - named_toks)
+    tiers = resolve_entity_mode(tiers, [_asks_kind and carries_name(h["_src"], named_toks) for h in diversified])
+    if debug:
+        for h, t in zip(diversified, tiers):
+            h["_debug"]["tier"] = t
+    ordered = order_by_tier(diversified, tiers, lat is not None and lng is not None)
+    tier_by_id = {id(h): t for h, t in zip(diversified, tiers)}
+    matched = [h for h in ordered if tier_by_id[id(h)] < 2]
+    rest = [h for h in ordered if tier_by_id[id(h)] == 2]
+    # Floor only the unmatched tail: a real match is never dropped for scoring
+    # below a vaguer hit, and `limit` is a ceiling, not a quota to fill.
+    # Street cap again AFTER tiering: sorting matches by distance regrouped
+    # the adjacent West 28th Street row houses the first pass had spread out.
+    hits = apply_diversity_cap(matched + apply_relevance_floor(rest))[:limit]
+    for h in hits:
+        h.pop("_src", None)
 
     header = build_header(hits, intent)
     facets = build_facets({

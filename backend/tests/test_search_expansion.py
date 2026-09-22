@@ -199,3 +199,52 @@ def test_parse_keeps_a_sane_year_range_only():
 def test_a_report_that_literally_says_it_is_a_direct_match():
     legs = {"buildings": [{"name": "340 East 6th Street", "lore_lex": 0.846}]}
     assert has_direct_match("tin ceilings", "name", legs)
+
+
+class TestTiers:
+    """The actual thing first; real matches nearest first; the rest by score."""
+    from services.unified_search import (order_by_tier, resolve_entity_mode,
+                                         tier_of, query_content_tokens)
+    G = {"bar", "coffee", "shop", "cocktail", "building", "art", "deco", "central"}
+
+    def t(self, h, q, interp=None):
+        from services.unified_search import tier_of, query_content_tokens
+        qt = query_content_tokens(q)
+        return tier_of(h, qt, {x for x in qt if x not in self.G}, interp, None, None, self.G)
+
+    def test_the_named_thing_via_its_host_building(self):
+        bar = {"type": "venue", "name": "The Bar", "category": "Cocktail Bar",
+               "neighborhood": "East Midtown-Turtle Bay", "borough": "Manhattan",
+               "lex_text": "the bar cocktail bar seagram building east midtown-turtle bay manhattan"}
+        assert self.t(bar, "seagram bar") == 0
+
+    def test_a_tenant_is_not_the_building(self):
+        deli = {"type": "venue", "name": "Vineyard", "category": "Deli",
+                "neighborhood": "Tribeca-Civic Center", "borough": "Manhattan",
+                "lex_text": "vineyard deli woolworth building tribeca-civic center manhattan"}
+        assert self.t(deli, "woolworth") != 0
+
+    def test_a_shop_named_after_the_word_is_not_the_thing(self):
+        shop = {"type": "venue", "name": "Dragonflies & Gargoyles", "category": "Gift Store"}
+        assert self.t(shop, "gargoyles") == 1
+
+    def test_report_prose_counts_for_phrases_only(self):
+        b = {"type": "building", "name": "340 East 6th Street",
+             "lore_text": "historic fire escape; pressed-tin ceiling in front of store"}
+        assert self.t(b, "tin ceilings") == 1
+        theater = {"type": "building", "name": "Cort Theater",
+                   "lore_text": "produced Murder in the Cathedral"}
+        assert self.t(theater, "murder") == 2
+
+    def test_matches_sort_nearest_first(self):
+        from services.unified_search import order_by_tier
+        hits = [{"id": "far", "dist_m": 900.0}, {"id": "near", "dist_m": 100.0}, {"id": "x", "dist_m": 5.0}]
+        out = order_by_tier(hits, [1, 1, 2], True)
+        assert [h["id"] for h in out] == ["near", "far", "x"]
+
+    def test_entity_mode(self):
+        from services.unified_search import resolve_entity_mode
+        # one named thing: other matches drop unless they carry the name
+        assert resolve_entity_mode([0, 1, 1, 2], [False, True, False, False]) == [0, 1, 2, 2]
+        # many "named" hits: the word was descriptive after all
+        assert resolve_entity_mode([0, 0, 0, 0, 1]) == [1, 1, 1, 1, 1]
