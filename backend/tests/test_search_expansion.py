@@ -160,6 +160,7 @@ def test_llm_style_bonus_matches_the_rows_own_style():
     assert llm_style_bonus(interp, {"style": "International Style"}) == W_LLM_STYLE
     assert llm_style_bonus(interp, {"style": "modern brutalist"}) == W_LLM_STYLE
     assert llm_style_bonus(interp, {"style": "italianate"}) == 0.0
+    assert llm_style_bonus({"styles": ["modern"]}, {"style": "art moderne"}) == 0.0
     assert llm_style_bonus(interp, {"style": None}) == 0.0
 
 

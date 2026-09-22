@@ -1682,12 +1682,14 @@ def llm_style_bonus(interp: Optional[Dict[str, Any]], hit: Dict[str, Any]) -> fl
     column, so it cannot reward a style the row does not have."""
     if not interp:
         return 0.0
-    style = " ".join(_tokens((hit.get("style") or "").replace("-", " ")))
+    style = set(_tokens((hit.get("style") or "").replace("-", " ")))
     if not style:
         return 0.0
+    # Whole words, not substrings: "modern" in "art moderne" gave a 1910
+    # lounge the modernist bonus, and the bonus switches off the era check.
     for want in interp.get("styles") or []:
-        w = " ".join(_tokens(want.replace("-", " ")))
-        if w and (w in style or style in w):
+        w = set(_tokens(want.replace("-", " ")))
+        if w and w <= style:
             return W_LLM_STYLE
     return 0.0
 
