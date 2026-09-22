@@ -836,7 +836,18 @@ async def _leg_buildings(
     lore_term = (
         "(:lore_w * ("
         "  0.75 * GREATEST(0, coalesce(lore.lex, 0) - :lore_lex_floor) / (1 - :lore_lex_floor)"
-        "+ 0.25 * GREATEST(0, coalesce(lore.sim, 0) - :lore_floor) / (1 - :lore_floor)"
+        # RELATIVE, not an absolute floor. bge similarity moves with how
+        # abstract the query is, so one fixed cutoff cannot serve both:
+        #   cemetery 0.744  murder 0.594  haunted 0.574  spooky 0.526
+        # A 0.60 floor gave "cemetery" full credit and the other three
+        # exactly zero -- which is why conceptual queries felt dead while
+        # literal ones worked. ref.hi is the best lore match ANY candidate
+        # achieved for THIS query, so the term measures "how good is this
+        # row's lore match compared with the best available", and a query
+        # with no real lore signal still scores everyone near zero because
+        # ref.hi itself is low relative to ref.floor.
+        "+ 0.25 * GREATEST(0, coalesce(lore.sim, 0) - ref.lo)"
+        "       / NULLIF(GREATEST(ref.hi - ref.lo, 0.05), 0)"
         "))"
     )
     fused = ("(0.7 * (1 - (b.embedding <=> CAST(:qvec AS vector))) + 0.3 * wl.lex + "
@@ -988,6 +999,16 @@ async def _leg_buildings(
                  LIMIT :lore_scan
             ) lp LIMIT :pool
         ),
+        lore_ref AS (
+            -- Per-query scale for the lore vector term. Cheap: it reuses the
+            -- same HNSW probe lore_pool already performs.
+            SELECT max(sim) AS hi, min(sim) AS lo FROM (
+                SELECT 1 - (embedding <=> CAST(:qvec AS vector)) AS sim
+                  FROM building_lore_index
+                 ORDER BY embedding <=> CAST(:qvec AS vector)
+                 LIMIT :lore_scan
+            ) lr
+        ),
         pool AS (
             SELECT bin FROM vec_pool UNION SELECT bin FROM lex_pool
             UNION SELECT bin FROM fuzzy_pool UNION SELECT bin FROM fame_pool
@@ -1015,6 +1036,7 @@ async def _leg_buildings(
                  AS name_sim
         FROM building_search_index b
         JOIN pool USING (bin)
+        CROSS JOIN lore_ref ref
         CROSS JOIN LATERAL (
             SELECT greatest(
                 word_similarity(lower(:q_lex), lower(b.text)),

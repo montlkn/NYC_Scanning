@@ -72,7 +72,15 @@ KEEP = re.compile(
     r"hotel|hostel|inn$|bed_and|"
     r"market|farmers|butcher|cheese|chocolate|wine_|liquor|"
     r"library|bookstore|stadium|arena|bowling|arcade|"
-    r"tattoo|florist|furniture|design|architect)")
+    r"tattoo|florist|furniture|design|architect|"
+    # Added after the first pass: the destination/errand split was right, but
+    # these read as errands by category name and are not. A cemetery is the
+    # single most-requested "spooky spots" answer and the first pass dropped
+    # all 613 of them; a university campus and a landmark post office are
+    # architecture people walk to.
+    r"cemeter|graveyard|funeral|mausoleum|crypt|"
+    r"college|university|campus|"
+    r"post_office)")
 # Errands. Checked second, so it wins a tie ("medical_museum" stays out).
 DROP = re.compile(
     r"(health|medical|dentist|diagnostic|physical_therapy|hospital|clinic|"
@@ -87,10 +95,16 @@ DROP = re.compile(
     r"gym|fitness|party_and_event|advertis|recruit|staffing|employment|"
     r"telecom|utility|wholesale)")
 
+# Categories the DROP regex would otherwise swallow, but which are genuine
+# destinations. Checked before DROP, so it wins.
+RESCUE = re.compile(r"(cemeter|graveyard|funeral|mausoleum|crypt|college|university|campus|post_office)")
+
 
 def wanted(cat: str | None) -> bool:
     if not cat:
         return False
+    if RESCUE.search(cat):
+        return True
     return bool(KEEP.search(cat)) and not DROP.search(cat)
 
 
