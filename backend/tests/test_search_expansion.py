@@ -248,3 +248,15 @@ class TestTiers:
         assert resolve_entity_mode([0, 1, 1, 2], [False, True, False, False]) == [0, 1, 2, 2]
         # many "named" hits: the word was descriptive after all
         assert resolve_entity_mode([0, 0, 0, 0, 1]) == [1, 1, 1, 1, 1]
+
+
+def test_one_place_one_result():
+    from services.unified_search import dedupe_same_place
+    hits = [
+        {"name": "The Pool", "bin": "1036465"},
+        {"name": "Seagram Building", "bin": "1036465", "type": "building"},
+        {"name": "The Pool New York", "bin": "1036465"},
+        {"name": "Seagram Building", "bin": "1036465", "type": "venue"},
+        {"name": "The Lobster Club", "bin": "1036465"},
+    ]
+    assert [h["name"] for h in dedupe_same_place(hits)] == ["The Pool", "Seagram Building", "The Lobster Club"]

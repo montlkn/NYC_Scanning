@@ -139,20 +139,30 @@ def base_parts(text: str) -> list:
     return out
 
 
+def host_class(desc: str | None) -> str:
+    """PLUTO building class as a noun a sentence can use: 'Church/Religious'
+    -> 'church', 'Factory/Industrial' -> 'factory'. Classes that say nothing
+    about the building ('Miscellaneous', vacant) are dropped."""
+    d = (desc or "").split("/")[0].strip().lower()
+    d = re.sub(r"\s*building$", "", d)  # "Store Building" -> "store"
+    return "" if d in ("", "miscellaneous", "vacant land") else d
+
+
 def build_text(parts: list, raw_cat: str | None, cat: str | None, host: str,
-               byear, style: str, hood: str, boro: str, arch: str) -> str:
+               byear, style: str, hood: str, boro: str, arch: str,
+               cls: str = "", material: str = "") -> str:
     parts = list(parts)
     if len(parts) > 1 and raw_cat and parts[1] == raw_cat and cat:
         parts[1] = cat
     name = parts[0] if parts else ""
     if host and host.lower() not in name.lower():
         parts.append(f"in the {host}")
-    if byear and style:
-        parts.append(f"in a {byear} {style} building")
-    elif byear:
-        parts.append(f"in a {byear} building")
-    elif style:
-        parts.append(f"in a {style} building")
+    # One clause for the host building: "in a 1931 art deco office building",
+    # "in a 1889 church building". The class (PLUTO) is what lets "bar in a
+    # former church" or "cafe in an old factory" match at all.
+    desc = " ".join(x for x in (str(byear) if byear else "", style, material, cls) if x)
+    if desc:
+        parts.append(f"in a {desc} building")
     place = ", ".join(x for x in (hood, boro) if x)
     if place:
         parts.append(f"in {place}")
@@ -221,7 +231,7 @@ def run(*, dry_run: bool = False, limit: int | None = None,
         cur.execute(f"""
             SELECT v.fsq_id, v.name, v.category, v.category_domains, v.text,
                    v.lat, v.lng, v.building_year, v.building_style,
-                   b.snippet, b.architect, v.source, v.searchable
+                   b.snippet, b.architect, v.source, v.searchable, v.bbl, b.material
               FROM venues v
               LEFT JOIN building_search_index b ON b.bin = v.bin
              ORDER BY v.fsq_id
@@ -238,6 +248,20 @@ def run(*, dry_run: bool = False, limit: int | None = None,
             votes[(normalize_category(r[2]) or "").lower()][tuple(sorted(r[3]))] += 1
     domain_of = {k: c.most_common(1)[0][0] for k, c in votes.items()}
 
+    # PLUTO (footprints DB): building class for ~194k venue lots, and a year
+    # for venues that have none. One pass over the table, keyed on BBL.
+    pluto: dict = {}
+    fp_url = os.environ.get("FOOTPRINTS_DB_URL")
+    if fp_url:
+        fp = psycopg2.connect(fp_url)
+        with fp.cursor(name="pluto") as cur:
+            cur.itersize = 50000
+            cur.execute("SELECT bbl, bldg_class_desc, year_built FROM pluto_buildings")
+            for bbl, desc, yb in cur:
+                pluto[str(bbl).replace(".0", "")] = (desc, yb if (yb or 0) > 1600 else None)
+        fp.close()
+        log.info("PLUTO: %d lots (%.0fs)", len(pluto), time.time() - t0)
+
     lats = np.array([r[5] if r[5] is not None else np.nan for r in rows])
     lngs = np.array([r[6] if r[6] is not None else np.nan for r in rows])
     hoods, boros = locate(lats, lngs)
@@ -246,7 +270,12 @@ def run(*, dry_run: bool = False, limit: int | None = None,
     out = []
     stats = collections.Counter()
     for r, hood, boro in zip(rows, hoods, boros):
-        fsq_id, name, raw_cat, domains, text, _lat, _lng, byear, bstyle, bsnip, arch, source, was_searchable = r
+        fsq_id, name, raw_cat, domains, text, _lat, _lng, byear, bstyle, bsnip, arch, source, was_searchable, bbl, material = r
+        pl_desc, pl_year = pluto.get(str(bbl or "").replace(".0", ""), (None, None))
+        cls = host_class(pl_desc)
+        if not byear and pl_year:
+            byear = pl_year
+            stats["year_filled"] += 1
         cat = normalize_category(raw_cat)
         in_nyc = hood is not None
         doms = tuple(domains) if domains else domain_of.get((cat or "").lower(), ())
@@ -255,15 +284,17 @@ def run(*, dry_run: bool = False, limit: int | None = None,
         host = (bsnip or "").split("—")[0].strip()
         if host and (host[:1].isdigit() or host.lower() in (name or "").lower()):
             host = ""  # an address-only building "name" adds nothing
+        mat = (material or "").replace("_", " ").strip().lower()
         new_text = build_text(base_parts(text), raw_cat, cat, host, byear,
-                              bstyle or "", hood or "", boro or "", arch or "")
-        lex = " ".join(x for x in (name, cat, host, hood, boro) if x).lower()
+                              bstyle or "", hood or "", boro or "", arch or "", cls, mat)
+        lex = " ".join(x for x in (name, cat, host, hood, boro, cls, mat) if x).lower()
+        stats["with_class"] += bool(cls)
         stats["in_nyc"] += in_nyc
         stats["searchable"] += searchable
         stats["cat_changed"] += cat != raw_cat
         stats["text_changed"] += new_text != text
         out.append((fsq_id, in_nyc, boro, hood, searchable, cat, lex,
-                    new_text if new_text != text else None, was_searchable))
+                    new_text if new_text != text else None, was_searchable, byear, cls))
 
     log.info("stats: %s of %d", dict(stats), len(out))
     if args.dry_run:
@@ -290,9 +321,10 @@ def run(*, dry_run: bool = False, limit: int | None = None,
             psycopg2.extras.execute_values(
                 cur,
                 "UPDATE venues v SET in_nyc = d.n, borough = d.b, neighborhood = d.h,"
-                " searchable = d.s, category = d.c, lex_text = d.l"
-                " FROM (VALUES %s) AS d(id, n, b, h, s, c, l) WHERE v.fsq_id = d.id",
-                [o[:7] for o in out[i:i + BATCH]],
+                " searchable = d.s, category = d.c, lex_text = d.l,"
+                " building_year = coalesce(v.building_year, d.y::int), host_class = nullif(d.k, '')"
+                " FROM (VALUES %s) AS d(id, n, b, h, s, c, l, y, k) WHERE v.fsq_id = d.id",
+                [o[:7] + (o[9], o[10]) for o in out[i:i + BATCH]],
                 page_size=BATCH,
             )
             conn.commit()

@@ -18,6 +18,9 @@ Both finish by calling `scripts/enrich_venues.py`, which:
   (downloaded to `data/geo/` on first run)
 - normalises Overture category slugs (`cocktail_bar` becomes `Cocktail Bar`)
 - sets `searchable` (see "What search hides" below)
+- adds the lot's PLUTO building class (`host_class`: church, theater, factory,
+  store...) and fills a missing `building_year` from PLUTO, so "bar in a former
+  church" can match
 - rebuilds `lex_text` and `text`, then re-embeds only the rows whose text changed
 
 **If enrichment was skipped or failed** (network drop, killed run), run it yourself.
@@ -77,6 +80,44 @@ corpus uses. The rewrites are cached per query in `search_interpretation_cache`.
   rewrites for the 200 most-searched queries that lack a current-version row
   (see `_warm_search_rewrites` in `main.py`). No cron is needed. To force it by
   hand: `python -m scripts.warm_search_rewrites`.
+
+## How results are ordered
+
+On top of the fused relevance score, every hit gets a tier
+(`order_by_tier` / `tier_of` in `services/unified_search.py`):
+
+| tier | what | order |
+|---|---|---|
+| 0 | **the actual thing**: every distinctive word of a building or venue name (or, when the query also asks for a kind of place, its host building's name) is in the query. "seagram bar" -> The Bar | relevance, wherever it is |
+| 1 | **a real match**: covers every query word in its name, category, style, neighborhood, host building or (multi-word queries only) its report sentence; or the rewrite's category + style/era | **nearest first** |
+| 2 | everything else | relevance |
+
+- A word counts as a *name* only if the designation reports write it
+  capitalized >= 80% of the time (Chrysler 119/119, haunted 1/8), checked per
+  word and cached. Words the reports never use are presumed names.
+- With the named thing found, other hits stay tier 1 only if they carry the
+  name AND the query asked for a kind of place ("bars near grand central").
+- Fewer than 3 real matches inside the near-me radius re-runs the query
+  citywide. `area=true` ("search this area") never widens.
+
+## Checking a change: the eval set
+
+```
+python -m scripts.search_eval                          # production
+python -m scripts.search_eval --base http://localhost:8011
+```
+
+`tests/search_eval_cases.json` holds the queries that were once wrong and the
+property that makes each right. Exit code is the number of failures. Run it
+before and after any ranking change. Add a case whenever a bug is fixed.
+
+## Wikipedia
+
+`python -m scripts.ingest_wikipedia_geo` harvests NYC's geotagged Wikipedia
+articles (about 7.8k) into `layer_search_index` with `layer = 'wiki'`. Re-runs
+only re-embed changed extracts, so monthly is plenty. Hits come back as
+`type: "wiki"` with `url` and `summary`; the app opens them in the Wikipedia
+layer's own sheet.
 
 ## Debugging a bad result
 

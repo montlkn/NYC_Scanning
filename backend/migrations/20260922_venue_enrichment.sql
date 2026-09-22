@@ -42,3 +42,7 @@ ALTER TABLE venues
 -- leg re-scores its pool, so relaxed ordering costs nothing:
 --
 --   ALTER DATABASE railway SET hnsw.iterative_scan = 'relaxed_order';
+
+-- PLUTO building class of the venue's lot ("church", "theater", "factory"),
+-- written by scripts/enrich_venues.py. Lets "bar in a former church" match.
+ALTER TABLE venues ADD COLUMN IF NOT EXISTS host_class text;

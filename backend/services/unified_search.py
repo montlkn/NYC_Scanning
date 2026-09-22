@@ -2004,3 +2004,29 @@ def evidence_why(h: Dict[str, Any], q_lex: str) -> Optional[str]:
     if snippet and snippet.strip().lower() != (h.get("name") or "").strip().lower():
         return _excerpt(snippet, q_toks) or snippet[:WHY_MAX]
     return None
+
+
+def _name_words(name: Optional[str]) -> set:
+    return {w for w in re.split(r"[^a-z0-9]+", (name or "").lower()) if w and w != "the"}
+
+
+def dedupe_same_place(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """One place, one result.
+
+    The same place arrives more than once: the Seagram Building as a building
+    AND as an Overture "Landmark and Historical Building" venue; The Pool as
+    "The Pool" (FSQ) and "The Pool New York" (Overture). Both copies share a
+    BIN, and one name's words are a subset of the other's. The first (higher
+    ranked) copy is kept. dedupe_near_identical cannot see these: it needs
+    the names to be equal."""
+    kept: List[Dict[str, Any]] = []
+    seen: Dict[str, List[set]] = {}
+    for h in hits:
+        bin_ = h.get("bin")
+        words = _name_words(h.get("name"))
+        if bin_ and words:
+            if any(words <= w or w <= words for w in seen.get(bin_, [])):
+                continue
+            seen.setdefault(bin_, []).append(words)
+        kept.append(h)
+    return kept

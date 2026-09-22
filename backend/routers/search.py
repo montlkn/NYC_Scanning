@@ -78,6 +78,7 @@ from services.unified_search import (
     resolve_entity_mode,
     carries_name,
     evidence_why,
+    dedupe_same_place,
     token_coverage,
     llm_category_bonus,
     parse_interpretation,
@@ -1640,6 +1641,7 @@ async def _leg_layers(
                l.lore_status, l.photo_url,
                {fused} AS score, wl.lex AS lex_score
                {(', ' + haversine_l + ' AS dist_m') if geo else ''}
+               , CASE WHEN l.layer = 'wiki' THEN l.text END AS full_text
         FROM layer_search_index l
         JOIN pool USING (id)
         CROSS JOIN LATERAL (
@@ -1669,7 +1671,7 @@ async def _leg_layers(
         # before 20260710_index_enrich.sql / the updated embed_layers.py ran.
         lore_status = r[8] or (category if (category and category.lower() in _STATUS_TOKENS) else None)
         layer_val = r[1]
-        hit_type = layer_val if layer_val in ("lore", "plaque", "contribution") else "lore"
+        hit_type = layer_val if layer_val in ("lore", "plaque", "contribution", "wiki") else "lore"
         hits.append({
             "type": hit_type,
             "id": r[0],
@@ -1691,6 +1693,9 @@ async def _leg_layers(
             "dist_m": round(float(r[12]), 1) if geo and len(r) > 12 and r[12] is not None else None,
             "photo_url": r[9],
             "lore_status": lore_status,
+            # The article extract, minus the "Title. " prefix it was embedded with.
+            "summary": ((r._mapping.get("full_text") or "")[len(r[2] or "") + 2:] or None)
+                       if hit_type == "wiki" else None,
         })
     return hits
 
@@ -1744,7 +1749,7 @@ async def _leg_layers_vector_only(
         category = r[8]
         lore_status = category if (category and category.lower() in _STATUS_TOKENS) else None
         layer_val = r[1]
-        hit_type = layer_val if layer_val in ("lore", "plaque", "contribution") else "lore"
+        hit_type = layer_val if layer_val in ("lore", "plaque", "contribution", "wiki") else "lore"
         out.append({
             "type": hit_type, "id": r[0], "bin": None, "bbl": None, "name": r[2], "snippet": r[3],
             "year": r[7], "style": None, "category": category, "landmark": None,
@@ -2421,6 +2426,11 @@ async def search_unified(
             "bbl": h.get("bbl"),
             "lore_status": h.get("lore_status"),
             "snippet": h.get("snippet"),
+            # Wikipedia hits carry their article link so the client can open
+            # the same sheet its Wikipedia map layer uses.
+            **({"url": "https://en.wikipedia.org/wiki/" + (h.get("name") or "").replace(" ", "_"),
+                "summary": h.get("summary")}
+               if h.get("type") == "wiki" else {}),
             "_src": h,
             **({"_debug": {"rrf": round(score * RRF_SCALE, 4), **dbg,
                            "legs": sorted(k for k, lst in legs.items()
@@ -2434,7 +2444,7 @@ async def search_unified(
     # across adjacent BINs of one development — same name, <150m apart),
     # THEN truncate to `limit`.
     all_hits.sort(key=lambda h: h["score"], reverse=True)
-    deduped = dedupe_near_identical(all_hits)
+    deduped = dedupe_same_place(dedupe_near_identical(all_hits))
     # Diversity BEFORE the limit, or the cap has nothing to promote into the
     # space it frees: three adjacent row houses sharing one designation report
     # otherwise fill the whole visible list ("haunted buildings" returned 55,
@@ -2461,7 +2471,10 @@ async def search_unified(
     if debug:
         for h, t in zip(diversified, tiers):
             h["_debug"]["tier"] = t
-    ordered = order_by_tier(diversified, tiers, lat is not None and lng is not None)
+    # An address names one place: its matches rank by relevance (the house
+    # number bonus), not by which copy of it is a few metres closer.
+    ordered = order_by_tier(diversified, tiers,
+                            lat is not None and lng is not None and intent != "address")
     tier_by_id = {id(h): t for h, t in zip(diversified, tiers)}
     matched = [h for h in ordered if tier_by_id[id(h)] < 2]
     rest = [h for h in ordered if tier_by_id[id(h)] == 2]
