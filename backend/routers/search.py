@@ -29,6 +29,7 @@ from services.unified_search import (
     facet_adjustments,
     aesthetic_match_bonus,
     layer_title_bonus,
+    apply_diversity_cap,
     fuzzy_name_bonus,
     LORE_SIM_FLOOR,
     LORE_LEX_FLOOR,
@@ -2019,9 +2020,15 @@ async def search_unified(
     # THEN truncate to `limit`.
     all_hits.sort(key=lambda h: h["score"], reverse=True)
     deduped = dedupe_near_identical(all_hits)
+    # Diversity BEFORE the limit, or the cap has nothing to promote into the
+    # space it frees: three adjacent row houses sharing one designation report
+    # otherwise fill the whole visible list ("haunted buildings" returned 55,
+    # 53 and 47 West 28th Street). Order-preserving -- nothing is dropped,
+    # the surplus is pushed below the alternatives.
+    diversified = apply_diversity_cap(deduped)
     # Floor BEFORE the limit: `limit` is a ceiling on how many good results to
     # show, not a quota to fill with noise.
-    hits = apply_relevance_floor(deduped)[:limit]
+    hits = apply_relevance_floor(diversified)[:limit]
 
     header = build_header(hits, intent)
     facets = build_facets({

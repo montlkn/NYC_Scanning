@@ -943,6 +943,62 @@ def facet_adjustments(q_lex: str, hits: Sequence[dict]) -> List[float]:
 #
 # So intent routing is left alone and the evidence is used directly instead:
 # the query's words are in the entry's title, which is not a guess.
+# Diversity cap: at most this many hits from the same street.
+#
+# "haunted buildings" returned 55, 53 and 47 West 28th Street -- three
+# adjacent row houses that share one designation report, so they carry nearly
+# identical text, match any query equally, and the ranker has no reason to
+# prefer one over another. The whole result list becomes one terrace.
+#
+# dedupe_near_identical does not catch this: the names and addresses differ,
+# only the PROSE is shared. And it is worst exactly when results are thin,
+# which is when the user most needs variety.
+#
+# Applied after ranking, so the best of each street keeps its position and the
+# rest are pushed below everything else rather than dropped -- a query that
+# genuinely is about one block still returns the block, just after the
+# alternatives.
+MAX_PER_STREET = 2
+
+_HOUSE_NUMBER_RE = re.compile(r"^\s*[\d\-]+\s+")
+
+
+def _street_key(name: Optional[str], snippet: Optional[str]) -> Optional[str]:
+    """Normalized street for grouping: '55 West 28th Street Building' and
+    '47 West 28th Street' both key to 'west 28th street'."""
+    for raw in (name, snippet):
+        if not raw:
+            continue
+        t = raw.split("—")[0].split("(")[0].strip().lower()
+        t = _HOUSE_NUMBER_RE.sub("", t)
+        t = re.sub(r"\b(building|house|houses|residence|apartments?)\b", "", t)
+        t = " ".join(t.split())
+        if len(t) >= 6:
+            return t
+    return None
+
+
+def apply_diversity_cap(hits: Sequence[dict],
+                        max_per_street: int = MAX_PER_STREET) -> List[dict]:
+    """Demote hits beyond `max_per_street` from the same street.
+
+    Order-preserving within each tier, so this only ever reorders -- nothing
+    is lost, and a caller that slices to `limit` sees variety first.
+    """
+    kept: List[dict] = []
+    demoted: List[dict] = []
+    seen: Dict[str, int] = {}
+    for h in hits:
+        key = _street_key(h.get("name"), h.get("snippet"))
+        if key is None:
+            kept.append(h)
+            continue
+        n = seen.get(key, 0) + 1
+        seen[key] = n
+        (kept if n <= max_per_street else demoted).append(h)
+    return kept + demoted
+
+
 W_LAYER_TITLE_MATCH = 0.28   # just under W_EXACT_NAME (0.30)
 
 
