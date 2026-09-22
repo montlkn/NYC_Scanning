@@ -152,3 +152,17 @@ class TestOvertureFilterIsTokenAnchored:
         for slug in ("caribbean_restaurant", "spanish_restaurant", "cocktail_bar", "pub",
                      "delicatessen", "farmers_market", "church_cathedral", "cemetery", "art_supply_store"):
             assert wanted(slug), slug
+
+
+def test_llm_style_bonus_matches_the_rows_own_style():
+    from services.unified_search import W_LLM_STYLE, llm_style_bonus
+    interp = {"styles": ["international style", "brutalist"]}
+    assert llm_style_bonus(interp, {"style": "International Style"}) == W_LLM_STYLE
+    assert llm_style_bonus(interp, {"style": "modern brutalist"}) == W_LLM_STYLE
+    assert llm_style_bonus(interp, {"style": "italianate"}) == 0.0
+    assert llm_style_bonus(interp, {"style": None}) == 0.0
+
+
+def test_web_domains_are_not_venue_names():
+    assert not is_searchable("Elove.com", "Bar", (), True)
+    assert is_searchable("Dante NYC", "Bar", (), True)

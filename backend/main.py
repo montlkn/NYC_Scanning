@@ -158,6 +158,50 @@ async def lifespan(app: FastAPI):
 
     asyncio.create_task(_install_vocab())
 
+    # Re-fill the search rewrite cache after a deploy. Rows are versioned by
+    # prompt (INTERP_VERSION), so a prompt change orphans every cached
+    # rewrite and the next person to type each query would wait ~2.5s for
+    # the model. This re-asks the model for the most-searched queries that
+    # lack a current row. LLM calls only, no searches; one per second; the
+    # advisory lock keeps multiple workers from doing it twice. On a deploy
+    # that changed nothing it finds nothing to do and costs one query.
+    async def _warm_search_rewrites():
+        try:
+            await asyncio.sleep(60)  # let the deploy settle and take traffic first
+            from sqlalchemy import text as _sql_text
+            from models.search_session import get_search_db
+            from routers.search import _interpret_and_cache
+            from services.openai_text import is_configured
+            from services.unified_search import INTERP_VERSION
+            if not is_configured():
+                return
+            async with get_search_db() as db:
+                if db is None:
+                    return
+                got = (await db.execute(_sql_text("SELECT pg_try_advisory_lock(772201)"))).scalar()
+                if not got:
+                    return
+                try:
+                    rows = (await db.execute(_sql_text("""
+                        SELECT lower(trim(l.query)) q
+                          FROM search_query_log l
+                          LEFT JOIN search_interpretation_cache c
+                                 ON c.query = lower(trim(l.query))
+                                AND (c.interpretation->>'v')::int = :v
+                         WHERE length(trim(l.query)) >= 3 AND c.query IS NULL
+                         GROUP BY 1 ORDER BY count(*) DESC LIMIT 200
+                    """), {"v": INTERP_VERSION})).fetchall()
+                    for (q,) in rows:
+                        await _interpret_and_cache(q)
+                        await asyncio.sleep(1.0)
+                    logger.info(f"[search] warmed {len(rows)} rewrites for prompt v{INTERP_VERSION}")
+                finally:
+                    await db.execute(_sql_text("SELECT pg_advisory_unlock(772201)"))
+        except Exception as e:
+            logger.warning(f"[search] rewrite warm-up skipped: {e}")
+
+    asyncio.create_task(_warm_search_rewrites())
+
     yield
 
     # Shutdown

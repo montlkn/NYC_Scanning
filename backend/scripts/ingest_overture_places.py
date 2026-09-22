@@ -295,7 +295,10 @@ def main() -> int:
             log.info("  %-10s %7d", src, n)
     conn.close()
     log.info("done in %.0fs", time.time() - t0)
-    return 0
+    # New rows arrive with no NYC test, no neighborhood and raw category slugs,
+    # and search shows NULL-flagged rows. Enrich before anyone searches them.
+    from scripts.enrich_venues import run as enrich_venues
+    return enrich_venues()
 
 
 if __name__ == "__main__":

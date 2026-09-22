@@ -73,6 +73,9 @@ NON_PLACE_CATEGORIES = frozenset({"structure", "neighborhood"})
 # all sit in the Seagram Building as "restaurant".
 _LEGAL_ENTITY_RE = re.compile(r"[\s,](llc|l\.l\.c|inc|corp|corporation|ltd|lp|pllc)\.?$", re.I)
 _HAS_LETTER_RE = re.compile(r"[^\W\d_]", re.UNICODE)
+# A web domain is not a venue name: "Elove.com" was filed as a Bar inside the
+# Graybar Building and led "art deco bar".
+_DOMAIN_NAME_RE = re.compile(r"^\S+\.(com|net|org|io|co|nyc|biz|info|us)$", re.I)
 _SMALL_WORDS = frozenset({"and", "of", "or", "the", "for", "a", "an", "to", "in"})
 
 
@@ -106,7 +109,7 @@ def is_searchable(name: str | None, category: str | None, domains: tuple, in_nyc
         return False
     if nl == cl or cl.endswith(" " + nl):
         return False  # named for its own category: "Restaurant" (Mexican Restaurant)
-    if _LEGAL_ENTITY_RE.search(n):
+    if _LEGAL_ENTITY_RE.search(n) or _DOMAIN_NAME_RE.match(n):
         return False
     slug = _slug(c)
     # One destination rule for both sources: the Overture ingest's errand
@@ -201,7 +204,16 @@ def main() -> int:
     ap.add_argument("--no-embed", action="store_true", help="attributes + lex_text only")
     ap.add_argument("--flags-only", action="store_true",
                     help="rewrite only `searchable`, only where it changed (safe beside a running embed)")
-    args = ap.parse_args()
+    a = ap.parse_args()
+    return run(dry_run=a.dry_run, limit=a.limit, no_embed=a.no_embed, flags_only=a.flags_only)
+
+
+def run(*, dry_run: bool = False, limit: int | None = None,
+        no_embed: bool = False, flags_only: bool = False) -> int:
+    """Called by the ingest scripts when they finish, so a new import can't
+    reach search un-enriched: NJ rows visible, no neighborhood, raw Overture
+    slugs. See docs/SEARCH_RUNBOOK.md."""
+    args = argparse.Namespace(dry_run=dry_run, limit=limit, no_embed=no_embed, flags_only=flags_only)
     t0 = time.time()
 
     conn = psycopg2.connect(os.environ["SEARCH_DB_URL"])

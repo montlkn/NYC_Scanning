@@ -1522,7 +1522,7 @@ def build_facets(available: Dict[str, List[Any]]) -> List[Dict[str, Any]]:
 # candidates but cannot outrank what was literally asked for.
 # ---------------------------------------------------------------------------
 
-INTERP_VERSION = 3
+INTERP_VERSION = 4
 MAX_EXPANSION_QUERIES = 3
 W_EXPANSION_LEG = 1.0        # a rewrite leg counts as much as a corpus leg...
 # ...and the user's own legs are halved when rewrites run. Rewrites only run
@@ -1581,6 +1581,7 @@ def parse_interpretation(raw: Optional[str], q: str) -> Optional[Dict[str, Any]]
         "neighborhoods": _str_list(d.get("neighborhoods"), 4, 60),
         "boroughs": [b for b in _str_list(d.get("boroughs"), 5, 20)
                      if b.lower() in _BOROUGHS],
+        "styles": _str_list(d.get("styles"), 6, 40),
     }
 
 
@@ -1634,6 +1635,30 @@ def llm_category_bonus(interp: Optional[Dict[str, Any]], hit: Dict[str, Any]) ->
         return 0.0
     wanted = {" ".join(_tokens(c)) for c in (interp.get("categories") or [])}
     return W_LLM_CATEGORY if cat in wanted else 0.0
+
+
+W_LLM_STYLE = 0.08  # ~5 rank steps: the host building's style is the one meant
+
+
+def llm_style_bonus(interp: Optional[Dict[str, Any]], hit: Dict[str, Any]) -> float:
+    """A building, or a venue's HOST building, in one of the architectural
+    styles the model says the query implies.
+
+    "modernist bars in midtown" returned wine bars in italianate walk-ups:
+    "modernist" is not a style label in the data, so nothing tied the word to
+    "international style", "brutalist" or "mid-century modern", which are.
+    The model supplies that bridge; the match is on the row's own style
+    column, so it cannot reward a style the row does not have."""
+    if not interp:
+        return 0.0
+    style = " ".join(_tokens((hit.get("style") or "").replace("-", " ")))
+    if not style:
+        return 0.0
+    for want in interp.get("styles") or []:
+        w = " ".join(_tokens(want.replace("-", " ")))
+        if w and (w in style or style in w):
+            return W_LLM_STYLE
+    return 0.0
 
 
 DIRECT_COVERAGE_HITS = 5

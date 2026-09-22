@@ -545,6 +545,12 @@ def main():
 
     logger.info(f"✅ done — {total} venues seeded ({joined} with building provenance)")
 
+    # The upsert above overwrites `text`/`embedding`, reverting enrichment on
+    # every re-seeded row, and new rows have no NYC test or neighborhood yet.
+    # Enrich before anyone searches them. See docs/SEARCH_RUNBOOK.md.
+    from scripts.enrich_venues import run as enrich_venues
+    enrich_venues()
+
 
 if __name__ == "__main__":
     main()

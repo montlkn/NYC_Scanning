@@ -68,6 +68,7 @@ from services.unified_search import (
     W_EXPANSION_LEG,
     W_ORIGINAL_WHEN_EXPANDED,
     has_direct_match,
+    llm_style_bonus,
     token_coverage,
     llm_category_bonus,
     parse_interpretation,
@@ -1675,18 +1676,19 @@ The database holds three things:
 3. Business listings: a venue name, a category such as "Cocktail Bar", "Wine Bar", "Speakeasy", "Coffee Shop", "Art Gallery", and a neighborhood.
 
 Reply with JSON only, no prose, no code fences:
-{"queries": [...], "categories": [...], "neighborhoods": [...], "boroughs": [...]}
+{"queries": [...], "categories": [...], "neighborhoods": [...], "boroughs": [...], "styles": [...]}
 
 queries: 1 to 3 phrases of 1 to 5 words, written the way the DATABASE describes things, never the way people search. Turn moods into concrete things a report, a history or a listing would literally say. When the query is vague, give each phrase a DIFFERENT angle (architecture, history, a place to go) rather than three wordings of one idea. When the query asks for a kind of place (a bar, a cafe, a church), EVERY phrase names that kind of place. Use distinctive words only: never "house", "building", "place", "spot", "site", "location", "NYC", "New York", "near me", "best", "ideas", "things to do". If the query names a specific building, business, person or event, return that exact name as the only phrase.
 categories: listing categories, only when the query asks for a kind of place to go. Otherwise [].
 neighborhoods: NYC neighborhoods the query names or clearly implies. Otherwise [].
 boroughs: any of Manhattan, Brooklyn, Queens, Bronx, Staten Island the query names. Otherwise [].
+styles: architectural style names, as a designation report writes them, that the query names or implies ("modernist" -> "international style", "mid-century modern", "brutalist", "modern"). Otherwise [].
 
 Examples:
-"creepy places" -> {"queries":["cemetery mausoleum","haunted ghost story","murder"],"categories":[],"neighborhoods":[],"boroughs":[]}
-"brutalist cafes in soho" -> {"queries":["cafe brutalist concrete","coffee shop modern building"],"categories":["Coffee Shop","Cafe","Café"],"neighborhoods":["SoHo"],"boroughs":[]}
-"woolworth bar" -> {"queries":["Woolworth Building"],"categories":["Cocktail Bar","Bar","Lounge"],"neighborhoods":[],"boroughs":[]}
-"date night queens" -> {"queries":["candlelit restaurant","wine bar garden"],"categories":["Restaurant","Wine Bar","Italian Restaurant","French Restaurant"],"neighborhoods":[],"boroughs":["Queens"]}"""
+"creepy places" -> {"queries":["cemetery mausoleum","haunted ghost story","murder"],"categories":[],"neighborhoods":[],"boroughs":[],"styles":["gothic revival"]}
+"brutalist cafes in soho" -> {"queries":["cafe brutalist concrete","coffee shop modern building"],"categories":["Coffee Shop","Cafe","Café"],"neighborhoods":["SoHo"],"boroughs":[],"styles":["brutalist","modern"]}
+"woolworth bar" -> {"queries":["Woolworth Building"],"categories":["Cocktail Bar","Bar","Lounge"],"neighborhoods":[],"boroughs":[],"styles":[]}
+"date night queens" -> {"queries":["candlelit restaurant","wine bar garden"],"categories":["Restaurant","Wine Bar","Italian Restaurant","French Restaurant"],"neighborhoods":[],"boroughs":["Queens"],"styles":[]}"""
 
 
 async def _get_cached_interpretation(q: str) -> Optional[dict]:
@@ -1752,7 +1754,7 @@ async def _interpret_and_cache(q: str) -> Optional[dict]:
             # answer is ~60 tokens; 300 is headroom, not a target.
             max_tokens=300,
             timeout_s=10.0,
-            cache_key="jink-search-interp-v3",
+            cache_key="jink-search-interp-v4",
         )
         interp = parse_interpretation(raw, q)
         if interp is None:
@@ -2108,6 +2110,13 @@ async def search_unified(
         expansion_queries = list(interp.get("queries") or [])[:MAX_EXPANSION_QUERIES]
         if expansion_queries:
             expanded = await asyncio.gather(*[_expand(p) for p in expansion_queries], return_exceptions=True)
+    # The model naming venue categories means the query asks for a PLACE TO
+    # GO, whatever the intent router guessed: "romantic dinner brooklyn"
+    # routes as `name` (the fallback) and weighted lore and buildings equal
+    # to restaurants, so a Botanic Garden light show outranked them.
+    place_seeking = bool(interp and interp.get("categories")) and intent not in ("poi", "address")
+    if place_seeking:
+        weights.update(corpus_weights("poi"))
     if expansion_queries and expanded:
         for corpus in ("buildings", "venues", "layers"):
             weights[corpus] = weights.get(corpus, 1.0) * W_ORIGINAL_WHEN_EXPANDED
@@ -2123,7 +2132,8 @@ async def search_unified(
                 # `name` is the classifier's fallback, not a real reading, and
                 # it weights lore at 0.6 -- exactly where "haunted ghost story"
                 # for "spooky spots" belongs -- so those use neutral weights.
-                basis = intent if intent in ("poi", "style", "architect", "lore", "event") else "prose"
+                basis = ("poi" if place_seeking else
+                         intent if intent in ("poi", "style", "architect", "lore", "event") else "prose")
                 weights[leg] = corpus_weights(basis).get(corpus, 1.0) * W_EXPANSION_LEG
                 legs[leg] = [RankedHit(corpus, h["id"], i + 1, h) for i, h in enumerate(hits) if h.get("id")]
         logger.info(f"[unified] expanded {q!r} -> {expansion_queries} "
@@ -2250,6 +2260,7 @@ async def search_unified(
         # Applied whenever an interpretation exists, including on a direct
         # match, because "bars in midtown" names a place either way.
         nudged += _t("llm_category_bonus", llm_category_bonus(interp, h))
+        nudged += _t("llm_style_bonus", llm_style_bonus(interp, h))
         nudged += _t("place_adjustment", place_adjustment(place_req, h, neighborhood_vocab()))
         why = build_why(
             matched_field=h.get("matched_field"),
