@@ -357,20 +357,44 @@ def building_style(snippet) -> str:
     return style if style.lower() not in ("", "unknown", "none", "no style") else ""
 
 
-def build_text(name, cat_leaf, address, byear, style="") -> str:
+def build_text(name, cat_leaf, address, byear, style="", building_name="",
+               neighborhood="", architect="") -> str:
     parts = [name]
     if cat_leaf:
         parts.append(cat_leaf)
     if address:
         parts.append(address)
-    # Fold the host building's architectural style into the embedding so style
-    # queries ("art deco bars") can match the venue, not just the building.
+    # Fold the host building's NAME in, not just its year and style.
+    #
+    # Without it "seagram bar" finds nothing: The Pool and The Lobster Club
+    # are in the corpus, correctly joined to the Seagram Building's BIN, and
+    # embedded as "The Pool. Seafood Restaurant. in a 1955 international style
+    # building" -- a description with no "Seagram" in it. The building
+    # provenance is the whole reason these rows carry a BIN, and the name is
+    # the part of it people actually search by.
+    host = (building_name or "").strip()
+    if host and host.lower() not in (name or "").lower():
+        parts.append(f"in the {host}")
     if byear and style:
         parts.append(f"in a {byear} {style} building")
     elif byear:
         parts.append(f"in a {byear} building")
     elif style:
         parts.append(f"in a {style} building")
+    # Neighborhood reaches 33,400 of the 33,809 building-joined venues --
+    # three times the coverage of the building NAME, because most buildings
+    # have no name, only an address. It is also how people actually scope a
+    # search: "modernist bars in midtown" could not match anything before,
+    # since no venue's text said midtown.
+    hood = (neighborhood or "").strip()
+    if hood:
+        parts.append(f"in {hood}")
+    # The architect reaches 24,614 of them, and turns the building's
+    # provenance into something a venue query can reach: "bar in a Mies
+    # building".
+    arch = (architect or "").strip()
+    if arch and arch.lower() not in ("not determined", "unknown"):
+        parts.append(f"designed by {arch}")
     return ". ".join(parts)
 
 

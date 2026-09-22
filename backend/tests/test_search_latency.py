@@ -70,23 +70,32 @@ class TestLexicalPoolsUseAnIndex:
             "idx_bli_trgm and measured 3.81s."
         )
 
-    def test_bare_word_similarity_is_the_slow_form(self, cur):
-        """Documents WHY the operator is there, so removing it fails loudly."""
-        fast = _exec_ms(
-            cur,
+    def test_the_operator_form_plans_an_index_scan(self, cur):
+        """Documents WHY the `<%` operator is there, so removing it fails loudly.
+
+        This used to compare the two forms' timings, and was flaky: a warm
+        cache can make the slow form fast on a repeat run. The property that
+        matters is structural -- the operator can use the trigram index and
+        the bare function call cannot -- so assert the PLAN, which does not
+        depend on what happens to be cached."""
+        def plan(sql, params):
+            cur.execute("EXPLAIN " + sql, params)
+            return "\n".join(r[0] for r in cur.fetchall())
+
+        op = plan(
             "SELECT bin FROM building_lore_index WHERE lower(%s) <%% lower(text) "
             "AND word_similarity(lower(%s), lower(text)) > 0.6 LIMIT 72",
             ("mansard", "mansard"),
         )
-        slow = _exec_ms(
-            cur,
+        bare = plan(
             "SELECT bin FROM building_lore_index "
             "WHERE word_similarity(lower(%s), lower(text)) > 0.6 LIMIT 72",
             ("mansard",),
         )
-        assert fast < slow, (
-            "the <% operator is supposed to be faster than the bare function; "
-            "if this flips, the index or the GUC changed"
+        assert "Index" in op, f"the <% form no longer uses an index:\n{op}"
+        assert "Index" not in bare, (
+            "the bare word_similarity() form now plans an index scan, so the "
+            f"`<%` operator may no longer be needed:\n{bare}"
         )
 
 

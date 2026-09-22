@@ -62,6 +62,16 @@ from services.unified_search import (
     reciprocal_rank_fusion,
     RRF_SCALE,
     W_LEG_FAME,
+    INTERP_VERSION,
+    INTERP_WAIT_S,
+    MAX_EXPANSION_QUERIES,
+    W_EXPANSION_LEG,
+    W_ORIGINAL_WHEN_EXPANDED,
+    has_direct_match,
+    token_coverage,
+    llm_category_bonus,
+    parse_interpretation,
+    place_adjustment,
 )
 
 router = APIRouter(prefix="/search", tags=["search"])
@@ -404,6 +414,8 @@ async def venues_nearby(
         "lng IS NOT NULL",
         "lower(category) IN :cats",
         f"{haversine} <= :radius_m",
+        # Hide NJ rows and non-places; see scripts/enrich_venues.py.
+        "searchable IS NOT FALSE",
     ]
     if require_building:
         where.append("bin IS NOT NULL")
@@ -463,7 +475,7 @@ async def venue_categories(request: Request) -> List[dict]:
     sql = """
         SELECT category, count(*) AS n
         FROM venues
-        WHERE category IS NOT NULL
+        WHERE category IS NOT NULL AND searchable IS NOT FALSE
         GROUP BY category
         ORDER BY n DESC
     """
@@ -501,7 +513,7 @@ async def search_venues(
         return []
 
     params: dict = {"qvec": _vec_literal(qvec), "limit": limit}
-    filters: List[str] = []
+    filters: List[str] = ["searchable IS NOT FALSE"]
 
     # Era filter applies to the HOST BUILDING's year — "original midcentury bar".
     if year_from is not None:
@@ -591,7 +603,7 @@ async def search_layers(
         return []
 
     params: dict = {"qvec": _vec_literal(qvec), "limit": limit}
-    filters: List[str] = []
+    filters: List[str] = ["in_nyc IS NOT FALSE"]
 
     if layer:
         filters.append("layer = :layer")
@@ -710,6 +722,51 @@ def material_vocab() -> set:
             "(SELECT DISTINCT material_text AS v FROM building_search_index "
             " WHERE material_text IS NOT NULL)")
     return _MATERIAL_VOCAB
+
+
+_HOOD_PHRASES: Optional[set] = None
+_BOROUGH_NAMES = ("manhattan", "brooklyn", "queens", "bronx", "staten island")
+
+
+def _neighborhood_phrases() -> set:
+    """Whole neighborhood names a person would type, derived from the NTA
+    names in the index: "Midtown South-Flatiron-Union Square" yields
+    "midtown south", "flatiron", "union square". Parenthesised qualifiers
+    ("Upper West Side (Central)") are dropped.
+
+    Phrases, not tokens: the token vocabulary holds "club", "park", "east"
+    and "city", and treating those as places would turn "night club near me"
+    into a citywide search."""
+    global _HOOD_PHRASES
+    if _HOOD_PHRASES is None:
+        import psycopg
+        from models.config import get_settings
+        phrases: set = set()
+        url = get_settings().search_db_url
+        try:
+            if url:
+                with psycopg.connect(url, connect_timeout=5) as c, c.cursor() as cur:
+                    cur.execute("SELECT DISTINCT neighborhood FROM building_search_index WHERE neighborhood IS NOT NULL")
+                    for (n,) in cur.fetchall():
+                        n = re.sub(r"\([^)]*\)", "", n)
+                        for part in n.split("-"):
+                            part = re.sub(r"\s+", " ", part.strip().lower().replace("'", ""))
+                            if len(part) >= 4:
+                                phrases.add(part)
+        except Exception as e:
+            logger.warning(f"[search] neighborhood phrase load failed ({e})")
+        _HOOD_PHRASES = phrases
+    return _HOOD_PHRASES
+
+
+def _query_places(q: str) -> tuple:
+    """(neighborhood phrases, boroughs) the query names, whole-word."""
+    ql = " " + re.sub(r"[^a-z0-9]+", " ", q.lower().replace("'", "")) + " "
+    hoods = [p for p in _neighborhood_phrases() if f" {p} " in ql]
+    # "upper west side" also contains "west side"; keep the longest.
+    hoods = [p for p in hoods if not any(p != o and p in o for o in hoods)]
+    boros = [b for b in _BOROUGH_NAMES if f" {b} " in ql]
+    return hoods, boros
 
 
 def neighborhood_vocab() -> set:
@@ -1195,16 +1252,22 @@ async def _leg_venues(
     year_from: Optional[int], year_to: Optional[int],
     soft_radius: bool = False,
 ) -> List[dict]:
-    """Venues leg. Trigram fusion mirrors the buildings CTE, reading migration
-    20260710_unified_search.sql's GIN index on name||snippet. If that migration
-    hasn't run yet, word_similarity()/similarity() still work (pg_trgm was
-    already installed by 20260619) just without the index — slower, not
-    broken — so no fallback branch is needed here.
+    """Venues leg: vector pool + trigram pool over `lex_text`, fused.
+
+    Only `searchable` rows (see scripts/enrich_venues.py): not in New Jersey,
+    not an FSQ "Structure" filed under an address, not a registry LLC. Before
+    that filter, "seagram bar" returned Korean bars in Fort Lee and "art deco
+    bar" led with Elove.com.
+
+    The trigram pool reads `lex_text` (name, category, host building,
+    neighborhood, borough), not name||snippet. The snippet is "{name} —
+    {category}", so the host building was invisible to it: The Bar sits in the
+    Seagram Building and "seagram bar" could not reach it lexically.
 
     soft_radius: see _leg_buildings' docstring — radius_m skips the WHERE
     filter and dist_m becomes a scoring-only signal instead."""
     params: dict = {"qvec": qvec_lit, "limit": limit, "q_lex": q_lex}
-    filters: List[str] = []
+    filters: List[str] = ["searchable IS NOT FALSE"]
     if year_from is not None:
         filters.append("building_year >= :year_from")
         params["year_from"] = year_from
@@ -1225,41 +1288,40 @@ async def _leg_venues(
             params["radius_m"] = radius_m
             filters.append(f"lat IS NOT NULL AND lng IS NOT NULL AND {haversine} <= :radius_m")
 
-    where = ("WHERE " + " AND ".join(filters)) if filters else ""
+    where = "WHERE " + " AND ".join(filters)
     pool = min(max(limit * 4, 40), 200)
     params["pool"] = pool
     params["lex_floor"] = LEX_FLOOR
     fused = "(0.7 * (1 - (v.embedding <=> CAST(:qvec AS vector))) + 0.3 * wl.lex)"
-    haversine_v = ""
+    dist_sql = ""
     if geo:
-        haversine_v = (
-            "6371000 * acos(GREATEST(-1, LEAST(1, "
+        dist_sql = (
+            ", 6371000 * acos(GREATEST(-1, LEAST(1, "
             "cos(radians(:lat)) * cos(radians(v.lat)) * cos(radians(v.lng) - radians(:lng)) "
-            "+ sin(radians(:lat)) * sin(radians(v.lat)))))"
+            "+ sin(radians(:lat)) * sin(radians(v.lat))))) AS dist_m"
         )
 
-    # Word-boundary guard — see _word_boundary_pattern's docstring and
-    # _leg_buildings' identical pattern. Venues has no separate fuzzy/typo
-    # pool, so this is the ONLY trigram recall path here; skip the guard
-    # entirely (None) when q_lex has no token long enough to build one.
+    # Word-boundary guard — see _word_boundary_pattern's docstring. Venues has
+    # no separate fuzzy/typo pool, so this is the ONLY trigram recall path;
+    # skipped entirely when q_lex has no token long enough to build one. The
+    # regex is also what lets the GIN trigram index on lex_text drive the pool.
     word_boundary = _word_boundary_pattern(q_lex)
     lex_word_boundary_clause = ""
     if word_boundary:
         params["lex_wb"] = word_boundary
-        lex_word_boundary_clause = "AND lower(name || ' ' || coalesce(snippet, '')) ~ :lex_wb"
+        lex_word_boundary_clause = "AND lex_text ~ :lex_wb"
 
-    def _sql(labels_col: bool) -> str:
-      return f"""
+    sql = f"""
         WITH vec_pool AS (
             SELECT fsq_id FROM venues {where}
             ORDER BY embedding <=> CAST(:qvec AS vector) LIMIT :pool
         ),
         lex_pool AS (
             SELECT fsq_id FROM venues
-            {where + (' AND ' if where else 'WHERE ')}
-            word_similarity(lower(:q_lex), lower(name || ' ' || coalesce(snippet, ''))) > :lex_floor
+            {where}
+            AND word_similarity(lower(:q_lex), lex_text) > :lex_floor
             {lex_word_boundary_clause}
-            ORDER BY word_similarity(lower(:q_lex), lower(name || ' ' || coalesce(snippet, ''))) DESC
+            ORDER BY word_similarity(lower(:q_lex), lex_text) DESC
             LIMIT :pool
         ),
         pool AS (
@@ -1267,79 +1329,53 @@ async def _leg_venues(
         )
         SELECT v.fsq_id, v.name, v.category, v.snippet, v.lat, v.lng,
                v.bin, v.bbl, v.building_year, v.building_style, v.photo_url,
+               v.category_labels, v.neighborhood, v.borough,
                {fused} AS score, wl.lex AS lex_score
-               {(', v.category_labels') if labels_col else ''}
-               {(', ' + haversine_v + ' AS dist_m') if geo else ''}
+               {dist_sql}
         FROM venues v
         JOIN pool USING (fsq_id)
         CROSS JOIN LATERAL (
-            SELECT word_similarity(lower(:q_lex), lower(v.name || ' ' || coalesce(v.snippet, ''))) AS lex
+            SELECT word_similarity(lower(:q_lex), coalesce(v.lex_text, lower(v.name))) AS lex
         ) wl
         ORDER BY score DESC
         LIMIT :limit
     """
-
-    # category_labels only exists after 20260731_venues_category_labels.sql.
-    # Probe for it exactly like the buildings leg probes its enriched columns —
-    # WITHOUT this, an unmigrated DB would fail the whole hybrid query and
-    # silently degrade every POI search to pure-vector.
-    labels_col = True
     try:
         async with get_search_db() as db:
             if db is None:
                 return []
-            result = await db.execute(text(_sql(True)), params)
-            rows = result.fetchall()
-    except Exception:
-        labels_col = False
-        try:
-            async with get_search_db() as db:
-                if db is None:
-                    return []
-                result = await db.execute(text(_sql(False)), params)
-                rows = result.fetchall()
-        except Exception as e:
-            # Covers BOTH the pre-existing trigram-migration-missing case AND a
-            # not-yet-migrated venues.photo_url column (20260710_index_enrich.sql)
-            # — either way, graceful degradation to the pure-vector leg (no
-            # photo_url, no trigram fusion) rather than a 500.
-            logger.warning(f"[unified/venues] hybrid query failed ({e}); falling back to pure vector")
-            return await _leg_venues_vector_only(qvec_lit, limit, lat, lng, radius_m, year_from, year_to, soft_radius=soft_radius)
-
-    # Column layout: 13 fixed (0-12), then category_labels when present, then
-    # dist_m when a location was supplied. Indices shift with labels_col.
-    labels_idx = 13 if labels_col else None
-    dist_idx = 14 if labels_col else 13
+            result = await db.execute(text(sql), params)
+            rows = [r._mapping for r in result.fetchall()]
+    except Exception as e:
+        logger.warning(f"[unified/venues] hybrid query failed ({e}); falling back to pure vector")
+        return await _leg_venues_vector_only(qvec_lit, limit, lat, lng, radius_m, year_from, year_to, soft_radius=soft_radius)
 
     hits = []
     for r in rows:
         hits.append({
             "type": "venue",
-            "id": r[0],
-            "bin": str(r[6]).replace(".0", "") if r[6] else None,
-            "bbl": str(r[7]).replace(".0", "") if r[7] else None,
-            "name": r[1],
-            "snippet": r[3],
-            "year": r[8],
-            "style": r[9],
-            "category": r[2],
+            "id": r["fsq_id"],
+            "bin": str(r["bin"]).replace(".0", "") if r["bin"] else None,
+            "bbl": str(r["bbl"]).replace(".0", "") if r["bbl"] else None,
+            "name": r["name"],
+            "snippet": r["snippet"],
+            "year": r["building_year"],
+            "style": r["building_style"],
+            "category": r["category"],
+            "neighborhood": r["neighborhood"],
+            "borough": r["borough"],
             "landmark": None,
-            "lat": r[4],
-            "lng": r[5],
-            "score": float(r[11]) if r[11] is not None else 0.0,
+            "lat": r["lat"],
+            "lng": r["lng"],
+            "score": float(r["score"]) if r["score"] is not None else 0.0,
+            "lex_score": float(r["lex_score"]) if r["lex_score"] is not None else 0.0,
             "matched_field": (
-                infer_matched_field(q_lex, name=r[1], style=r[9], category=r[2])
-                if (r[12] or 0) > 0.5 else "semantic"
+                infer_matched_field(q_lex, name=r["name"], style=r["building_style"], category=r["category"])
+                if (r["lex_score"] or 0) > 0.5 else "semantic"
             ),
-            "dist_m": (
-                round(float(r[dist_idx]), 1)
-                if geo and len(r) > dist_idx and r[dist_idx] is not None else None
-            ),
-            "category_labels": (
-                list(r[labels_idx])
-                if labels_idx is not None and len(r) > labels_idx and r[labels_idx] else None
-            ),
-            "photo_url": r[10],
+            "dist_m": round(float(r["dist_m"]), 1) if geo and r.get("dist_m") is not None else None,
+            "category_labels": list(r["category_labels"]) if r["category_labels"] else None,
+            "photo_url": r["photo_url"],
             "lore_status": None,
         })
     return hits
@@ -1354,7 +1390,7 @@ async def _leg_venues_vector_only(
     """Fallback path if the hybrid trigram migration hasn't run (pg_trgm/index
     missing) — pure vector, matching the pre-existing /search/venues shape."""
     params: dict = {"qvec": qvec_lit, "limit": limit}
-    filters: List[str] = []
+    filters: List[str] = ["searchable IS NOT FALSE"]
     if year_from is not None:
         filters.append("building_year >= :year_from")
         params["year_from"] = year_from
@@ -1428,7 +1464,9 @@ async def _leg_layers(
 
     soft_radius: see _leg_buildings' docstring."""
     params: dict = {"qvec": qvec_lit, "limit": limit, "q_lex": q_lex}
-    filters: List[str] = []
+    # See scripts/flag_layers_in_nyc.py: AMC Wayne 14 and a house in Sea
+    # Cliff are not New York lore.
+    filters: List[str] = ["in_nyc IS NOT FALSE"]
     if layer:
         filters.append("layer = :layer")
         params["layer"] = layer
@@ -1548,7 +1586,9 @@ async def _leg_layers_vector_only(
     soft_radius: bool = False,
 ) -> List[dict]:
     params: dict = {"qvec": qvec_lit, "limit": limit}
-    filters: List[str] = []
+    # See scripts/flag_layers_in_nyc.py: AMC Wayne 14 and a house in Sea
+    # Cliff are not New York lore.
+    filters: List[str] = ["in_nyc IS NOT FALSE"]
     if layer:
         filters.append("layer = :layer")
         params["layer"] = layer
@@ -1599,11 +1639,35 @@ async def _leg_layers_vector_only(
 
 
 # ---------------------------------------------------------------------------
-# Query-interpretation cache — prose-intent only, OFF the response critical
-# path. Synchronous cache CHECK (fast SELECT); on miss we return without it
-# and write the interpretation in a background task so the NEXT identical
-# query benefits. See services/openai_text.py::openai_text.
+# Query interpretation (LLM expansion). See the block comment above
+# INTERP_VERSION in services/unified_search.py for why it exists.
+#
+# The cache is keyed on the lowercased query and versioned: rows written by an
+# older prompt are ignored rather than trusted, because the v1 prompt returned
+# mood adjectives ("foggy", "ominous") that retrieve nothing.
 # ---------------------------------------------------------------------------
+
+_INTERP_SYSTEM = """You translate a search typed into a New York City architecture and history app into phrases its database can match.
+
+The database holds three things:
+1. NYC landmark designation reports: architectural styles, materials, ornament, architects, building types (church, bank, theater, tenement, loft, cemetery, mausoleum, rowhouse).
+2. Short histories of buildings and events: fires, murders, hauntings, ghosts, demolitions, scandals, riots, film locations, famous residents.
+3. Business listings: a venue name, a category such as "Cocktail Bar", "Wine Bar", "Speakeasy", "Coffee Shop", "Art Gallery", and a neighborhood.
+
+Reply with JSON only, no prose, no code fences:
+{"queries": [...], "categories": [...], "neighborhoods": [...], "boroughs": [...]}
+
+queries: 1 to 3 phrases of 1 to 5 words, written the way the DATABASE describes things, never the way people search. Turn moods into concrete things a report, a history or a listing would literally say. When the query is vague, give each phrase a DIFFERENT angle (architecture, history, a place to go) rather than three wordings of one idea. When the query asks for a kind of place (a bar, a cafe, a church), EVERY phrase names that kind of place. Use distinctive words only: never "house", "building", "place", "spot", "site", "location", "NYC", "New York", "near me", "best", "ideas", "things to do". If the query names a specific building, business, person or event, return that exact name as the only phrase.
+categories: listing categories, only when the query asks for a kind of place to go. Otherwise [].
+neighborhoods: NYC neighborhoods the query names or clearly implies. Otherwise [].
+boroughs: any of Manhattan, Brooklyn, Queens, Bronx, Staten Island the query names. Otherwise [].
+
+Examples:
+"creepy places" -> {"queries":["cemetery mausoleum","haunted ghost story","murder"],"categories":[],"neighborhoods":[],"boroughs":[]}
+"brutalist cafes in soho" -> {"queries":["cafe brutalist concrete","coffee shop modern building"],"categories":["Coffee Shop","Cafe","Café"],"neighborhoods":["SoHo"],"boroughs":[]}
+"woolworth bar" -> {"queries":["Woolworth Building"],"categories":["Cocktail Bar","Bar","Lounge"],"neighborhoods":[],"boroughs":[]}
+"date night queens" -> {"queries":["candlelit restaurant","wine bar garden"],"categories":["Restaurant","Wine Bar","Italian Restaurant","French Restaurant"],"neighborhoods":[],"boroughs":["Queens"]}"""
+
 
 async def _get_cached_interpretation(q: str) -> Optional[dict]:
     try:
@@ -1615,57 +1679,70 @@ async def _get_cached_interpretation(q: str) -> Optional[dict]:
                 {"q": q.strip().lower()},
             )
             row = result.fetchone()
-            return row[0] if row else None
+            interp = row[0] if row else None
+            if isinstance(interp, dict) and interp.get("v") == INTERP_VERSION:
+                return interp
+            return None
     except Exception as e:
         logger.info(f"[unified] interpretation cache check skipped: {e}")
         return None
 
 
-async def _refine_and_cache_interpretation(q: str) -> None:
-    """Background task: expand era/style hints for a prose query, then cache the
-    interpretation for next time. Never raises into the caller (it's
-    fire-and-forget via asyncio.create_task)."""
+async def _store_interpretation(q: str, interp: dict) -> None:
+    import json
     try:
-        # 600, not the old 150. `max_output_tokens` on a reasoning model is a
-        # budget the reasoning pass draws from FIRST, so a tight cap truncates
-        # the JSON — and truncated JSON fails the parse below and is discarded,
-        # meaning the cache would simply never populate and every query would
-        # pay the miss forever. The answer here is ~50 tokens; the headroom is
-        # what guarantees it survives.
-        raw = await openai_text(
-            system=(
-                "You expand a natural-language NYC-architecture search query into "
-                "structured filter hints. Reply with compact JSON only: "
-                '{"style_terms": [...], "year_from": int|null, "year_to": int|null}. '
-                "No prose, no markdown fences."
-            ),
-            user=q,
-            max_tokens=600,
-            cache_key="jink-search-interp",
-        )
-        if not raw:
-            return
-        import json
-        try:
-            interpretation = json.loads(raw)
-        except Exception:
-            logger.info(f"[unified] interpretation not valid JSON, discarding: {raw[:120]}")
-            return
-
         async with get_search_db() as db:
-            if db is None:
-                return
-            await db.execute(
-                text(
-                    "INSERT INTO search_interpretation_cache (query, interpretation) "
-                    "VALUES (:q, CAST(:interp AS jsonb)) "
-                    "ON CONFLICT (query) DO UPDATE SET interpretation = EXCLUDED.interpretation, created_at = now()"
-                ),
-                {"q": q.strip().lower(), "interp": json.dumps(interpretation)},
-            )
-            await db.commit()
+            if db is not None:
+                await db.execute(
+                    text(
+                        "INSERT INTO search_interpretation_cache (query, interpretation) "
+                        "VALUES (:q, CAST(:interp AS jsonb)) "
+                        "ON CONFLICT (query) DO UPDATE SET interpretation = EXCLUDED.interpretation, created_at = now()"
+                    ),
+                    {"q": q.strip().lower(), "interp": json.dumps(interp)},
+                )
+                await db.commit()
     except Exception as e:
-        logger.info(f"[unified] background interpretation refine skipped: {e}")
+        logger.info(f"[unified] interpretation store skipped for {q!r}: {e}")
+
+
+async def _mark_direct_when_ready(q: str, task: "asyncio.Task", direct: bool) -> None:
+    """For a request that did not wait for its rewrite: once the model
+    answers, record whether this query needed it."""
+    try:
+        interp = await task
+        if interp is not None:
+            await _store_interpretation(q, {**interp, "direct": direct})
+    except Exception:
+        pass
+
+
+async def _interpret_and_cache(q: str) -> Optional[dict]:
+    """Ask the model, validate, cache, return. Never raises.
+
+    Runs as a task started at the top of the request, concurrently with
+    retrieval, so on the queries that need it most of its ~2.5s is already
+    spent by the time the first pass finishes. If the request stops waiting,
+    the task still completes and caches, so the next person gets it free."""
+    try:
+        raw = await openai_text(
+            system=_INTERP_SYSTEM,
+            user=q,
+            # Reasoning is off in openai_text, so this is all answer. The
+            # answer is ~60 tokens; 300 is headroom, not a target.
+            max_tokens=300,
+            timeout_s=10.0,
+            cache_key="jink-search-interp-v3",
+        )
+        interp = parse_interpretation(raw, q)
+        if interp is None:
+            logger.info(f"[unified] interpretation unusable for {q!r}: {(raw or '')[:120]!r}")
+            return None
+        await _store_interpretation(q, interp)
+        return interp
+    except Exception as e:
+        logger.info(f"[unified] interpretation skipped for {q!r}: {e}")
+        return None
 
 
 async def _log_query(q: str, intent: str, latency_ms: float, result_ids: List[str]) -> None:
@@ -1776,6 +1853,7 @@ async def search_unified(
     landmark: Optional[bool] = Query(None, description="Filters buildings leg by is_landmark"),
     user_vector: Optional[str] = Query(None, description="9 comma-separated floats: user's aesthetic archetype vector"),
     scanned_bins: Optional[str] = Query(None, description="CSV of bins the user has already scanned (novelty nudge)"),
+    debug: bool = Query(False, description="Include a per-hit score breakdown (_debug). For tuning; never cached."),
 ) -> Dict[str, Any]:
     """Cross-corpus search: buildings + venues + layers (lore/plaques/
     contributions), fused via Reciprocal Rank Fusion with intent-aware corpus
@@ -1797,18 +1875,38 @@ async def search_unified(
         (year_from, year_to, borough, style_family, material, lore_status,
          landmark, user_vector, scanned_bins),
     )
-    cached_resp = _result_cache_get(cache_key)
+    cached_resp = None if debug else _result_cache_get(cache_key)
     if cached_resp is not None:
         return cached_resp
 
     q = _sanitize_query(q)
     intent, poi_noun = classify_intent_detailed(q)
-    weights = corpus_weights(intent)
+    weights = dict(corpus_weights(intent))
     # HARD_RADIUS_INTENTS (poi/name/address/event): radius_m stays a hard
     # WHERE filter — "near me" is core to those queries. Everything else
     # (style/architect/lore/prose) treats radius as a soft proximity signal
     # only, so a better match further away can still surface.
     soft_radius = intent not in HARD_RADIUS_INTENTS
+
+    # A query that names a place is not a "near me" query, whatever its
+    # intent: "bars in midtown" asked from Brooklyn must not be clipped to
+    # the user's radius, where it can only return Brooklyn bars. And the
+    # place is a constraint in its own right, detected here without the LLM.
+    q_hoods, q_boros = _query_places(q)
+    if q_hoods or q_boros:
+        soft_radius = True
+
+    # LLM expansion, started NOW so it runs alongside retrieval rather than
+    # after it. See INTERP_VERSION in services/unified_search.py.
+    #
+    # Before this, expansion was inert twice over: it only ever fired on
+    # `prose` intent (which almost no real query reaches -- "spooky spots" is
+    # `name`), and even on a cache hit the result was never applied. The cache
+    # table was empty on 2026-09-22 after thousands of searches.
+    interp = await _get_cached_interpretation(q)
+    interp_task: Optional[asyncio.Task] = None
+    if interp is None and intent != "address" and len(q) >= 3:
+        interp_task = asyncio.create_task(_interpret_and_cache(q))
 
     try:
         # to_thread: the ONNX forward pass is sync CPU work — off the event
@@ -1823,8 +1921,6 @@ async def search_unified(
 
     leg_limit = max(limit, 20)
     layer_filter = None
-    if lore_status and lore_status.lower() in {"extant", "demolished", "unbuilt", "transformed"}:
-        layer_filter = None  # lore_status filters layers AFTER retrieval below, not via `layer` column
 
     # Personalization vector — parsed BEFORE the legs run so it can be pushed
     # into _leg_buildings' SQL (dot product computed in Postgres via pgvector's
@@ -1853,80 +1949,159 @@ async def search_unified(
         except Exception:
             user_vec_lit = None
 
-    buildings_task = _leg_buildings(
-        qvec_lit, q_lex, leg_limit, lat, lng, radius_m, year_from, year_to,
-        borough=borough, material=material, style_family=style_family,
-        user_vec_lit=user_vec_lit, soft_radius=soft_radius,
-        fame_weight=W_LEG_FAME if intent in FAME_BOOST_INTENTS else 0.0,
-        lore_weight=leg_lore_weight(intent),
-    )
-    venues_task = _leg_venues(qvec_lit, q_lex, leg_limit, lat, lng, radius_m, year_from, year_to, soft_radius=soft_radius)
-    layers_task = _leg_layers(qvec_lit, q_lex, leg_limit, lat, lng, radius_m, layer_filter, soft_radius=soft_radius)
+    async def _retrieve(vec_lit: str, lex: str, *, with_personal: bool = True):
+        """One full leg set (buildings, venues, layers) for one phrasing of
+        the query, with the request's filters and POI adjustments applied."""
+        b, v, l = await asyncio.gather(
+            _leg_buildings(
+                vec_lit, lex, leg_limit, lat, lng, radius_m, year_from, year_to,
+                borough=borough, material=material, style_family=style_family,
+                user_vec_lit=user_vec_lit if with_personal else None, soft_radius=soft_radius,
+                fame_weight=W_LEG_FAME if intent in FAME_BOOST_INTENTS else 0.0,
+                lore_weight=leg_lore_weight(intent),
+            ),
+            _leg_venues(vec_lit, lex, leg_limit, lat, lng, radius_m, year_from, year_to, soft_radius=soft_radius),
+            _leg_layers(vec_lit, lex, leg_limit, lat, lng, radius_m, layer_filter, soft_radius=soft_radius),
+        )
+        return _post_filter(b, v, l)
 
-    buildings_hits, venues_hits, layers_hits = await asyncio.gather(
-        buildings_task, venues_task, layers_task, return_exceptions=False
-    )
+    def _post_filter(buildings_hits, venues_hits, layers_hits):
+        if landmark is not None:
+            buildings_hits = [h for h in buildings_hits if h.get("landmark") == landmark]
+        if style_family:
+            # The SQL leg already filters buildings via style_family; this is
+            # what does the work for venues (no style_family column) and a
+            # harmless re-check for buildings.
+            needle = style_family.replace("_", " ").lower()
+            buildings_hits = [h for h in buildings_hits if h.get("style") and needle in h["style"].lower()]
+            venues_hits = [h for h in venues_hits if h.get("style") and needle in h["style"].lower()]
+        if borough:
+            buildings_hits = [h for h in buildings_hits if not h.get("borough") or h["borough"].lower() == borough.lower()]
+            venues_hits = [h for h in venues_hits if not h.get("borough") or h["borough"].lower() == borough.lower()]
+        if material:
+            buildings_hits = [h for h in buildings_hits if not h.get("material") or h["material"].lower() == material.lower()]
+        if lore_status:
+            layers_hits = [h for h in layers_hits if h.get("lore_status") == lore_status]
 
-    if landmark is not None:
-        buildings_hits = [h for h in buildings_hits if h.get("landmark") == landmark]
-    if style_family:
-        # Applied again here (belt-and-suspenders): the SQL leg already filters
-        # buildings via style_family when the enriched columns exist; this
-        # post-filter is what actually does the work for venues (no
-        # style_family column on `venues` — best-effort substring match against
-        # the parsed style text) and is a harmless no-op re-check for buildings.
-        needle = style_family.replace("_", " ").lower()
-        buildings_hits = [h for h in buildings_hits if h.get("style") and needle in h["style"].lower()]
-        venues_hits = [h for h in venues_hits if h.get("style") and needle in h["style"].lower()]
-    if borough:
-        # No borough column on venues/layers in this DB — buildings-only filter
-        # (SQL leg already applied it when enriched; this re-check is a no-op
-        # there and harmless).
-        buildings_hits = [h for h in buildings_hits if not h.get("borough") or h["borough"].lower() == borough.lower()]
-    if material:
-        buildings_hits = [h for h in buildings_hits if not h.get("material") or h["material"].lower() == material.lower()]
-    if lore_status:
-        layers_hits = [h for h in layers_hits if h.get("lore_status") == lore_status]
+        if intent == "poi" and poi_noun:
+            # Category-family rank adjustment (poi_category_adjustment, see
+            # unified_search.py): a mild boost when the venue's category matches
+            # the detected POI noun's family (bar/pub/lounge/... for "bar"), mild
+            # demotion for a category that's clearly a DIFFERENT, unrelated
+            # family (Antique Store / Art Gallery for a "bar" query). Never a
+            # hard filter — applied to `score` BEFORE re-sorting, so it also
+            # shifts each venue's rank within its own corpus (which RRF then
+            # reads), not just the final fused score.
+            style_toks = query_style_tokens(q, poi_noun)
+            for h in venues_hits:
+                adj = poi_category_adjustment(h.get("category"), poi_noun, h.get("category_labels"))
+                # Host-building style/era affinity — "art deco bar" boosts bars
+                # inside deco (or deco-era) buildings; the venue row already
+                # carries building_style/building_year, previously unscored.
+                adj += venue_style_affinity(style_toks, h.get("style"), h.get("year"))
+                # Style words in a venue NAME ("High Style Deco", antique store)
+                # are a lexical decoy, not noun relevance — penalized unless the
+                # category really is in the noun's family.
+                adj += style_name_decoy_penalty(q_lex, h.get("name"), h.get("category"), poi_noun)
+                # Applied twice, on two different scales: here on the raw leg
+                # score (reorders the leg, which RRF reads as rank) AND stashed
+                # for the post-RRF nudge pass. Post-RRF_SCALE one rank step is
+                # ~0.016, so a ±0.15 category adjustment moves a hit ~9 ranks —
+                # decisive enough to bury the antique store, without the old
+                # behaviour where it silently outweighed the entire relevance
+                # range.
+                h["poi_adj"] = adj
+                h["score"] = (h.get("score") or 0.0) + adj
+            venues_hits.sort(key=lambda h: h.get("score") or 0.0, reverse=True)
+        return buildings_hits, venues_hits, layers_hits
 
-    if intent == "poi" and poi_noun:
-        # Category-family rank adjustment (poi_category_adjustment, see
-        # unified_search.py): a mild boost when the venue's category matches
-        # the detected POI noun's family (bar/pub/lounge/... for "bar"), mild
-        # demotion for a category that's clearly a DIFFERENT, unrelated
-        # family (Antique Store / Art Gallery for a "bar" query). Never a
-        # hard filter — applied to `score` BEFORE re-sorting, so it also
-        # shifts each venue's rank within its own corpus (which RRF then
-        # reads), not just the final fused score.
-        style_toks = query_style_tokens(q, poi_noun)
-        for h in venues_hits:
-            adj = poi_category_adjustment(h.get("category"), poi_noun, h.get("category_labels"))
-            # Host-building style/era affinity — "art deco bar" boosts bars
-            # inside deco (or deco-era) buildings; the venue row already
-            # carries building_style/building_year, previously unscored.
-            adj += venue_style_affinity(style_toks, h.get("style"), h.get("year"))
-            # Style words in a venue NAME ("High Style Deco", antique store)
-            # are a lexical decoy, not noun relevance — penalized unless the
-            # category really is in the noun's family.
-            adj += style_name_decoy_penalty(q_lex, h.get("name"), h.get("category"), poi_noun)
-            # Applied twice, on two different scales: here on the raw leg
-            # score (reorders the leg, which RRF reads as rank) AND stashed
-            # for the post-RRF nudge pass. Post-RRF_SCALE one rank step is
-            # ~0.016, so a ±0.15 category adjustment moves a hit ~9 ranks —
-            # decisive enough to bury the antique store, without the old
-            # behaviour where it silently outweighed the entire relevance
-            # range.
-            h["poi_adj"] = adj
-            h["score"] = (h.get("score") or 0.0) + adj
-        venues_hits.sort(key=lambda h: h.get("score") or 0.0, reverse=True)
+    async def _expand(phrase: str):
+        vec = await asyncio.to_thread(embed_query, phrase)
+        # Personalization rides on the user's own query only: applying it
+        # to every rewrite would count taste once per phrasing.
+        return await _retrieve(_vec_literal(vec), _lexical_query(phrase), with_personal=False)
 
-    # Build RankedHit lists (rank = position in each corpus's own score order;
-    # legs already ORDER BY score DESC in SQL).
+    # A cached rewrite that last time turned out to be NEEDED ("direct":
+    # false) runs alongside the user's own legs instead of after them, so a
+    # repeat of "spooky spots" costs one round of queries, not two.
+    expansion_queries: List[str] = []
+    expanded: Optional[list] = None
+    pre_expand = bool(interp and interp.get("direct") is False and interp.get("queries"))
+    if pre_expand:
+        expansion_queries = list(interp["queries"])[:MAX_EXPANSION_QUERIES]
+        results = await asyncio.gather(
+            _retrieve(qvec_lit, q_lex), *[_expand(p) for p in expansion_queries],
+            return_exceptions=True,
+        )
+        if isinstance(results[0], Exception):
+            raise results[0]
+        buildings_hits, venues_hits, layers_hits = results[0]
+        expanded = list(results[1:])
+    else:
+        buildings_hits, venues_hits, layers_hits = await _retrieve(qvec_lit, q_lex)
+    raw_legs = {"buildings": buildings_hits, "venues": venues_hits, "layers": layers_hits}
+
+    # Wait for the model only when the user's own words did not already find
+    # the answer. "chrysler building" must not pay 2.5s for a rewrite it does
+    # not need; "spooky spots" should.
+    direct = has_direct_match(q_lex, intent, raw_legs)
+    if interp is None and interp_task is not None and not direct:
+        remaining = INTERP_WAIT_S - (time.monotonic() - start)
+        if remaining > 0:
+            try:
+                # shield: on timeout the task keeps running and still caches.
+                interp = await asyncio.wait_for(asyncio.shield(interp_task), timeout=remaining)
+            except asyncio.TimeoutError:
+                logger.info(f"[unified] interpretation not ready in {INTERP_WAIT_S}s for {q!r}; cached for next time")
+    # Remember whether this query needed its rewrite, so the next run knows
+    # whether to start it in parallel. Fire-and-forget.
+    if interp is not None and interp.get("direct") is not (direct is True):
+        interp = {**interp, "direct": bool(direct)}
+        asyncio.create_task(_store_interpretation(q, interp))
+    elif interp is None and interp_task is not None:
+        asyncio.create_task(_mark_direct_when_ready(q, interp_task, bool(direct)))
+
     legs = {
-        "buildings": [RankedHit("buildings", h["id"], i + 1, h) for i, h in enumerate(buildings_hits) if h.get("id")],
-        "venues": [RankedHit("venues", h["id"], i + 1, h) for i, h in enumerate(venues_hits) if h.get("id")],
-        "layers": [RankedHit("layers", h["id"], i + 1, h) for i, h in enumerate(layers_hits) if h.get("id")],
+        name: [RankedHit(name, h["id"], i + 1, h) for i, h in enumerate(hits) if h.get("id")]
+        for name, hits in raw_legs.items()
     }
+
+    if direct:
+        expansion_queries, expanded = [], None
+    elif interp and expanded is None:
+        expansion_queries = list(interp.get("queries") or [])[:MAX_EXPANSION_QUERIES]
+        if expansion_queries:
+            expanded = await asyncio.gather(*[_expand(p) for p in expansion_queries], return_exceptions=True)
+    if expansion_queries and expanded:
+        for corpus in ("buildings", "venues", "layers"):
+            weights[corpus] = weights.get(corpus, 1.0) * W_ORIGINAL_WHEN_EXPANDED
+        for n, res in enumerate(expanded):
+            if isinstance(res, Exception):
+                logger.warning(f"[unified] expansion leg failed for {expansion_queries[n]!r}: {res}")
+                continue
+            for corpus, hits in zip(("buildings", "venues", "layers"), res):
+                leg = f"{corpus}~{n}"
+                # A rewrite of a POI query is still a POI query, so it keeps the
+                # user's corpus weights: with neutral ones, "modernist bars in
+                # midtown" returned lore ABOUT modernism above any bar. But
+                # `name` is the classifier's fallback, not a real reading, and
+                # it weights lore at 0.6 -- exactly where "haunted ghost story"
+                # for "spooky spots" belongs -- so those use neutral weights.
+                basis = intent if intent in ("poi", "style", "architect", "lore", "event") else "prose"
+                weights[leg] = corpus_weights(basis).get(corpus, 1.0) * W_EXPANSION_LEG
+                legs[leg] = [RankedHit(corpus, h["id"], i + 1, h) for i, h in enumerate(hits) if h.get("id")]
+        logger.info(f"[unified] expanded {q!r} -> {expansion_queries} "
+                    f"cats={interp.get('categories')} hoods={interp.get('neighborhoods')} boros={interp.get('boroughs')}")
+
     fused = reciprocal_rank_fusion(legs, weights)
+
+    # Where the query asked to be: phrases found in the query itself, plus
+    # whatever the model inferred. Either alone is enough.
+    place_req = None
+    _hoods = list(q_hoods) + [x for x in ((interp or {}).get("neighborhoods") or []) if x.lower() not in q_hoods]
+    _boros = list(q_boros) + [x for x in ((interp or {}).get("boroughs") or []) if x.lower() not in q_boros]
+    if _hoods or _boros:
+        place_req = {"neighborhoods": _hoods, "boroughs": _boros}
 
     scanned = set()
     if scanned_bins:
@@ -1944,6 +2119,12 @@ async def search_unified(
     _facet_adj = facet_adjustments(q_lex, [rh.payload for _, _, rh in fused])
     for idx, (gk, score, ranked_hit) in enumerate(fused):
         h = dict(ranked_hit.payload)
+        dbg: Dict[str, float] = {}
+
+        def _t(label: str, val: float) -> float:
+            if debug and val:
+                dbg[label] = round(dbg.get(label, 0.0) + float(val), 4)
+            return val
         # personalization_dot is set only on buildings hits, only when the
         # enriched `profile` column exists AND a user_vector param was passed
         # (see _leg_buildings' b_personalization SELECT) — None otherwise, in
@@ -1958,68 +2139,81 @@ async def search_unified(
             dist_m=h.get("dist_m"),
             is_novel=is_novel,
         )
+        _t("apply_nudges", nudged - score * RRF_SCALE)
         # Soft-radius proximity: for style/architect/lore/prose intents,
         # radius_m was never applied as a WHERE filter (see soft_radius
         # above), so dist_m may be large or None — add a decaying bonus
         # instead of a cutoff, only when the caller actually supplied a
         # location (dist_m is only ever populated when lat/lng were given).
         if soft_radius and h.get("dist_m") is not None:
-            nudged += proximity_decay_bonus(h.get("dist_m"))
+            nudged += _t("proximity_decay_bonus", proximity_decay_bonus(h.get("dist_m")))
         # Landmark/fame boost: buildings only, only on intents where fame
         # should break ties (see FAME_BOOST_INTENTS) — lets an icon-tier
         # building (Chrysler etc.) beat an obscure same-style row house.
-        nudged += fame_boost(intent, h.get("fame"))
+        nudged += _t("fame_boost", fame_boost(intent, h.get("fame")))
         # Name intent: an exact/subset name match is the answer — this bonus
         # is deliberately dominant over every other nudge (see W_EXACT_NAME).
         if intent == "name":
             _exact = exact_name_bonus(q_lex, h.get("name"))
-            nudged += _exact
+            nudged += _t("_exact", _exact)
             # A typo of a famous name is still a name match. exact_name_bonus
             # fires only on exact/subset TOKEN equality, so a misspelling got
             # nothing and "chrystler building" put the Chrysler Building
             # second, behind 215 Chrystie Street. Skipped when the exact bonus
             # already fired -- same signal, would double-count.
-            nudged += fuzzy_name_bonus(intent, h.get("name_sim"), _exact)
+            nudged += _t("fuzzy_name_bonus", fuzzy_name_bonus(intent, h.get("name_sim"), _exact))
         # Architect intent: a real column match is the answer, same standing as
         # an exact name match. Previously this intent had no structured field
         # to score against at all.
         if intent == "architect":
-            nudged += architect_match_bonus(q_lex, h.get("architect"))
+            nudged += _t("architect_match_bonus", architect_match_bonus(q_lex, h.get("architect")))
         # Naming an archetype is an instruction: "austerist" must return the
         # 169 austerist buildings, not the stylistically adjacent modernists
         # that happen to be more famous.
-        nudged += aesthetic_match_bonus(q_lex, h.get("aesthetic"))
+        # ...but only when the row answers the rest of the query too.
+        # "romantic" is an archetype AND an adjective: "romantic dinner
+        # brooklyn" handed +0.30 (~19 rank steps) to every romantic-archetype
+        # building in Brooklyn, and not one of them serves dinner.
+        if token_coverage(q_lex, h.get("name"), h.get("snippet"), h.get("category"),
+                          h.get("style"), h.get("neighborhood"),
+                          (h.get("aesthetic") or "").replace("_", " ")) >= 1.0:
+            nudged += _t("aesthetic_match_bonus", aesthetic_match_bonus(q_lex, h.get("aesthetic")))
         # A lore entry whose title carries the query is the answer regardless
         # of intent: "kitty genovese" retrieves the Kitty Genovese Murder at
         # 0.82 and was still buried under buildings by the corpus weights.
-        nudged += layer_title_bonus(q_lex, h.get("type"), h.get("name"))
+        nudged += _t("layer_title_bonus", layer_title_bonus(q_lex, h.get("type"), h.get("name")))
         # House-number address queries ("469 broome") classify as name/address
         # but their number is the whole signal — a dominant bonus when a
         # building's address range contains it, so the exact address beats fame
         # (570 Broome was outranking 469-475). Buildings only.
         if intent in ("name", "address") and h.get("type") == "building":
-            nudged += house_number_bonus(q_lex, h.get("name"), h.get("snippet"))
+            nudged += _t("house_number_bonus", house_number_bonus(q_lex, h.get("name"), h.get("snippet")))
         # POI adjustments re-applied on the RRF scale (see the venues
         # re-score block above for why twice).
-        nudged += h.get("poi_adj") or 0.0
+        nudged += _t("poi_adj", h.get("poi_adj") or 0.0)
         # Lore/event multi-token queries: reward full concept coverage
         # ("demolished" AND "theaters"), demote single-concept matches.
-        nudged += coverage_adjustment(
+        nudged += _t("coverage", coverage_adjustment(
             intent, q_lex, h.get("name"), h.get("snippet"),
             h.get("category"), h.get("style"),
-        )
+        ))
         # Hedged style attributions ("… colonial revival OR art deco") were
         # scoring as confident matches because trigram similarity reads the
         # best-matching substring. Discount a match that only lands on the
         # alternative, never on the primary.
-        nudged += hedged_style_penalty(
+        nudged += _t("hedged", hedged_style_penalty(
             query_style_tokens(q, poi_noun), h.get("style")
-        )
+        ))
         # Facet decoys: "cast iron soho" ranked 565 Broome SoHo (glass, 2018)
         # first on a NAME match for "soho" while the actual cast-iron district
         # sat below it. Computed across the whole list (facet-ness is emergent
         # from it), so it is applied from a precomputed array, not per-hit.
-        nudged += _facet_adj[idx]
+        nudged += _t("_facet_adj", _facet_adj[idx])
+        # What the model said the query MEANT: the kind of place, and where.
+        # Applied whenever an interpretation exists, including on a direct
+        # match, because "bars in midtown" names a place either way.
+        nudged += _t("llm_category_bonus", llm_category_bonus(interp, h))
+        nudged += _t("place_adjustment", place_adjustment(place_req, h, neighborhood_vocab()))
         why = build_why(
             matched_field=h.get("matched_field"),
             year=h.get("year"),
@@ -2044,6 +2238,10 @@ async def search_unified(
             "bbl": h.get("bbl"),
             "lore_status": h.get("lore_status"),
             "snippet": h.get("snippet"),
+            **({"_debug": {"rrf": round(score * RRF_SCALE, 4), **dbg,
+                           "legs": sorted(k for k, lst in legs.items()
+                                          if any(r.key == ranked_hit.key and r.corpus == ranked_hit.corpus for r in lst))}}
+               if debug else {}),
         })
 
     # Re-sort after the soft-radius/landmark nudges (both applied AFTER the
@@ -2076,14 +2274,6 @@ async def search_unified(
         elif f["kind"] == "lore_status":
             f["param"] = "lore_status"
 
-    interpretation_used = False
-    if intent == "prose":
-        cached = await _get_cached_interpretation(q)
-        if cached is None:
-            asyncio.create_task(_refine_and_cache_interpretation(q))
-        else:
-            interpretation_used = True  # available for a future refinement pass; response shape is pinned
-
     latency_ms = (time.monotonic() - start) * 1000
     asyncio.create_task(_log_query(q, intent, latency_ms, [h["id"] for h in hits if h.get("id")]))
 
@@ -2093,7 +2283,8 @@ async def search_unified(
         "facets": facets,
         "hits": hits,
     }
-    _result_cache_put(cache_key, resp)
+    if not debug:
+        _result_cache_put(cache_key, resp)
     return resp
 
 

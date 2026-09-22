@@ -859,7 +859,10 @@ def _facet_words(*values: Optional[str]) -> set:
     out: set = set()
     for v in values:
         if v:
-            out |= {t for t in _tokens(v) if len(t) >= 3}
+            # Hyphens split: NTA names are hyphen-joined ("Midtown South-
+            # Flatiron-Union Square"), and _tokens keeps them, which made
+            # "midtown" a decoy on bars that really are in Midtown.
+            out |= {t for t in _tokens(v.replace("-", " ")) if len(t) >= 3}
     return out
 
 
@@ -1305,10 +1308,14 @@ def reciprocal_rank_fusion(
     scores: Dict[str, float] = {}
     best_hit: Dict[str, RankedHit] = {}
 
-    for corpus, hits in legs.items():
-        w = weights.get(corpus, 1.0)
+    for leg, hits in legs.items():
+        # Keyed on the HIT's corpus, weighted by the LEG. They differ for
+        # expansion legs ("buildings~0" is the buildings corpus retrieved for
+        # an LLM rewrite of the query): the same building found by the user's
+        # words and by the rewrite must accumulate into ONE entry, not two.
+        w = weights.get(leg, 1.0)
         for h in hits:
-            gk = f"{corpus}:{h.key}"
+            gk = f"{h.corpus}:{h.key}"
             contrib = w * (1.0 / (k + h.rank))
             scores[gk] = scores.get(gk, 0.0) + contrib
             if gk not in best_hit:
@@ -1497,3 +1504,187 @@ def build_facets(available: Dict[str, List[Any]]) -> List[Dict[str, Any]]:
                 "value": v,
             })
     return facets
+
+
+# ---------------------------------------------------------------------------
+# LLM query expansion.
+#
+# The embedding is similarity over written words. "gargoyles" works because
+# designation reports literally say gargoyles; "spooky spots" does not,
+# because no report says spooky, and bge-small has no notion that spooky means
+# gothic churches, cemeteries and murder sites. That gap is conceptual, so it
+# takes a model that holds concepts: gpt-5.6-luna rewrites the query into the
+# corpus's own vocabulary, and each rewrite is retrieved as an extra leg set
+# fused into the same RRF as the user's words.
+#
+# The rewrite never replaces the query. Name bonuses, coverage and the
+# lexical pools still read the user's own words, so an expansion can add
+# candidates but cannot outrank what was literally asked for.
+# ---------------------------------------------------------------------------
+
+INTERP_VERSION = 3
+MAX_EXPANSION_QUERIES = 3
+W_EXPANSION_LEG = 1.0        # a rewrite leg counts as much as a corpus leg...
+# ...and the user's own legs are halved when rewrites run. Rewrites only run
+# when the user's words found no direct match, so those legs are by
+# definition the weak ones: "spooky spots" retrieved row houses on Patchin
+# Place at full weight while the rewrite retrieved the Vanderbilt Mausoleum,
+# Green-Wood and the Merchant's House at 0.7, and the row houses won.
+W_ORIGINAL_WHEN_EXPANDED = 0.5
+# How long, from the start of the request, a search with no direct match waits
+# for the model. Measured 2.2-3.6s for gpt-5.6-luna on 2026-09-22; the call
+# starts with the request, so the first pass is already inside this. It is
+# paid once per distinct query: the answer is cached, and a repeat runs the
+# rewrite in parallel with the first pass (see "direct" in the cache row).
+INTERP_WAIT_S = 4.5
+W_LLM_CATEGORY = 0.08        # ~5 rank steps: the kind of place asked for
+W_PLACE_MATCH = 0.10         # hit is in the neighborhood/borough asked for
+W_PLACE_MISMATCH = -0.12     # hit is known to be somewhere else
+
+
+def _str_list(v: Any, max_items: int, max_len: int = 80) -> List[str]:
+    if not isinstance(v, list):
+        return []
+    out = []
+    for x in v:
+        if isinstance(x, str):
+            x = x.strip()
+            if x and len(x) <= max_len and x.lower() not in {o.lower() for o in out}:
+                out.append(x)
+    return out[:max_items]
+
+
+def parse_interpretation(raw: Optional[str], q: str) -> Optional[Dict[str, Any]]:
+    """Validate the model's JSON. Anything malformed is dropped, not guessed at.
+
+    A rewrite identical to the query adds nothing but a duplicate leg, so it
+    is removed here rather than retrieved twice."""
+    if not raw:
+        return None
+    import json
+    txt = raw.strip()
+    if txt.startswith("```"):
+        txt = txt.strip("`")
+        txt = txt[txt.find("{"):] if "{" in txt else txt
+    try:
+        d = json.loads(txt)
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+    ql = (q or "").strip().lower()
+    queries = [x for x in _str_list(d.get("queries"), 4) if x.lower() != ql]
+    return {
+        "v": INTERP_VERSION,
+        "queries": queries[:MAX_EXPANSION_QUERIES],
+        "categories": _str_list(d.get("categories"), 6, 40),
+        "neighborhoods": _str_list(d.get("neighborhoods"), 4, 60),
+        "boroughs": [b for b in _str_list(d.get("boroughs"), 5, 20)
+                     if b.lower() in _BOROUGHS],
+    }
+
+
+_BOROUGHS = frozenset({"manhattan", "brooklyn", "queens", "bronx", "staten island"})
+
+
+def _place_tokens(s: Optional[str], vocab: Optional[set]) -> set:
+    # Letters only. _tokens keeps hyphens, and NTA names are hyphen-joined:
+    # "East Midtown-Turtle Bay" tokenised to "midtown-turtle", so every
+    # Midtown hit counted as NOT in Midtown and was demoted.
+    toks = {t for t in re.split(r"[^a-z]+", (s or "").lower().replace("'", "")) if len(t) >= 3}
+    return (toks & vocab) if vocab is not None else toks
+
+
+def place_adjustment(interp: Optional[Dict[str, Any]], hit: Dict[str, Any],
+                     hood_vocab: Optional[set] = None) -> float:
+    """Reward hits in the place the query asked for, demote hits known to be
+    elsewhere. Rows with no place on record are left alone: absence of a
+    neighborhood is not evidence of being in the wrong one.
+
+    A requested neighborhood matches when every one of its tokens that exists
+    in the NTA vocabulary appears in the hit's NTA name, so "Midtown" matches
+    "Midtown-Times Square" and "East Midtown-Turtle Bay", and a token the
+    model adds that no NTA uses ("Manhattan" in "Midtown Manhattan") cannot
+    make every hit a mismatch."""
+    if not interp:
+        return 0.0
+    adj = 0.0
+    hoods = interp.get("neighborhoods") or []
+    hit_hood = hit.get("neighborhood")
+    if hoods and hit_hood:
+        hit_toks = _place_tokens(hit_hood, None)
+        wanted = [w for w in (_place_tokens(h, hood_vocab) for h in hoods) if w]
+        if wanted:
+            adj += W_PLACE_MATCH if any(w <= hit_toks for w in wanted) else W_PLACE_MISMATCH
+    boros = {b.lower() for b in (interp.get("boroughs") or [])}
+    hit_boro = (hit.get("borough") or "").lower()
+    if boros and hit_boro and not hoods:
+        adj += W_PLACE_MATCH if hit_boro in boros else W_PLACE_MISMATCH
+    return adj
+
+
+def llm_category_bonus(interp: Optional[Dict[str, Any]], hit: Dict[str, Any]) -> float:
+    """A venue whose category is one the model named as the kind of place
+    asked for ("Cocktail Bar" for "modernist bars"). Exact category match on
+    normalised words, venues only."""
+    if not interp or hit.get("type") != "venue":
+        return 0.0
+    cat = " ".join(_tokens(hit.get("category") or ""))
+    if not cat:
+        return 0.0
+    wanted = {" ".join(_tokens(c)) for c in (interp.get("categories") or [])}
+    return W_LLM_CATEGORY if cat in wanted else 0.0
+
+
+DIRECT_COVERAGE_HITS = 5
+
+
+def has_direct_match(q_lex: str, intent: str, legs: Dict[str, Sequence[Dict[str, Any]]]) -> bool:
+    """Did the user's own words already find the answer?
+
+    Decides whether a search waits ~2.5s for the LLM. It should not for
+    "chrysler building", "469 broome" or "coffee": the name, address or
+    category is right there. It should for "spooky spots", where one lore
+    title happens to contain "spooky" and the rest is architectural noise.
+
+    So: one hit is enough when it is an ENTITY match (a building or venue name,
+    an address, an architect, an archetype). Otherwise it takes several hits
+    that cover every query word, because a single coincidental match is
+    exactly what a weak query looks like."""
+    if intent == "address":
+        return True
+
+    def _covers_all(h: Dict[str, Any]) -> bool:
+        return token_coverage(
+            q_lex, h.get("name"), h.get("snippet"), h.get("category"), h.get("style"),
+            h.get("neighborhood"), h.get("architect"),
+            (h.get("aesthetic") or "").replace("_", " "),
+        ) >= 1.0
+
+    b = list(legs.get("buildings") or [])[:5]
+    v = list(legs.get("venues") or [])[:5]
+    for h in b + v:
+        # A typo of a name cannot cover the query by definition, so the
+        # fuzzy score stands on its own.
+        if (h.get("name_sim") or 0.0) >= FUZZY_NAME_FULL:
+            return True
+        # An entity match is the answer only if it answers the WHOLE query.
+        # "romantic" and "modernist" are archetype names, so "romantic dinner
+        # brooklyn" matched the romantic archetype on one word, was declared
+        # answered, and returned Brooklyn Heights churches with no restaurant
+        # in sight.
+        entity = (
+            exact_name_bonus(q_lex, h.get("name")) > 0
+            or architect_match_bonus(q_lex, h.get("architect")) > 0
+            or aesthetic_match_bonus(q_lex, h.get("aesthetic")) > 0
+        )
+        if entity and _covers_all(h):
+            return True
+        if intent == "name" and house_number_bonus(q_lex, h.get("name"), h.get("snippet")) > 0:
+            return True
+    covered = 0
+    for leg in ("buildings", "venues", "layers"):
+        for h in list(legs.get(leg) or [])[:10]:
+            if _covers_all(h):
+                covered += 1
+    return covered >= DIRECT_COVERAGE_HITS

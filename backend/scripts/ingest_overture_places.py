@@ -61,18 +61,29 @@ BATCH = 2048
 EMBED_THREADS = int(os.environ.get("EMBED_THREADS", "4"))
 
 # Destination-shaped. Matched against Overture's `categories.primary`.
+#
+# Every alternative is anchored to a slug-token boundary ((?:^|_) ... ), and
+# the short ones to both ends. The first version matched substrings, and
+# 21,065 errand rows got through on a fragment of an unrelated word
+# (measured 2026-09-22): "marketing_agency" on "market", "courier_and_
+# delivery_services" and "food_delivery_service" on "deli", "public_relations",
+# "topic_publisher" and "notary_public" on "pub", "martial_arts_club" on
+# "arts_". They then surfaced as POIs: "seagram bar" listed an SEO agency and
+# a marketing firm inside the Seagram Building.
+_B = r"(?:^|_)"
+_E = r"(?:$|_)"
 KEEP = re.compile(
-    r"(restaurant|_bar$|^bar$|pub|brewery|brewpub|winery|distillery|cocktail|"
-    r"cafe|coffee|tea_|bakery|patisserie|deli|ice_cream|dessert|juice|"
-    r"museum|gallery|theat|cinema|music|concert|nightclub|night_club|dance|"
-    r"comedy|performing|art_|arts_|"
+    _B + r"(restaurant|bar|pubs?|gastropub|brewery|brewpub|winery|distillery|cocktail|"
+    r"cafe|coffee|tea|bakery|patisserie|deli|delicatessen|ice_cream|dessert|juice|"
+    r"museum|gallery|theat|cinema|music_venue|live_music|musical_instrument|music_and|music_store|concert|"
+    r"nightclub|night_club|dance_club|dance_hall|comedy|performing|arts?|"
     r"landmark|historic|monument|memorial|church|cathedral|synagogue|temple|mosque|"
     r"park|garden|plaza|square|pier|beach|trail|scenic|observation|zoo|aquarium|"
-    r"book|record|vintage|antique|thrift|flea|craft|hobby|game|toy|"
-    r"hotel|hostel|inn$|bed_and|"
-    r"market|farmers|butcher|cheese|chocolate|wine_|liquor|"
-    r"library|bookstore|stadium|arena|bowling|arcade|"
-    r"tattoo|florist|furniture|design|architect|"
+    r"book|bookstore|record_store|vinyl|vintage|antique|thrift|flea|craft|hobby|game|toy|"
+    r"hotel|hostel|inn|bed_and|"
+    r"markets?|farmers|butcher|cheese|chocolate|wine|liquor|"
+    r"library|stadium|arena|bowling|arcade|"
+    r"tattoo|florist|furniture_store|"
     # Added after the first pass: the destination/errand split was right, but
     # these read as errands by category name and are not. A cemetery is the
     # single most-requested "spooky spots" answer and the first pass dropped
@@ -83,21 +94,31 @@ KEEP = re.compile(
     r"post_office)")
 # Errands. Checked second, so it wins a tie ("medical_museum" stays out).
 DROP = re.compile(
-    r"(health|medical|dentist|diagnostic|physical_therapy|hospital|clinic|"
+    _B + r"(health|medical|dentist|diagnostic|physical_therapy|hospital|clinic|"
     r"pharmacy|veterinar|"
-    r"real_estate|professional_services|lawyer|corporate|contractor|financial|"
-    r"bank|insurance|accounting|"
-    r"salon|barber|nail|spa_|massage|"
-    r"automotive|gas_station|car_|auto_|parking|"
-    r"laundromat|dry_clean|storage|moving|shipping|logistics|"
+    r"real_estate|professional_services|lawyer|law_firm|corporate|contractor|financial|"
+    r"insurance|accounting|consultant|consulting|notary|"
+    r"marketing|advertis|public_relations|publisher|telemarketing|"
+    r"interior_design|graphic|web_design|product_design|"
+    r"record_label|recording|remodeling|reupholstery|manufactur|"
+    r"salon|barber|massage|"
+    r"automotive|gas_station|parking|"
+    r"laundromat|dry_clean|storage|moving|shipping|logistics|courier|"
     r"grocery|supermarket|convenience|mobile_phone|hardware|"
     r"community_services|non_profit|government|school|education|childcare|"
-    r"gym|fitness|party_and_event|advertis|recruit|staffing|employment|"
-    r"telecom|utility|wholesale)")
+    r"fitness|martial_arts|party_and_event|recruit|staffing|employment|"
+    r"telecom|utility|wholesale|"
+    # Whole tokens only: as prefixes these ate "caribbean_restaurant" (car),
+    # "spanish_restaurant" (spa) and "art_supply_store" (supply).
+    r"(?:car|auto|spa|nail|bank|gym|legal|agency|delivery|rental|repair|"
+    r"production|productions|production_services|assembly|equipment)(?=$|_)|"
+    # Trailing only: a "designer" or "architect" is an office, but
+    # "designer_clothing" is a shop and "architectural_tours" a tour.
+    r"(?:designer|architect|supply|supplies|supplier|musician|critic)$)")
 
 # Categories the DROP regex would otherwise swallow, but which are genuine
 # destinations. Checked before DROP, so it wins.
-RESCUE = re.compile(r"(cemeter|graveyard|funeral|mausoleum|crypt|college|university|campus|post_office)")
+RESCUE = re.compile(_B + r"(cemeter|graveyard|funeral|mausoleum|crypt|college|university|campus|post_office)")
 
 
 def wanted(cat: str | None) -> bool:
