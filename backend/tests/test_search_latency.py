@@ -54,49 +54,30 @@ def _exec_ms(cur, sql, params) -> float:
 
 
 class TestLexicalPoolsUseAnIndex:
-    """The lore pool must keep its indexable operator."""
+    """The lore pool prefilters on conjunctive whole-word stems."""
 
-    def test_lore_lex_pool_is_index_backed(self, cur):
+    def test_lore_lex_pool_is_fast_for_a_phrase(self, cur):
+        # The phrase case is the one that regressed: `<%` scanned 7.2s for
+        # "haunted ghost story" and returned nothing. LLM rewrites are phrases.
         ms = _exec_ms(
             cur,
             "SELECT bin FROM building_lore_index "
-            " WHERE lower(%s) <%% lower(text) "
+            " WHERE lower(text) ~ %s AND lower(text) ~ %s AND lower(text) ~ %s "
             "   AND word_similarity(lower(%s), lower(text)) > 0.6 LIMIT 72",
-            ("gargoyles", "gargoyles"),
+            (r"\mhaunted", r"\mghost", r"\mstory", "haunted ghost story"),
         )
-        assert ms < POOL_CEILING_MS, (
-            f"lore_lex_pool took {ms:.0f}ms. The `<%` operator is what makes this "
-            "index-backed; the bare word_similarity() call cannot use "
-            "idx_bli_trgm and measured 3.81s."
-        )
+        assert ms < POOL_CEILING_MS, f"lore_lex_pool took {ms:.0f}ms for a phrase"
 
-    def test_the_operator_form_plans_an_index_scan(self, cur):
-        """Documents WHY the `<%` operator is there, so removing it fails loudly.
-
-        This used to compare the two forms' timings, and was flaky: a warm
-        cache can make the slow form fast on a repeat run. The property that
-        matters is structural -- the operator can use the trigram index and
-        the bare function call cannot -- so assert the PLAN, which does not
-        depend on what happens to be cached."""
-        def plan(sql, params):
-            cur.execute("EXPLAIN " + sql, params)
-            return "\n".join(r[0] for r in cur.fetchall())
-
-        op = plan(
-            "SELECT bin FROM building_lore_index WHERE lower(%s) <%% lower(text) "
+    def test_stem_regex_plans_an_index_scan(self, cur):
+        """The regex form is only fast because the trigram index serves it.
+        Asserted on the PLAN, not on timings, which a warm cache makes flaky."""
+        cur.execute(
+            "EXPLAIN SELECT bin FROM building_lore_index WHERE lower(text) ~ %s "
             "AND word_similarity(lower(%s), lower(text)) > 0.6 LIMIT 72",
-            ("mansard", "mansard"),
+            (r"\mmansard", "mansard"),
         )
-        bare = plan(
-            "SELECT bin FROM building_lore_index "
-            "WHERE word_similarity(lower(%s), lower(text)) > 0.6 LIMIT 72",
-            ("mansard",),
-        )
-        assert "Index" in op, f"the <% form no longer uses an index:\n{op}"
-        assert "Index" not in bare, (
-            "the bare word_similarity() form now plans an index scan, so the "
-            f"`<%` operator may no longer be needed:\n{bare}"
-        )
+        plan = "\n".join(r[0] for r in cur.fetchall())
+        assert "Index" in plan, f"the stem prefilter no longer uses an index:\n{plan}"
 
 
 class TestPoolsStayBounded:

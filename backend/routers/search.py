@@ -876,6 +876,26 @@ async def _leg_buildings(
     # and a wider scan only costs time. Measured on "stained glass windows":
     # 600 -> 2.44s/200 bins, 250 -> 1.57s/157 bins.
     params["lore_scan"] = pool
+    # Conjunctive whole-word stems for the lore lexical prefilter; see
+    # lore_lex_pool. Plural "s" trimmed so "gargoyles" also finds "gargoyle".
+    _lore_stems = [
+        (t[:-1] if len(t) > 4 and t.endswith("s") else t)
+        for t in re.findall(r"[a-z0-9]+", q_lex.lower()) if len(t) >= 3
+    ][:4]
+    for i, st in enumerate(_lore_stems):
+        params[f"lore_rx{i}"] = r"\m" + re.escape(st)
+    lore_rx_sql = (
+        " AND ".join(f"lower(text) ~ :lore_rx{i}" for i in range(len(_lore_stems)))
+        if _lore_stems else "lower(:q_lex) <% lower(text)"
+    )
+    # The same test gates the per-chunk word_similarity in the lore LATERAL:
+    # lore.lex only scores above LORE_LEX_FLOOR (0.6), which a chunk cannot
+    # reach without containing the words, and word_similarity over long
+    # report text was 7.2ms per BIN x 223 BINs = 1.6s of a 1.8s leg.
+    lore_chunk_gate = (
+        " AND ".join(f"lower(l.text) ~ :lore_rx{i}" for i in range(len(_lore_stems)))
+        if _lore_stems else "TRUE"
+    )
     # Higher than lex_floor: a neighborhood name is a short, distinctive
     # string, so a loose match here drags in a whole different part of the city.
     params["hood_floor"] = 0.6
@@ -1046,23 +1066,22 @@ async def _leg_buildings(
             -- not contain the chunk that says "gargoyle" for the query
             -- "gargoyles", so without this leg the text is in the index and
             -- still unreachable.
-            -- `<%` is the INDEXABLE form of word_similarity: the bare
-            -- function call cannot use idx_bli_trgm, and profiling put this
-            -- one pool at 3.81s of a 5.65s buildings leg. The explicit
-            -- predicate stays as the source of truth; the operator only
-            -- prefilters, using pg_trgm.word_similarity_threshold, whose
-            -- default (0.6) is deliberately the same value as
-            -- LORE_LEX_FLOOR. If that floor is ever lowered, this needs a
-            -- matching `SET pg_trgm.word_similarity_threshold` or the
-            -- operator will exclude rows the predicate would accept.
+            -- Prefiltered by EVERY query word as a whole-word stem, which
+            -- the trigram index serves selectively. It used `<%` (the
+            -- indexable word_similarity), which was fine for one rare word
+            -- and a disaster for a phrase: "haunted ghost story" scanned
+            -- 7.2s to return nothing, because every chunk shares trigrams
+            -- with "story". LLM rewrites are exactly such phrases, and three
+            -- of them per search took the buildings leg to 7.8s. The
+            -- conjunctive stems run 40-160ms with comparable recall
+            -- ("mansard roof" 208 vs 199 chunks), and a phrase that clears
+            -- a 0.6 word_similarity contains its words anyway.
             --
             -- No ORDER BY: this pool is a RECALL set, not a ranking -- the
-            -- fused score orders everything downstream. Sorting the matched
-            -- set cost 4.72s vs 1.65s on "mansard roof" for no change in
-            -- which BINs survive.
+            -- fused score orders everything downstream.
             SELECT DISTINCT bin FROM (
                 SELECT bin FROM building_lore_index
-                 WHERE lower(:q_lex) <% lower(text)
+                 WHERE {lore_rx_sql}
                    AND word_similarity(lower(:q_lex), lower(text)) > :lore_lex_floor
                  LIMIT :lore_scan
             ) llp LIMIT :pool
@@ -1133,17 +1152,18 @@ async def _leg_buildings(
         LEFT JOIN LATERAL (
             -- Best-matching report chunk for this BIN: its similarity feeds
             -- the fused score, its text becomes the `why` citation.
-            SELECT 1 - (l.embedding <=> CAST(:qvec AS vector)) AS sim,
-                   word_similarity(lower(:q_lex), lower(l.text)) AS lex,
-                   l.text AS text
-              FROM building_lore_index l
-             WHERE l.bin = b.bin
+            SELECT c.sim, c.lex, c.text FROM (
+                SELECT 1 - (l.embedding <=> CAST(:qvec AS vector)) AS sim,
+                       CASE WHEN {lore_chunk_gate}
+                            THEN word_similarity(lower(:q_lex), lower(l.text))
+                            ELSE 0 END AS lex,
+                       l.text AS text
+                  FROM building_lore_index l
+                 WHERE l.bin = b.bin
+            ) c
              -- Pick the chunk that best explains the hit on EITHER signal, so
              -- the citation is the sentence the user would recognise.
-             ORDER BY GREATEST(
-                        word_similarity(lower(:q_lex), lower(l.text)),
-                        1 - (l.embedding <=> CAST(:qvec AS vector))
-                      ) DESC
+             ORDER BY GREATEST(c.lex, c.sim) DESC
              LIMIT 1
         ) lore ON true
         {('WHERE ' + ' AND '.join(enriched_filters)) if (enriched and enriched_filters) else ''}
