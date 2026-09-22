@@ -51,6 +51,13 @@ async def get_building_lore(
         True,
         description="When false, serve cache only — never run the billed chain",
     ),
+    material: bool = Query(
+        False,
+        description=(
+            "Return assembled SOURCE MATERIAL instead of finished prose, and "
+            "never cache it. The client writes the narrative itself."
+        ),
+    ),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
     """
@@ -91,7 +98,18 @@ async def get_building_lore(
     (name, address, year_built, style, architect, materials,
      cached, cached_sources, cached_comparative, comparative_basis) = row
 
-    if cached and not refresh:
+    # Material mode bypasses the `storytelling` cache in BOTH directions.
+    #
+    # Reading it would serve a paraphrase where raw material was asked for —
+    # Kit would then be writing from a summary of the sources rather than the
+    # sources, which is exactly the lossy double-synthesis this mode exists to
+    # remove. Writing it is worse: a cached paraphrase becomes the material for
+    # every later request, which is how the column filled with flat prose.
+    #
+    # Nothing is lost by skipping it. The finished narrative is cached by the
+    # client in MAIN.grok_narratives, keyed by BIN, so the chain below runs at
+    # most once per building — the same number of times the old cache saved.
+    if cached and not refresh and not material:
         return {
             "bin": bin_clean,
             "lore": cached,
@@ -138,6 +156,8 @@ async def get_building_lore(
         style=style,
         architect=architect,
         materials=materials,
+        cache_to_db=not material,
+        synthesize=not material,
     )
     if not result:
         # Every tier declined. That is a real outcome, not an error — the
@@ -166,7 +186,13 @@ async def get_building_lore(
         # Every citation, primary first. `source` stays for older clients.
         "sources": result.sources or ([result.source] if result.source else []),
         "synthesized": result.synthesized,
-        "comparative": await get_comparative(
+        # Material mode serves the comparative paragraph only if one is already
+        # cached, and never generates it. `get_comparative` runs a SECOND LLM
+        # call and writes the result back — paying to synthesize block context
+        # would reintroduce, one layer down, the duplicate spend this mode
+        # exists to remove. The client's own writer gets the block reading for
+        # free from the material it is already handed.
+        "comparative": cached_comparative if material else await get_comparative(
             db, bin_clean, name, result.text, cached_comparative, comparative_basis
         ),
     }

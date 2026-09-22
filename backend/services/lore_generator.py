@@ -932,7 +932,8 @@ async def generate_building_lore_detailed(
     style: Optional[str] = None,
     architect: Optional[str] = None,
     materials: Optional[str] = None,
-    cache_to_db: bool = True
+    cache_to_db: bool = True,
+    synthesize: bool = True,
 ) -> Optional[LoreResult]:
     """
     Generate or retrieve building lore via a three-tier fallback chain, and say
@@ -973,6 +974,15 @@ async def generate_building_lore_detailed(
         raw_plus = raw if not extra_text else (
             raw + "\n\nAdditional web sources about this building:\n" + extra_text
         )
+        if not synthesize:
+            # Retrieval-only: hand the caller the assembled source material and
+            # let IT do the single piece of writing. Nothing is cached, because
+            # material is not an answer — caching it is what put flat,
+            # pre-paraphrased prose in the `storytelling` column in the first
+            # place. See the `material=true` contract in routers/lore.py.
+            return LoreResult(text=raw_plus, tier="landmark_chunks",
+                              specificity=spec, source=src, synthesized=False,
+                              sources=_merge_sources([src], _bs2.source_urls(extra, limit=3)))
         lore = await _synthesize(raw_plus, building_name, address, year_built,
                                            style, architect, block_ctx, arch_n, near)
         if lore:
@@ -1023,6 +1033,11 @@ async def generate_building_lore_detailed(
             raw_plus = raw if not extra_text else (
                 raw + "\n\nAdditional web sources about this building:\n" + extra_text
             )
+            if not synthesize:
+                return LoreResult(
+                    text=raw_plus, tier="wikipedia", specificity="building",
+                    source=wiki_url, synthesized=False,
+                    sources=_merge_sources([wiki_url], _bs2.source_urls(extra, limit=3)))
             lore = await _synthesize(raw_plus, building_name, address, year_built,
                                                style, architect, block_ctx, arch_n, near)
             # A Wikipedia extract is at least written prose, so serving it raw is
@@ -1068,6 +1083,12 @@ async def generate_building_lore_detailed(
             block_ctx = await _bounded(_get_block_context(session, bin_val), 'block_context')
             arch_n = await _bounded(_get_architect_catalogue_count(session, architect), 'architect_count')
             near = await _bounded(_get_nearby_lore(session, bin_val), 'nearby_lore')
+            if not synthesize:
+                urls = brave_search.source_urls(results)
+                return LoreResult(text=raw, tier="brave_search",
+                                  specificity="building",
+                                  source=urls[0] if urls else None,
+                                  synthesized=False, sources=urls)
             lore = await _synthesize(raw, building_name, address,
                                                year_built, style, architect,
                                                block_ctx, arch_n, near)
@@ -1088,6 +1109,11 @@ async def generate_building_lore_detailed(
     # longer searches anything — the old name would have kept reporting web
     # coverage the chain had stopped providing, and `tier` is the metric the
     # spend decision rests on.
+    # Tier 4 has no MATERIAL to give: it writes from the building's own DB
+    # fields, which the client already has. Returning a description here would
+    # hand Kit its own input back as though it were a source.
+    if not synthesize:
+        return None
     lore = await _describe_from_fields(building_name, address, year_built,
                                        style, architect, materials)
     if lore:

@@ -202,3 +202,68 @@ async def test_retry_reuses_the_same_prompt(llm):
     await synth()
     assert fake.calls[0]["user"] == fake.calls[1]["user"]
     assert fake.calls[0]["system"] == fake.calls[1]["system"]
+
+
+# ── material mode: retrieval without writing ────────────────────────────────
+#
+# `synthesize=False` exists to stop the app paying for the same web search
+# twice: the backend retrieves, the client writes. Two things must hold, and
+# both fail silently if broken — a regression would just quietly restore the
+# duplicate LLM spend, or cache raw OCR typescript as a building's permanent
+# story. Hence the assertions on the source itself rather than on a live call.
+
+def test_material_mode_returns_before_every_synthesize_call():
+    """No tier may reach `_synthesize` when synthesize=False."""
+    import ast, inspect
+
+    src = inspect.getsource(lore.generate_building_lore_detailed)
+    tree = ast.parse(src.lstrip())
+    fn = tree.body[0]
+
+    # Every LoreResult built with synthesized=False must be a plain `return`
+    # guarded by `if not synthesize:` — i.e. it short-circuits the tier.
+    guards = [
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.If)
+        and isinstance(n.test, ast.UnaryOp)
+        and isinstance(n.test.op, ast.Not)
+        and getattr(n.test.operand, "id", None) == "synthesize"
+    ]
+    assert len(guards) >= 4, (
+        "expected a `if not synthesize:` guard in each of the three material "
+        f"tiers plus the fields-only decline, found {len(guards)}"
+    )
+    for g in guards:
+        # A guard may prepare its return value (the Brave tier collects `urls`
+        # first), but it must END in a return and must never synthesize.
+        assert isinstance(g.body[-1], ast.Return), (
+            "a material guard falls through instead of returning"
+        )
+        called = {
+            getattr(n.func, "id", None)
+            for n in ast.walk(g) if isinstance(n, ast.Call)
+        }
+        assert "_synthesize" not in called, (
+            "a material guard calls _synthesize — that is the duplicate spend "
+            "this mode exists to remove"
+        )
+
+
+def test_material_results_are_flagged_unsynthesized():
+    """The client gates on `synthesized`; material must never claim to be prose."""
+    import ast, inspect
+
+    src = inspect.getsource(lore.generate_building_lore_detailed)
+    fn = ast.parse(src.lstrip()).body[0]
+
+    flagged = []
+    for node in ast.walk(fn):
+        if (isinstance(node, ast.Return) and isinstance(node.value, ast.Call)
+                and getattr(node.value.func, "id", None) == "LoreResult"):
+            kw = {k.arg: ast.unparse(k.value) for k in node.value.keywords}
+            flagged.append(kw.get("synthesized"))
+
+    assert flagged.count("False") == 3, (
+        "expected exactly three material returns (landmark, wikipedia, brave); "
+        f"got {flagged}"
+    )
