@@ -120,20 +120,30 @@ class TestFallbackRpcStaysUnderAnonTimeout:
     backend is slow.
     """
 
-    def test_is_well_under_three_seconds(self):
+    @pytest.mark.parametrize("q", [
+        "art deco theater",
+        # The one that actually timed out: its longest token is "building",
+        # the LEAST selective word in the corpus (3,474 rows vs 1 for
+        # "chrysler"). Picking a pivot by length put the client's fallback
+        # over anon's 3s limit, so the app fell back to Apple Maps only.
+        "empire state building",
+        "chrysler building",
+        "mckim mead",
+    ])
+    def test_is_well_under_three_seconds(self, q):
         url = os.environ.get("DATABASE_URL")
         if not url:
             pytest.skip("needs DATABASE_URL (the BUILDINGS project)")
         import psycopg2
         with psycopg2.connect(url) as conn, conn.cursor() as c:
             t = time.time()
-            c.execute("SELECT count(*) FROM buildings_text_search(%s, 20, false)",
-                      ("art deco theater",))
+            c.execute("SELECT count(*) FROM buildings_text_search(%s, 20, false)", (q,))
             c.fetchall()
             elapsed = time.time() - t
         assert elapsed < 2.0, (
-            f"buildings_text_search took {elapsed:.2f}s; anon's statement_timeout "
-            "is 3s and this is the client's fallback path."
+            f"buildings_text_search({q!r}) took {elapsed:.2f}s; anon's "
+            "statement_timeout is 3s and this is the client's fallback path -- "
+            "when it dies the app shows Apple Maps results only."
         )
 
 
