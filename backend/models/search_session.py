@@ -37,8 +37,12 @@ def init_search_engine():
     search_engine = create_async_engine(
         database_url,
         echo=settings.debug,
-        pool_size=3,
-        max_overflow=2,
+        pool_size=settings.db_pool_size,
+        max_overflow=settings.db_max_overflow,
+        # Without a timeout SQLAlchemy waits 30s for a free connection, so a
+        # saturated pool surfaces as a hung request rather than an error the
+        # caller can act on.
+        pool_timeout=settings.db_pool_timeout,
         pool_pre_ping=True,
         pool_recycle=300,
         # hnsw.ef_search is the HNSW candidate list size, and pgvector defaults

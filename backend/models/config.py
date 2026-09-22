@@ -20,6 +20,25 @@ class Settings(BaseSettings):
     footprints_db_url: Optional[str] = None  # Railway database for building footprints
     search_db_url: Optional[str] = None  # Dedicated pgvector DB for the semantic search index
 
+    # Connection pool sizing for the two Railway databases. Tunable from the
+    # Railway service variables so a saturated pool is a config change, not a
+    # redeploy.
+    #
+    # These were hardcoded at pool_size=3, max_overflow=2 — five connections
+    # total — and a SINGLE beta tester exhausted them, producing 30-second
+    # QueuePool timeouts on /api/search/unified and /api/lore. The cause is that
+    # one unified search fans out into several concurrent queries, so one user
+    # request can hold more than one connection at a time; five was under one
+    # user's working set, never mind twenty.
+    #
+    # 10 + 10 gives 20 per container, comfortably inside Railway Postgres's
+    # default max_connections (100) even with a couple of containers running.
+    db_pool_size: int = 10
+    db_max_overflow: int = 10
+    # Fail fast instead of hanging the request for half a minute. A queue wait
+    # this long is a saturated pool, and the client has given up long before.
+    db_pool_timeout: int = 10
+
     # Redis (optional - can be disabled for initial deployment)
     redis_url: Optional[str] = None
 
