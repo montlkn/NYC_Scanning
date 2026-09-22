@@ -110,7 +110,7 @@ DROP = re.compile(
     r"telecom|utility|wholesale|"
     # Whole tokens only: as prefixes these ate "caribbean_restaurant" (car),
     # "spanish_restaurant" (spa) and "art_supply_store" (supply).
-    r"(?:car|auto|spa|nail|bank|gym|legal|agency|delivery|rental|repair|"
+    r"(?:car|auto|spa|nail|bank|gym|law|legal|agency|delivery|rental|repair|"
     r"production|productions|production_services|assembly|equipment)(?=$|_)|"
     # Trailing only: a "designer" or "architect" is an office, but
     # "designer_clothing" is a shop and "architectural_tours" a tour.

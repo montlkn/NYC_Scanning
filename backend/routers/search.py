@@ -1854,6 +1854,7 @@ async def search_unified(
     user_vector: Optional[str] = Query(None, description="9 comma-separated floats: user's aesthetic archetype vector"),
     scanned_bins: Optional[str] = Query(None, description="CSV of bins the user has already scanned (novelty nudge)"),
     debug: bool = Query(False, description="Include a per-hit score breakdown (_debug). For tuning; never cached."),
+    area: bool = Query(False, description="'Search this area': radius_m is a HARD bound for every intent and every leg"),
 ) -> Dict[str, Any]:
     """Cross-corpus search: buildings + venues + layers (lore/plaques/
     contributions), fused via Reciprocal Rank Fusion with intent-aware corpus
@@ -1873,7 +1874,7 @@ async def search_unified(
     cache_key = _result_cache_key(
         q, lat, lng, radius_m, limit,
         (year_from, year_to, borough, style_family, material, lore_status,
-         landmark, user_vector, scanned_bins),
+         landmark, user_vector, scanned_bins, area),
     )
     cached_resp = None if debug else _result_cache_get(cache_key)
     if cached_resp is not None:
@@ -1895,6 +1896,12 @@ async def search_unified(
     q_hoods, q_boros = _query_places(q)
     if q_hoods or q_boros:
         soft_radius = True
+    # "Search this area" is the user drawing the boundary by moving the map.
+    # It overrides every softening above: results outside the viewport are
+    # exactly what the button exists to exclude.
+    area_bound = bool(area and lat is not None and lng is not None and radius_m)
+    if area_bound:
+        soft_radius = False
 
     # LLM expansion, started NOW so it runs alongside retrieval rather than
     # after it. See INTERP_VERSION in services/unified_search.py.
@@ -1966,6 +1973,13 @@ async def search_unified(
         return _post_filter(b, v, l)
 
     def _post_filter(buildings_hits, venues_hits, layers_hits):
+        if area_bound:
+            # Belt and braces over the SQL radius: some pools (typo, lore,
+            # neighborhood) are unions that do not all carry the WHERE, and a
+            # rewrite leg must not reintroduce what the viewport excludes.
+            def _inside(hs):
+                return [h for h in hs if h.get("dist_m") is not None and h["dist_m"] <= radius_m * 1.05]
+            buildings_hits, venues_hits, layers_hits = _inside(buildings_hits), _inside(venues_hits), _inside(layers_hits)
         if landmark is not None:
             buildings_hits = [h for h in buildings_hits if h.get("landmark") == landmark]
         if style_family:
@@ -2040,6 +2054,7 @@ async def search_unified(
     else:
         buildings_hits, venues_hits, layers_hits = await _retrieve(qvec_lit, q_lex)
     raw_legs = {"buildings": buildings_hits, "venues": venues_hits, "layers": layers_hits}
+    t_first = time.monotonic()
 
     # Wait for the model only when the user's own words did not already find
     # the answer. "chrysler building" must not pay 2.5s for a rewrite it does
@@ -2061,6 +2076,7 @@ async def search_unified(
     elif interp is None and interp_task is not None:
         asyncio.create_task(_mark_direct_when_ready(q, interp_task, bool(direct)))
 
+    t_llm = time.monotonic()
     legs = {
         name: [RankedHit(name, h["id"], i + 1, h) for i, h in enumerate(hits) if h.get("id")]
         for name, hits in raw_legs.items()
@@ -2093,6 +2109,7 @@ async def search_unified(
         logger.info(f"[unified] expanded {q!r} -> {expansion_queries} "
                     f"cats={interp.get('categories')} hoods={interp.get('neighborhoods')} boros={interp.get('boroughs')}")
 
+    t_expand = time.monotonic()
     fused = reciprocal_rank_fusion(legs, weights)
 
     # Where the query asked to be: phrases found in the query itself, plus
@@ -2283,6 +2300,15 @@ async def search_unified(
         "facets": facets,
         "hits": hits,
     }
+    if debug:
+        resp["_timing"] = {
+            "first_pass_ms": round((t_first - start) * 1000),
+            "llm_wait_ms": round((t_llm - t_first) * 1000),
+            "expansion_ms": round((t_expand - t_llm) * 1000),
+            "total_ms": round(latency_ms),
+            "direct": direct, "pre_expand": pre_expand,
+            "expansions": expansion_queries,
+        }
     if not debug:
         _result_cache_put(cache_key, resp)
     return resp
