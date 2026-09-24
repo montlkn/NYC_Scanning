@@ -6,10 +6,18 @@ GPS + ARKit heading); the client inserts its own `scans` row directly into
 Supabase. The only backend job left on the scan path is archiving the photo
 when the user explicitly opts in — which is async and fire-and-forget from
 the client's perspective, so Render cold start no longer matters.
+
+Auth: the caller must send `Authorization: Bearer <MAIN Supabase access
+token>` and must own the scan row (`scans.user_id` == token `sub`). Without
+this, anyone who knew a scan id could overwrite that user's saved photo.
+Anonymous (guest) sessions are refused: guest scans live on-device and are
+replayed under the real user id at signup, and the app never uploads a photo
+for a guest. `SCAN_PHOTO_ALLOW_UNAUTHENTICATED=true` temporarily admits
+header-less requests from pre-auth app builds during rollout.
 """
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Request
-from sqlalchemy import update
+from sqlalchemy import select, update
 from datetime import datetime, timezone
 import logging
 
@@ -17,6 +25,8 @@ from models.database import Scan
 from models.session import AsyncSessionLocal
 from utils.storage import upload_image
 from utils.rate_limit import limiter, LIMIT_SCAN
+from utils.auth import bearer_token, verify_supabase_token
+from models.config import get_settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -40,6 +50,8 @@ async def upload_scan_photo(
     photo: UploadFile = File(...),
 ):
     """Store the user's opt-in scan photo on R2 and patch the scan row."""
+    await _authorize(request, scan_id)
+
     photo_bytes = await photo.read()
     if not photo_bytes:
         raise HTTPException(status_code=400, detail="Empty photo")
@@ -70,3 +82,37 @@ async def upload_scan_photo(
         logger.error(f"scan-photo row patch failed for {scan_id}: {e}")
 
     return {"scan_id": scan_id, "photo_url": photo_url}
+
+
+async def _authorize(request: Request, scan_id: str) -> None:
+    """Raise unless the caller may write the photo for `scan_id`."""
+    token = bearer_token(request)
+    if token is None:
+        if get_settings().scan_photo_allow_unauthenticated:
+            # Legacy client (pre-auth build). Allowed only while the rollout
+            # flag is on; logged so the tail of old clients is visible.
+            logger.warning(f"scan-photo: unauthenticated legacy upload for {scan_id}")
+            return
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    user = await verify_supabase_token(token)
+    if user.is_anonymous:
+        raise HTTPException(status_code=403, detail="Sign in to save photos")
+
+    try:
+        async with AsyncSessionLocal() as db:
+            owner = (
+                await db.execute(select(Scan.user_id).where(Scan.id == scan_id))
+            ).first()
+    except Exception as e:
+        logger.error(f"scan-photo owner lookup failed for {scan_id}: {e}")
+        raise HTTPException(status_code=503, detail="Database unavailable")
+
+    if owner is None:
+        # The client inserts the row itself and may upload before the insert
+        # lands; 404 tells it to retry.
+        raise HTTPException(status_code=404, detail="Scan not found")
+    # The iOS client writes `UUID.uuidString` (uppercase); the JWT sub is
+    # lowercase. Same uuid, so compare case-insensitively.
+    if not owner[0] or owner[0].lower() != user.id.lower():
+        raise HTTPException(status_code=403, detail="Not your scan")
