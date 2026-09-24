@@ -1969,7 +1969,37 @@ def order_by_tier(hits: List[Dict[str, Any]], tiers: List[int], has_geo: bool) -
     t2 = [i for i in idx if tiers[i] == 2]
     if has_geo:
         t1.sort(key=lambda i: (hits[i].get("dist_m") is None, hits[i].get("dist_m") or 0.0))
-    return [hits[i] for i in t0 + t1 + t2]
+    return host_before_tenants([hits[i] for i in t0 + t1 + t2])
+
+
+def host_before_tenants(ordered: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """A building outranks the venues inside it when it scored at least as
+    well as each of them.
+
+    Tenants carry their host's name, so they match the same words. When the
+    building misses tier 0 (a typo: "radiator builidng" is not "american
+    radiator"), it and its tenants all land in tier 1 sorted by distance, and
+    five bars at the same address beat the building by a few metres even
+    though it scored 1.28 against their 0.29. Moves the building up to just
+    before its first out-scored tenant. Stable otherwise; never moves a
+    building above a tenant that scored higher ("seagram bar" -> The Bar)."""
+    out = list(ordered)
+    for h in ordered:
+        if h.get("type") != "building" or not h.get("bin"):
+            continue
+        i = next(k for k, x in enumerate(out) if x is h)
+        score = h.get("score") or 0.0
+        j = i
+        for k in range(i - 1, -1, -1):
+            x = out[k]
+            if x.get("type") != "venue" or x.get("bin") != h["bin"]:
+                continue
+            if (x.get("score") or 0.0) > score:
+                break
+            j = k
+        if j < i:
+            out.insert(j, out.pop(i))
+    return out
 
 
 # A real match needs this many near the user before the search stops looking

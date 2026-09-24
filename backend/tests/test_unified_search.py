@@ -890,3 +890,24 @@ def test_architect_match_bonus():
     assert architect_match_bonus("cass gilbert", "") == 0.0
     # A query of pure noise must not match every architect in the corpus.
     assert architect_match_bonus("buildings designed by the architect", "Cass Gilbert") == 0.0
+
+
+def test_host_building_leads_its_outscored_tenants():
+    from services.unified_search import host_before_tenants
+    hits = [
+        {"type": "venue", "bin": "1080745", "score": 0.29, "name": "Chic REPUBLIC"},
+        {"type": "venue", "bin": "4439070", "score": 0.49, "name": "Radiator Studios"},
+        {"type": "venue", "bin": "1080745", "score": 0.28, "name": "Celon"},
+        {"type": "building", "bin": "1080745", "score": 1.28, "name": "American Radiator Building"},
+    ]
+    assert [h["name"] for h in host_before_tenants(hits)] == [
+        "American Radiator Building", "Chic REPUBLIC", "Radiator Studios", "Celon"]
+
+
+def test_host_building_never_passes_a_higher_scoring_tenant():
+    from services.unified_search import host_before_tenants
+    hits = [
+        {"type": "venue", "bin": "1", "score": 2.0, "name": "The Bar"},
+        {"type": "building", "bin": "1", "score": 1.0, "name": "Seagram Building"},
+    ]
+    assert [h["name"] for h in host_before_tenants(hits)] == ["The Bar", "Seagram Building"]
