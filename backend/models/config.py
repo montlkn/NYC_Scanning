@@ -53,6 +53,12 @@ class Settings(BaseSettings):
     r2_user_images_bucket: str = "user-images"
     r2_user_images_public_url: Optional[str] = None
 
+    # ROLLOUT FLAG, delete once the auth-sending iOS build is the minimum
+    # version in use. When true, /api/scan-photo still accepts uploads with NO
+    # Authorization header (older TestFlight builds). A request that does send
+    # a token is always fully verified either way. Default false = secure.
+    scan_photo_allow_unauthenticated: bool = False
+
     # Optional APIs
     perplexity_api_key: Optional[str] = None
 
