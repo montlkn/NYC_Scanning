@@ -1296,7 +1296,14 @@ async def _leg_buildings(
         -- boost): the leg's LIMIT would otherwise cut a high-fame row (the
         -- Chrysler Building for "art deco") on raw fused score before the
         -- boost ever sees it. :fame_w is 0 for non-fame intents.
-        ORDER BY ({fused} + :fame_w * coalesce(b.fame, 0)) DESC
+        -- A row whose own name IS the query leads the leg. "flatiron
+        -- building" near Madison Square matched the Flatiron neighborhood on
+        -- every nearby row with the same lexical score, and the closer ones
+        -- cut the Flatiron Building itself before ranking ever saw it.
+        ORDER BY ({fused} + :fame_w * coalesce(b.fame, 0)
+                  + CASE WHEN (SELECT max(similarity(lower(:q_lex), lower(a)))
+                                 FROM unnest(string_to_array(coalesce(b.name_norm, ''), ' | ')) a)
+                              >= 0.6 THEN 1.0 ELSE 0 END) DESC
         LIMIT :limit
     """
 
@@ -1806,7 +1813,7 @@ The database holds three things:
 3. Business listings: a venue name, a category such as "Cocktail Bar", "Wine Bar", "Speakeasy", "Coffee Shop", "Art Gallery", and a neighborhood.
 
 Reply with JSON only, no prose, no code fences:
-{"queries": [...], "categories": [...], "neighborhoods": [...], "boroughs": [...], "styles": [...], "years": [from, to] or null, "about": "buildings" | "places" | "stories" | "mixed"}
+{"queries": [...], "categories": [...], "neighborhoods": [...], "boroughs": [...], "styles": [...], "years": [from, to] or null, "about": "buildings" | "places" | "stories" | "mixed", "picks": [{"name": ..., "hood": ..., "note": ...}], "events": true | false, "genres": [...]}
 
 queries: 1 to 3 phrases of 1 to 5 words, written the way the DATABASE describes things, never the way people search. Turn moods into concrete things a report, a history or a listing would literally say. When the query is vague, give each phrase a DIFFERENT angle (architecture, history, a place to go) rather than three wordings of one idea. When the query asks for a kind of place (a bar, a cafe, a church), EVERY phrase names that kind of place. Use distinctive words only: never "house", "building", "place", "spot", "site", "location", "NYC", "New York", "near me", "best", "ideas", "things to do". If the query names a specific building, business, person or event, return that exact name as the only phrase.
 categories: listing categories, only when the query asks for a kind of place to go. Otherwise [].
@@ -1815,13 +1822,18 @@ boroughs: any of Manhattan, Brooklyn, Queens, Bronx, Staten Island the query nam
 styles: architectural style names, as a designation report writes them, that the query names or implies ("modernist" -> "international style", "mid-century modern", "brutalist", "modern"). Otherwise [].
 years: [from, to] when the query names or implies a period ("modernist" -> [1930, 1975], "gilded age" -> [1870, 1910], "prewar" -> [1880, 1940]). Otherwise null.
 If the query is misspelt, the FIRST phrase is the query with its spelling fixed and nothing else changed.
+picks: the specific real New York places or buildings a well-informed local would name as the best answers, up to 8, when the query is a vibe, a mood, a scene, slang, a superlative, a cuisine or style of place, or an architect's or firm's work ("chic bars", "dim lit bars", "romantic dinner", "old school italian", "cool hangout", "buildings by frank lloyd wright"). Read slang generously: "cunt", "slay", "serving", "giving" mean fashionable, fierce, glamorous, see-and-be-seen. name is the exact name the place goes by; hood is its neighborhood; note is 3 to 8 plain words on why it fits ("Piano bar inside the Carlyle"). Only places that exist; prefer ones still open; never invent. Name a place only if you are confident it fits this query; three right answers beat eight guesses. [] when the query already names one specific thing, or asks about history or architectural features rather than where to go or whose work.
+events: true when the query asks what is on or happening now or soon (tonight, this weekend, a party, a gig, a DJ, live music, clubbing). Otherwise false.
+genres: music genres the query names or implies for events ("techno", "house", "jazz"). Otherwise [].
 about: what the answer should mostly be. "buildings" for architecture (styles, features, materials, architects); "places" for somewhere to go (bars, cafes, shops, parks); "stories" for history, people and events (who lived where, crimes, disasters, hauntings, demolished things); "mixed" when it is genuinely several.
 
 Examples:
 "creepy places" -> {"queries":["cemetery mausoleum","haunted ghost story","murder"],"categories":[],"neighborhoods":[],"boroughs":[],"styles":["gothic revival"],"years":null,"about":"mixed"}
 "brutalist cafes in soho" -> {"queries":["cafe brutalist concrete","coffee shop modern building"],"categories":["Coffee Shop","Cafe","Café"],"neighborhoods":["SoHo"],"boroughs":[],"styles":["brutalist","modern"],"years":[1950,1980],"about":"places"}
 "woolworth bar" -> {"queries":["Woolworth Building"],"categories":["Cocktail Bar","Bar","Lounge"],"neighborhoods":[],"boroughs":[],"styles":[],"years":null,"about":"places"}
-"date night queens" -> {"queries":["candlelit restaurant","wine bar garden"],"categories":["Restaurant","Wine Bar","Italian Restaurant","French Restaurant"],"neighborhoods":[],"boroughs":["Queens"],"styles":[],"years":null,"about":"places"}"""
+"date night queens" -> {"queries":["candlelit restaurant","wine bar garden"],"categories":["Restaurant","Wine Bar","Italian Restaurant","French Restaurant"],"neighborhoods":[],"boroughs":["Queens"],"styles":[],"years":null,"about":"places","picks":[{"name":"Bohemian Hall & Beer Garden","hood":"Astoria","note":"Century-old Czech beer garden"}],"events":false,"genres":[]}
+"techno tonight" -> {"queries":["techno club","dance club warehouse"],"categories":["Dance Club","Music Venue","Nightclub"],"neighborhoods":[],"boroughs":[],"styles":[],"years":null,"about":"places","picks":[{"name":"Nowadays","hood":"Ridgewood","note":"Indoor-outdoor dance club, long sets"},{"name":"Basement","hood":"Maspeth","note":"Concrete techno bunker under a warehouse"}],"events":true,"genres":["techno"]}
+"flatiron building" -> {"queries":["Flatiron Building"],"categories":[],"neighborhoods":[],"boroughs":[],"styles":[],"years":null,"about":"buildings","picks":[],"events":false,"genres":[]}"""
 
 
 async def _get_cached_interpretation(q: str) -> Optional[dict]:
@@ -1885,9 +1897,9 @@ async def _interpret_and_cache(q: str) -> Optional[dict]:
             user=q,
             # Reasoning is off in openai_text, so this is all answer. The
             # answer is ~60 tokens; 300 is headroom, not a target.
-            max_tokens=300,
+            max_tokens=900,
             timeout_s=10.0,
-            cache_key="jink-search-interp-v6",
+            cache_key=f"jink-search-interp-v{INTERP_VERSION}",
         )
         interp = parse_interpretation(raw, q)
         if interp is None:
@@ -1898,6 +1910,138 @@ async def _interpret_and_cache(q: str) -> Optional[dict]:
     except Exception as e:
         logger.info(f"[unified] interpretation skipped for {q!r}: {e}")
         return None
+
+
+# ---------------------------------------------------------------------------
+# Picks: the model's named answers, resolved against our own rows.
+#
+# Venues carry a name, a category and a host building, nothing else: no
+# reviews, no ratings, no description. So "chic bars", "dim lit", "romantic"
+# and slang had nothing to match and fell back to "the nearest bar". The
+# model does know which bars are chic. It names them; a name only becomes a
+# result when it matches a venue or building we hold, so an invented or
+# closed place cannot show.
+# ---------------------------------------------------------------------------
+
+PICK_VENUE_MIN_SIM = 0.6
+PICK_BUILDING_MIN_SIM = 0.55
+
+
+def _meters(lat1, lng1, lat2, lng2) -> Optional[float]:
+    import math
+    if None in (lat1, lng1, lat2, lng2):
+        return None
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = p2 - p1, math.radians(lng2 - lng1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 6371000.0 * 2 * math.asin(math.sqrt(a))
+
+
+async def _resolve_picks(picks: List[dict], about: Optional[str],
+                         lat: Optional[float], lng: Optional[float]) -> List[dict]:
+    """One hit per pick that matches a row, in the model's order."""
+    if not picks:
+        return []
+    names = [p["name"] for p in picks]
+    hoods = [p.get("hood") or "" for p in picks]
+    venues_sql = text("""
+        SELECT p.ord, v.fsq_id, v.name, v.category, v.lat, v.lng, v.bin, v.bbl,
+               v.building_year, v.building_style, v.neighborhood, v.borough,
+               v.photo_url, v.snippet, v.sim
+          FROM unnest(CAST(:names AS text[]), CAST(:hoods AS text[])) WITH ORDINALITY AS p(n, hood, ord)
+          CROSS JOIN LATERAL (
+            SELECT fsq_id, name, category, lat, lng, bin, bbl, building_year, building_style,
+                   neighborhood, borough, photo_url, snippet,
+                   similarity(lower(p.n), lower(name)) AS sim
+              FROM venues
+             WHERE searchable IS NOT FALSE
+               AND lower(name || ' ' || coalesce(snippet, '')) %> lower(p.n)
+             -- Several rows share a name (branches, stale duplicates with the
+             -- wrong coordinates); the one in the neighborhood the model
+             -- named wins.
+             ORDER BY similarity(lower(p.n), lower(name))
+                      + CASE WHEN p.hood <> '' AND lower(coalesce(neighborhood, ''))
+                                  LIKE '%' || lower(split_part(p.hood, ' ', 1)) || '%'
+                             THEN 0.3 ELSE 0 END DESC
+             LIMIT 1
+          ) v
+    """)
+    buildings_sql = text("""
+        SELECT p.ord, b.bin, b.bbl, b.snippet, b.year_built, b.style_family, b.lat, b.lng,
+               b.photo_url, b.architect, b.neighborhood, b.borough, b.fame, b.sim
+          FROM unnest(CAST(:names AS text[])) WITH ORDINALITY AS p(n, ord)
+          CROSS JOIN LATERAL (
+            SELECT bin, bbl, snippet, year_built, style_family, lat, lng, photo_url,
+                   architect, neighborhood, borough, fame,
+                   (SELECT max(similarity(lower(p.n), lower(a)))
+                      FROM unnest(string_to_array(name_norm, ' | ')) a) AS sim
+              FROM building_search_index
+             WHERE lower(name_norm) %> lower(p.n)
+             ORDER BY sim DESC NULLS LAST, fame DESC NULLS LAST
+             LIMIT 1
+          ) b
+    """)
+    try:
+        async with get_search_db() as db:
+            if db is None:
+                return []
+            vrows = (await db.execute(venues_sql, {"names": names, "hoods": hoods})).mappings().all()
+            brows = (await db.execute(buildings_sql, {"names": names})).mappings().all()
+    except Exception as e:
+        logger.info(f"[unified] pick resolution skipped: {e}")
+        return []
+
+    best: Dict[int, dict] = {}
+    import re as _re
+
+    def _words(x: str) -> set:
+        return {w for w in _re.split(r"[^\w']+", (x or "").lower()) if w}
+
+    for r in vrows:
+        # Close on the whole string, or every word of the pick is in the name
+        # ("230 Fifth" is "230 Fifth Rooftop Bar"). A near-spelling is not:
+        # "Tino's Cucina" is not "Tina's Cuban".
+        pick_words = _words(picks[r["ord"] - 1]["name"]) - {"the"}
+        if (r["sim"] or 0) < PICK_VENUE_MIN_SIM and not (pick_words and pick_words <= _words(r["name"])):
+            continue
+        best[r["ord"]] = {
+            "type": "venue", "id": r["fsq_id"],
+            "bin": str(r["bin"]).replace(".0", "") if r["bin"] else None,
+            "bbl": str(r["bbl"]).replace(".0", "") if r["bbl"] else None,
+            "name": (r["name"] or "").strip(), "snippet": r["snippet"],
+            "year": r["building_year"], "style": r["building_style"],
+            "category": r["category"], "lat": r["lat"], "lng": r["lng"],
+            "photo_url": r["photo_url"], "lore_status": None, "_sim": float(r["sim"]),
+        }
+    for r in brows:
+        sim = float(r["sim"] or 0)
+        if sim < PICK_BUILDING_MIN_SIM:
+            continue
+        cur = best.get(r["ord"])
+        # A building beats a venue only when it is the better name match, or
+        # an equal one on a query about architecture.
+        if cur and (cur["_sim"] > sim or (cur["_sim"] == sim and about != "buildings")):
+            continue
+        snippet = r["snippet"] or ""
+        name = snippet.split("—", 1)[0].strip() if "—" in snippet else snippet
+        bin_ = str(r["bin"]).replace(".0", "") if r["bin"] else None
+        best[r["ord"]] = {
+            "type": "building", "id": bin_, "bin": bin_,
+            "bbl": str(r["bbl"]).replace(".0", "") if r["bbl"] else None,
+            "name": name or picks[r["ord"] - 1]["name"], "snippet": snippet or None,
+            "year": r["year_built"], "style": r["style_family"], "category": None,
+            "lat": r["lat"], "lng": r["lng"], "photo_url": r["photo_url"],
+            "lore_status": None, "_sim": sim,
+        }
+    out = []
+    for ord_, h in sorted(best.items()):
+        h.pop("_sim", None)
+        h["why"] = picks[ord_ - 1].get("note") or ""
+        h["dist_m"] = (round(_meters(lat, lng, h["lat"], h["lng"]), 1)
+                       if lat is not None and lng is not None and h["lat"] is not None else None)
+        h["pick"] = True
+        out.append(h)
+    return out
 
 
 async def _log_query(q: str, intent: str, latency_ms: float, result_ids: List[str]) -> None:
@@ -2251,7 +2395,10 @@ async def search_unified(
     # the answer. "chrysler building" must not pay 2.5s for a rewrite it does
     # not need; "spooky spots" should.
     direct = has_direct_match(q_lex, intent, raw_legs)
-    if interp is None and interp_task is not None and not direct:
+    # A kind of place ("chic bars") also waits, once per query: a venue
+    # named "Chic Republic" made the words look answered, and the picks,
+    # the actual chic bars, never ran.
+    if interp is None and interp_task is not None and (not direct or intent == "poi"):
         remaining = INTERP_WAIT_S - (time.monotonic() - start)
         if remaining > 0:
             try:
@@ -2514,6 +2661,16 @@ async def search_unified(
     # for a KIND of thing ("bars near grand central"). A bare name ("chrysler
     # building") keeps its context ranked by relevance, not its tenants.
     _asks_kind = bool(q_toks - named_toks)
+    # A building whose whole name IS the query is the thing, even when every
+    # word of it is generic: "flatiron" is a neighborhood, so the Flatiron
+    # Building had no distinctive word, sorted by distance among forty
+    # things "in Flatiron", and fell off the list. The name goes through the
+    # same stopword strip as the query ("building" is one). Buildings only:
+    # a venue literally named "Wine Bar" is not the answer to "wine bar".
+    for i, h in enumerate(diversified):
+        if (h.get("type") == "building" and not h["_src"].get("_rewrite") and q_toks
+                and query_content_tokens(_lexical_query(h.get("name") or "")) == q_toks):
+            tiers[i] = 0
     tiers = resolve_entity_mode(tiers, [_asks_kind and carries_name(h["_src"], named_toks) for h in diversified])
     if debug:
         for h, t in zip(diversified, tiers):
@@ -2532,6 +2689,42 @@ async def search_unified(
     hits = apply_diversity_cap(matched + apply_relevance_floor(rest))[:limit]
     for h in hits:
         h.pop("_src", None)
+
+    # The model's named answers lead, nearest first. The user's words did
+    # not find them (a direct match means the words did), so they are what
+    # the query meant. Anything already in the list moves up, not in twice.
+    picks: List[dict] = []
+    if interp and interp.get("picks"):
+        picks = await _resolve_picks(interp["picks"], interp.get("about"), lat, lng)
+        # "Near me" and "search this area" bound picks like everything else:
+        # "coffee near me" is not answered by a famous roaster 14km away.
+        if (area_bound or not soft_radius) and radius_m and lat is not None:
+            picks = [p for p in picks if p.get("dist_m") is not None and p["dist_m"] <= radius_m * 1.05]
+        if lat is not None and lng is not None:
+            picks.sort(key=lambda p: p["dist_m"] if p.get("dist_m") is not None else 1e12)
+        if picks:
+            ids = {p["id"] for p in picks}
+            bins = {p["bin"] for p in picks if p["type"] == "building" and p.get("bin")}
+            names = {(p["name"] or "").lower() for p in picks}
+            def _dup(h):
+                return (h.get("id") in ids
+                        or (h.get("type") == "building" and h.get("bin") in bins)
+                        or (h.get("type") in ("venue", "apple") and (h.get("name") or "").lower() in names))
+            if debug:
+                for p in picks:
+                    p["_debug"] = {"pick": True}
+            rest_hits = [h for h in hits if not _dup(h)]
+            # When the query named a thing and it was found, it and whatever
+            # carries its name (the bars inside Grand Central) stay first.
+            lead = ([h for h in rest_hits if tier_by_id.get(id(h), 2) <= 1]
+                    if 0 in tiers else [])
+            lead_ids = {id(h) for h in lead}
+            hits = (lead + picks + [h for h in rest_hits if id(h) not in lead_ids])[:max(limit, len(picks))]
+
+    # Some listings carry stray whitespace and CRLFs in their names.
+    for h in hits:
+        if isinstance(h.get("name"), str):
+            h["name"] = " ".join(h["name"].split())
 
     header = build_header(hits, intent)
     facets = build_facets({
@@ -2555,6 +2748,10 @@ async def search_unified(
         "facets": facets,
         "hits": hits,
     }
+    # The query asks what is on. Events live client-side (Resident Advisor),
+    # so the backend only says so, and which genres.
+    if interp and interp.get("events"):
+        resp["events"] = {"genres": interp.get("genres") or []}
     if debug:
         resp["_timing"] = {
             "first_pass_ms": round((t_first - start) * 1000),
@@ -2566,7 +2763,10 @@ async def search_unified(
             "local_names": [h.get("name") for h in _local][:10] if widened is not None else None,
             "expansions": expansion_queries,
         }
-    if not debug:
+    # An answer given before the rewrite arrived is incomplete; caching it
+    # would serve the pick-less version for five minutes after the picks
+    # exist.
+    if not debug and not (interp is None and interp_task is not None):
         _result_cache_put(cache_key, resp)
     return resp
 

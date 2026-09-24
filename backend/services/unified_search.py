@@ -1522,7 +1522,7 @@ def build_facets(available: Dict[str, List[Any]]) -> List[Dict[str, Any]]:
 # candidates but cannot outrank what was literally asked for.
 # ---------------------------------------------------------------------------
 
-INTERP_VERSION = 6
+INTERP_VERSION = 8
 MAX_EXPANSION_QUERIES = 3
 W_EXPANSION_LEG = 1.0        # a rewrite leg counts as much as a corpus leg...
 # ...and the user's own legs are halved when rewrites run. Rewrites only run
@@ -1584,7 +1584,33 @@ def parse_interpretation(raw: Optional[str], q: str) -> Optional[Dict[str, Any]]
         "styles": _str_list(d.get("styles"), 6, 40),
         "years": _year_range(d.get("years")),
         "about": d.get("about") if d.get("about") in _ABOUT_WEIGHTS else None,
+        "picks": _picks(d.get("picks")),
+        "events": d.get("events") is True,
+        "genres": _str_list(d.get("genres"), 4, 30),
     }
+
+
+MAX_PICKS = 8
+
+
+def _picks(v: Any) -> List[Dict[str, str]]:
+    """The model's named answers: [{name, hood, note}]. Names only, never
+    trusted as results until they resolve against our own rows."""
+    if not isinstance(v, list):
+        return []
+    out: List[Dict[str, str]] = []
+    for x in v:
+        if not isinstance(x, dict):
+            continue
+        name = x.get("name")
+        if not isinstance(name, str) or not (2 < len(name.strip()) <= 80):
+            continue
+        hood = x.get("hood") if isinstance(x.get("hood"), str) else ""
+        note = x.get("note") if isinstance(x.get("note"), str) else ""
+        if name.strip().lower() in {p["name"].lower() for p in out}:
+            continue
+        out.append({"name": name.strip(), "hood": hood.strip()[:60], "note": note.strip()[:80]})
+    return out[:MAX_PICKS]
 
 
 # What the query is ABOUT, from the rewrite, as corpus weights. RRF gives each
@@ -1892,6 +1918,14 @@ def tier_of(h: Dict[str, Any], q_toks: set, named_toks: set,
     covered = (bool(q_toks)
                and (q_toks - named_toks) <= _hit_match_tokens(h, with_prose=phrase)
                and named_toks <= _hit_name_tokens(h))
+    # An architect's own buildings are the answer to their name; a report
+    # that MENTIONS Frank Lloyd Wright (2 Park Avenue, Lever House) is not,
+    # and those sorted nearer than the Guggenheim. Two words minimum, so a
+    # lone surname does not claim every building by anyone called White.
+    _who = q_toks - (generic or set()) - _NAME_FILLER
+    if (h.get("type") == "building" and len(_who) >= 2
+            and _who <= _field_tokens(h.get("architect"))):
+        return 0
     # Only a PLACE can be "the thing itself". A lore title that contains the
     # words ("Murder of ...") is a topical match, sorted by distance like any
     # other real match.

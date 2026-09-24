@@ -125,6 +125,8 @@ def main() -> int:
             el = time.time() - t
             t_all.append(el)
             fails = check(case, d.get("hits", []))
+            if case.get("events") and not d.get("events"):
+                fails.append("response lacks the events flag")
             mark = "ok  " if not fails else "FAIL"
             print(f"{mark} {el:4.1f}s  {case['q']!r}")
             for f in fails:
