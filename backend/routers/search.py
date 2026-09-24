@@ -1813,7 +1813,7 @@ The database holds three things:
 3. Business listings: a venue name, a category such as "Cocktail Bar", "Wine Bar", "Speakeasy", "Coffee Shop", "Art Gallery", and a neighborhood.
 
 Reply with JSON only, no prose, no code fences:
-{"queries": [...], "categories": [...], "neighborhoods": [...], "boroughs": [...], "styles": [...], "years": [from, to] or null, "about": "buildings" | "places" | "stories" | "mixed", "picks": [{"name": ..., "hood": ..., "note": ...}], "events": true | false, "genres": [...]}
+{"queries": [...], "categories": [...], "neighborhoods": [...], "boroughs": [...], "styles": [...], "years": [from, to] or null, "about": "buildings" | "places" | "stories" | "mixed", "picks": [{"name": ..., "hood": ..., "note": ...}], "events": true | false, "genres": [...], "kinds": [...], "when": "tonight" | "today" | "weekend" | "week" | null}
 
 queries: 1 to 3 phrases of 1 to 5 words, written the way the DATABASE describes things, never the way people search. Turn moods into concrete things a report, a history or a listing would literally say. When the query is vague, give each phrase a DIFFERENT angle (architecture, history, a place to go) rather than three wordings of one idea. When the query asks for a kind of place (a bar, a cafe, a church), EVERY phrase names that kind of place. Use distinctive words only: never "house", "building", "place", "spot", "site", "location", "NYC", "New York", "near me", "best", "ideas", "things to do". If the query names a specific building, business, person or event, return that exact name as the only phrase.
 categories: listing categories, only when the query asks for a kind of place to go. Otherwise [].
@@ -1823,8 +1823,10 @@ styles: architectural style names, as a designation report writes them, that the
 years: [from, to] when the query names or implies a period ("modernist" -> [1930, 1975], "gilded age" -> [1870, 1910], "prewar" -> [1880, 1940]). Otherwise null.
 If the query is misspelt, the FIRST phrase is the query with its spelling fixed and nothing else changed.
 picks: the specific real New York places or buildings a well-informed local would name as the best answers, up to 8, when the query is a vibe, a mood, a scene, slang, a superlative, a cuisine or style of place, or an architect's or firm's work ("chic bars", "dim lit bars", "romantic dinner", "old school italian", "cool hangout", "buildings by frank lloyd wright"). Read slang generously: "cunt", "slay", "serving", "giving" mean fashionable, fierce, glamorous, see-and-be-seen. name is the exact name the place goes by; hood is its neighborhood; note is 3 to 8 plain words on why it fits ("Piano bar inside the Carlyle"). Only places that exist; prefer ones still open; never invent. Name a place only if you are confident it fits this query; three right answers beat eight guesses. [] when the query already names one specific thing, or asks about history or architectural features rather than where to go or whose work.
-events: true when the query asks what is on or happening now or soon (tonight, this weekend, a party, a gig, a DJ, live music, clubbing). Otherwise false.
+events: true when the query asks what is on or happening now or soon (tonight, this weekend, a party, a gig, a DJ, live music, clubbing), or asks for exhibitions, gallery shows or openings, or film screenings. Otherwise false.
 genres: music genres the query names or implies for events ("techno", "house", "jazz"). Otherwise [].
+kinds: which listings the query asks about, any of "music", "art_opening" (gallery shows and openings), "exhibition" (museum shows), "film" (screenings). [] when it asks about all of them or none.
+when: the time the query asks about: "tonight", "today", "weekend", "week", or null.
 about: what the answer should mostly be. "buildings" for architecture (styles, features, materials, architects); "places" for somewhere to go (bars, cafes, shops, parks); "stories" for history, people and events (who lived where, crimes, disasters, hauntings, demolished things); "mixed" when it is genuinely several.
 
 Examples:
@@ -1832,7 +1834,7 @@ Examples:
 "brutalist cafes in soho" -> {"queries":["cafe brutalist concrete","coffee shop modern building"],"categories":["Coffee Shop","Cafe","Café"],"neighborhoods":["SoHo"],"boroughs":[],"styles":["brutalist","modern"],"years":[1950,1980],"about":"places"}
 "woolworth bar" -> {"queries":["Woolworth Building"],"categories":["Cocktail Bar","Bar","Lounge"],"neighborhoods":[],"boroughs":[],"styles":[],"years":null,"about":"places"}
 "date night queens" -> {"queries":["candlelit restaurant","wine bar garden"],"categories":["Restaurant","Wine Bar","Italian Restaurant","French Restaurant"],"neighborhoods":[],"boroughs":["Queens"],"styles":[],"years":null,"about":"places","picks":[{"name":"Bohemian Hall & Beer Garden","hood":"Astoria","note":"Century-old Czech beer garden"}],"events":false,"genres":[]}
-"techno tonight" -> {"queries":["techno club","dance club warehouse"],"categories":["Dance Club","Music Venue","Nightclub"],"neighborhoods":[],"boroughs":[],"styles":[],"years":null,"about":"places","picks":[{"name":"Nowadays","hood":"Ridgewood","note":"Indoor-outdoor dance club, long sets"},{"name":"Basement","hood":"Maspeth","note":"Concrete techno bunker under a warehouse"}],"events":true,"genres":["techno"]}
+"techno tonight" -> {"queries":["techno club","dance club warehouse"],"categories":["Dance Club","Music Venue","Nightclub"],"neighborhoods":[],"boroughs":[],"styles":[],"years":null,"about":"places","picks":[{"name":"Nowadays","hood":"Ridgewood","note":"Indoor-outdoor dance club, long sets"},{"name":"Basement","hood":"Maspeth","note":"Concrete techno bunker under a warehouse"}],"events":true,"genres":["techno"],"kinds":["music"],"when":"tonight"}
 "flatiron building" -> {"queries":["Flatiron Building"],"categories":[],"neighborhoods":[],"boroughs":[],"styles":[],"years":null,"about":"buildings","picks":[],"events":false,"genres":[]}"""
 
 
@@ -2751,7 +2753,9 @@ async def search_unified(
     # The query asks what is on. Events live client-side (Resident Advisor),
     # so the backend only says so, and which genres.
     if interp and interp.get("events"):
-        resp["events"] = {"genres": interp.get("genres") or []}
+        resp["events"] = {"genres": interp.get("genres") or [],
+                          "kinds": interp.get("kinds") or [],
+                          "when": interp.get("when")}
     if debug:
         resp["_timing"] = {
             "first_pass_ms": round((t_first - start) * 1000),
