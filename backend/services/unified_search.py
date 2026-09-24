@@ -1522,7 +1522,7 @@ def build_facets(available: Dict[str, List[Any]]) -> List[Dict[str, Any]]:
 # candidates but cannot outrank what was literally asked for.
 # ---------------------------------------------------------------------------
 
-INTERP_VERSION = 8
+INTERP_VERSION = 9
 MAX_EXPANSION_QUERIES = 3
 W_EXPANSION_LEG = 1.0        # a rewrite leg counts as much as a corpus leg...
 # ...and the user's own legs are halved when rewrites run. Rewrites only run
@@ -1587,7 +1587,14 @@ def parse_interpretation(raw: Optional[str], q: str) -> Optional[Dict[str, Any]]
         "picks": _picks(d.get("picks")),
         "events": d.get("events") is True,
         "genres": _str_list(d.get("genres"), 4, 30),
+        "kinds": [k for k in _str_list(d.get("kinds"), 4, 20) if k in _EVENT_KINDS],
+        "when": d.get("when") if d.get("when") in _EVENT_WHEN else None,
     }
+
+
+# The kinds MAIN.cultural_events holds; the app filters its own copy by them.
+_EVENT_KINDS = frozenset({"music", "art_opening", "exhibition", "film"})
+_EVENT_WHEN = frozenset({"tonight", "today", "weekend", "week"})
 
 
 MAX_PICKS = 8
