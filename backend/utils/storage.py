@@ -142,7 +142,10 @@ def create_thumbnail_bytes(image_bytes: bytes, size: tuple = (200, 200)) -> Opti
         return output.read()
 
     except Exception as e:
-        logger.error(f"Failed to create thumbnail: {e}")
+        # Handled: caller checks for None and just skips the thumbnail. A
+        # corrupt/unsupported upload isn't a server bug, so this doesn't
+        # need error-level noise in Sentry.
+        logger.warning(f"Failed to create thumbnail: {e}")
         return None
 
 

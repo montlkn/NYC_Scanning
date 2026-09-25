@@ -36,18 +36,25 @@ logger = logging.getLogger(__name__)
 
 settings = get_settings()
 
-# Initialize Sentry for error tracking
-sentry_dsn = os.getenv("SENTRY_DSN", "https://108d23e36bba68c9b84944a310d977bc@o4510116323393536.ingest.us.sentry.io/4510116333355008")
-if sentry_dsn:
+# Initialize Sentry for error tracking. Only for a real deploy -- there is
+# no fallback DSN, because there used to be one, and it meant every local
+# `curl localhost:8079` while debugging reported straight into the shared
+# production Sentry project (tagged environment=development, but still the
+# same issues list everyone triages).
+sentry_dsn = os.getenv("SENTRY_DSN")
+is_deployed = bool(os.getenv("RAILWAY_ENVIRONMENT"))
+if sentry_dsn and is_deployed:
     sentry_sdk.init(
         dsn=sentry_dsn,
         integrations=[FastApiIntegration()],
         traces_sample_rate=0.1,  # 10% of transactions for performance monitoring
-        environment="production" if os.getenv("RENDER") or os.getenv("RAILWAY_ENVIRONMENT") else "development",
+        environment="production",
         release="nyc-scan@1.0.0",
         send_default_pii=True,  # Include request headers and user data
     )
     logger.info("✅ Sentry initialized for error tracking")
+elif sentry_dsn:
+    logger.info("Sentry DSN set but not running under Railway -- skipping init (local/dev run)")
 else:
     logger.warning("⚠️  SENTRY_DSN not set, error tracking disabled")
 
