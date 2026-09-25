@@ -2696,8 +2696,19 @@ async def search_unified(
     # not find them (a direct match means the words did), so they are what
     # the query meant. Anything already in the list moves up, not in twice.
     picks: List[dict] = []
-    if interp and interp.get("picks"):
+    # A history question ("where did famous writers live") is answered by
+    # stories, not by a building the model thinks of.
+    if interp and interp.get("picks") and interp.get("about") != "stories":
         picks = await _resolve_picks(interp["picks"], interp.get("about"), lat, lng)
+        # A venue pick must be the kind of place asked for: "art deco bar"
+        # picked the Russian Tea Room, a restaurant. Sharing one category
+        # word is enough ("Bar" covers "Cocktail Bar"). Buildings pass: a
+        # named landmark is not a mis-kinded bar.
+        from services.unified_search import _tokens as _cat_tokens
+        wanted = {t for c in (interp.get("categories") or []) for t in _cat_tokens(c)}
+        if wanted:
+            picks = [p for p in picks
+                     if p["type"] != "venue" or (set(_cat_tokens(p.get("category") or "")) & wanted)]
         # "Near me" and "search this area" bound picks like everything else:
         # "coffee near me" is not answered by a famous roaster 14km away.
         if (area_bound or not soft_radius) and radius_m and lat is not None:
