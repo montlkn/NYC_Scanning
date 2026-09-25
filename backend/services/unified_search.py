@@ -2101,7 +2101,9 @@ _FOOTNOTE_RE = re.compile(r"(?<=[a-z,;])\s\d{1,2}(?=\s[a-z])|^\d{1,2}\s(?=[A-Z])
 # Scanned-PDF damage: stray tildes, a word split by a space ("lar ger"), a
 # lone consonant fused to a word ("L ~berty"). Sentences carrying it are
 # skipped rather than shown.
-_OCR_DAMAGE_RE = re.compile(r"[~|\\·]|(?:^|\s)[B-HJ-Zb-hj-z] [a-z]{2,}\b|\b[a-z]+ Is\b|\b[a-z]+ Its\b")
+_OCR_DAMAGE_RE = re.compile(r"[~|\\·]|(?:^|\s)[B-HJ-Zb-hj-z] [a-z]{2,}\b")
+# The old reports' OCR capitalizes "is"/"its" mid-sentence; they never are.
+_OCR_CAPS_IS_RE = re.compile(r"(?<=\S) (Is|Its)\b")
 _SENTENCE_RE = re.compile(r"[^.!?]+[.!?]+(?=\s|$)|[^.!?]+$")
 
 
@@ -2114,6 +2116,7 @@ def _prose_sentence(text: str, q_toks: set, width: int = WHY_MAX) -> Optional[st
     flat = re.sub(r"\s+", " ", text)
     for sent in _SENTENCE_RE.findall(flat):
         sent = _FOOTNOTE_RE.sub("", _REPORT_HEADING_RE.sub("", sent.strip(" ,;:-•"))).strip(" ,;:-")
+        sent = _OCR_CAPS_IS_RE.sub(lambda m: " " + m.group(1).lower(), sent)
         # A sentence that starts lowercase was cut mid-word by the splitter
         # or the chunker ("mbody to some extent...").
         if not sent or not sent[0].isupper():
