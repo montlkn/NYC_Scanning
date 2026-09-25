@@ -911,3 +911,20 @@ def test_host_building_never_passes_a_higher_scoring_tenant():
         {"type": "building", "bin": "1", "score": 1.0, "name": "Seagram Building"},
     ]
     assert [h["name"] for h in host_before_tenants(hits)] == ["The Bar", "Seagram Building"]
+
+
+def test_why_skips_report_title_block():
+    from services.unified_search import _prose_sentence, query_content_tokens
+    text = ("Landmarks Preservation Commission May 19, 1981, Designation List 143 LP-2000 "
+            "EMPIRE STATE BUILDING, 350 Fifth Avenue, Borough of Manhattan. Built 1930-31. "
+            "The Empire State Building, for forty years the tallest building in the world, "
+            "remains the most famous skyscraper in New York.")
+    out = _prose_sentence(text, query_content_tokens("empire state building"))
+    assert out.startswith("The Empire State Building, for forty years")
+    assert "LP-" not in out and "Designation" not in out
+
+
+def test_why_skips_ocr_damage_and_returns_none_when_nothing_clean():
+    from services.unified_search import _prose_sentence, query_content_tokens
+    text = "Standing in lower Manhattan, L ~berty Tower is now surrounded by many larger structures."
+    assert _prose_sentence(text, query_content_tokens("liberty tower")) is None

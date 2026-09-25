@@ -2076,6 +2076,49 @@ def _excerpt(text: str, q_toks: set, width: int = WHY_MAX) -> Optional[str]:
     return ("…" if start > 0 else "") + frag + ("…" if end < len(text) else "")
 
 
+# Designation-report furniture: title blocks, catalogue numbers, hearing
+# dates. None of it is evidence, and for a name search the title block is the
+# FIRST place the name appears, so an excerpt around the first match was
+# almost always "...1981, Designation List 143 LP-2000 EMPIRE STATE BUILDING".
+_REPORT_NOISE_RE = re.compile(
+    r"Landmarks Preservation Commission|Designation List \d+|\bLP-\d+|"
+    r"\bBorough of (?:Manhattan|Brooklyn|Queens|the Bronx|Staten Island)\b|"
+    r"\bTax Map Block\b|\bLandmark Site\b|\(Item No\.|\bCalendar No\.|"
+    r"\bpublic hearing\b|\bdesignation report\b",
+    re.IGNORECASE,
+)
+# Scanned-PDF damage: stray tildes, a word split by a space ("lar ger"), a
+# lone consonant fused to a word ("L ~berty"). Sentences carrying it are
+# skipped rather than shown.
+_OCR_DAMAGE_RE = re.compile(r"[~|\\]|(?:^|\s)[B-HJ-Zb-hj-z] [a-z]{2,}\b")
+_SENTENCE_RE = re.compile(r"[^.!?]+[.!?]+(?=\s|$)|[^.!?]+$")
+
+
+def _prose_sentence(text: str, q_toks: set, width: int = WHY_MAX) -> Optional[str]:
+    """A whole, readable sentence from `text` that mentions the query.
+
+    Evidence reads as a sentence, not a window cut mid-word. Skips report
+    boilerplate, SHOUTED title lines and OCR-damaged sentences; returns None
+    when nothing clean is left, and the client hides an empty line."""
+    flat = re.sub(r"\s+", " ", text)
+    for sent in _SENTENCE_RE.findall(flat):
+        sent = sent.strip(" ,;:-")
+        words = sent.split()
+        if len(words) < 6 or _REPORT_NOISE_RE.search(sent) or _OCR_DAMAGE_RE.search(sent):
+            continue
+        letters = [c for c in sent if c.isalpha()]
+        if not letters or sum(c.isupper() for c in letters) / len(letters) > 0.3:
+            continue
+        low = sent.lower()
+        if not any(re.search(r"\b" + re.escape(t), low) for t in q_toks):
+            continue
+        if len(sent) <= width:
+            return sent
+        cut = sent.rfind(" ", 0, width - 1)
+        return sent[: cut if cut > 0 else width - 1].rstrip(" ,;:") + "…"
+    return None
+
+
 _VENUE_HOST_RE = re.compile(r"\bin the ([^.]+)")
 # Only with a style: a bare year repeats the row's meta line.
 _VENUE_ERA_RE = re.compile(r"\bin an? (\d{4} [^.]+?) building")
@@ -2087,7 +2130,12 @@ def evidence_why(h: Dict[str, Any], q_lex: str) -> Optional[str]:
     if t == "building":
         lore = h.get("lore_text") or ""
         if lore and ((h.get("lore_lex") or 0.0) >= LORE_LEX_FLOOR or q_toks & _field_tokens(lore)):
-            ex = _excerpt(lore, q_toks)
+            # Words that are just the building's own name are not evidence:
+            # "empire state building" matching the name inside the report says
+            # nothing. Prefer a sentence matching the OTHER query words, then
+            # fall back to any clean sentence that mentions the name.
+            other = q_toks - _field_tokens(h.get("name") or "")
+            ex = (_prose_sentence(lore, other) if other else None) or _prose_sentence(lore, q_toks)
             if ex:
                 return ex
         return None
