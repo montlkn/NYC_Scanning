@@ -47,6 +47,12 @@ async def confirm_building_v2(
     2. If confirmed BIN was in top 3, stores user photo for future CLIP matching
     3. Tracks accuracy for analytics
     """
+    # Same gate as the scan photo: a signed-in caller must own the scan. The
+    # form's user_id is client-supplied and never trusted for authorization.
+    # Unauthenticated legacy builds pass only while the rollout flag is on.
+    from routers.scan_photo import _authorize
+    await _authorize(request, scan_id)
+
     try:
         logger.info(f"[{scan_id}] V2 confirmation: BIN {confirmed_bin}")
 

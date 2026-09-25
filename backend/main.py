@@ -217,7 +217,12 @@ app = FastAPI(
     description="Point-and-scan building identification using computer vision",
     version="1.0.0",
     lifespan=lifespan,
-    debug=settings.debug
+    debug=settings.debug,
+    # The interactive docs publish every route and parameter to anyone with
+    # the hostname. Development only.
+    docs_url="/docs" if settings.debug else None,
+    redoc_url="/redoc" if settings.debug else None,
+    openapi_url="/openapi.json" if settings.debug else None,
 )
 
 # Per-IP rate limiting. This API has no authentication, so the limiter is the
@@ -328,7 +333,7 @@ async def warm(request: Request):
         await loop.run_in_executor(None, _get_model)
     except Exception as e:
         logger.warning(f"/api/warm: embedding model load failed: {e}")
-        return JSONResponse(status_code=503, content={"status": "cold", "error": str(e)})
+        return JSONResponse(status_code=503, content={"status": "cold"})
 
     try:
         async with get_search_db() as db:
@@ -336,7 +341,7 @@ async def warm(request: Request):
                 await db.execute(sql_text("SELECT 1"))
     except Exception as e:
         logger.warning(f"/api/warm: search DB probe failed: {e}")
-        return JSONResponse(status_code=503, content={"status": "cold", "error": str(e)})
+        return JSONResponse(status_code=503, content={"status": "cold"})
 
     return {"status": "warm"}
 
@@ -345,8 +350,10 @@ async def warm(request: Request):
 app.include_router(scan.router, prefix="/api", tags=["scan"])
 app.include_router(scan_photo.router, prefix="/api", tags=["scan"])
 app.include_router(buildings.router, prefix="/api", tags=["buildings"])
-app.include_router(stamps.router, prefix="/api", tags=["stamps"])
-app.include_router(vetting.router, prefix="/api", tags=["vetting"])
+# stamps + vetting are unmounted: no client calls them, the vetting routes
+# took the acting user_id from the request BODY (anyone could verify, vote or
+# earn XP as anyone), and /leaderboard handed out user ids that /users/{id}/*
+# then answered for. Remount only behind utils.auth.verify_supabase_token.
 app.include_router(rag.router, prefix="/api", tags=["rag"])
 app.include_router(lore.router, prefix="/api", tags=["lore"])
 app.include_router(search.router, prefix="/api", tags=["search"])
