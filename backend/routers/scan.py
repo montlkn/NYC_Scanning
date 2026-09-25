@@ -128,50 +128,32 @@ async def confirm_building_v2(
 
 @router.get("/scan/health")
 @limiter.exempt  # health probe: never limited
-async def scan_health_check(db: AsyncSession = Depends(get_db)):
-    """
-    Health check for V2 scan system.
+async def scan_health_check():
+    """Health check for the footprints database (Railway) the scan path uses.
 
-    Verifies:
-    - Database connection
-    - building_footprints table exists and has data
-    - PostGIS functions are available
+    Public and unauthenticated, so it reports only healthy/unhealthy: error
+    text can carry hostnames and SQL, which is reconnaissance for an attacker.
     """
+    from sqlalchemy import text
+    from models.footprints_session import get_footprints_db
     try:
-        # Check footprints table
-        from sqlalchemy import text
-
-        result = await db.execute(
-            text("SELECT COUNT(*) FROM building_footprints")
-        )
-        footprint_count = result.scalar()
-
-        # Check PostGIS function
-        result = await db.execute(
-            text("""
-                SELECT COUNT(*) FROM find_buildings_in_cone(
-                    40.7128, -74.0060, 45, 100, 60, 5
-                )
-            """)
-        )
-        test_count = result.scalar()
-
+        async with get_footprints_db() as fdb:
+            if fdb is None:
+                raise RuntimeError("footprints DB not configured")
+            # Planner estimate: a COUNT(*) over 1.08M rows on every probe is
+            # wasted work for a liveness check.
+            footprint_count = (await fdb.execute(text(
+                "SELECT reltuples::bigint FROM pg_class WHERE oid = 'building_footprints'::regclass"
+            ))).scalar()
+            test_count = (await fdb.execute(text(
+                "SELECT COUNT(*) FROM find_buildings_in_cone(40.7128, -74.0060, 45, 100, 60, 5)"
+            ))).scalar()
         return {
             'status': 'healthy',
             'version': 'v2',
             'footprints_loaded': footprint_count,
-            'test_query_results': test_count,
-            'postgis_working': test_count is not None
+            'postgis_working': test_count is not None,
         }
-
     except Exception as e:
         logger.error(f"Health check failed: {e}")
-        return JSONResponse(
-            status_code=503,
-            content={
-                'status': 'unhealthy',
-                'error': str(e),
-                'version': 'v2',
-                'footprints_loaded': 0
-            }
-        )
+        return JSONResponse(status_code=503, content={'status': 'unhealthy', 'version': 'v2'})

@@ -129,27 +129,38 @@ async def _get_block_context(session: AsyncSession, bin_val: str) -> Optional[st
     Also counts the architect's other work IN OUR CATALOGUE — phrased as such,
     since it is not a claim about their whole career.
     """
+    # Footprints live on Railway (FOOTPRINTS_DB_URL), not the buildings DB.
+    # Railway's footprint rows carry no construction_year, so years come from
+    # `footprint_years` (copied from NYC's footprint dataset, keyed by BIN).
+    # The `&& ST_Expand` box uses the geometry GIST index; Railway has no
+    # geography index, and a bare ST_DWithin on ::geography scans all 1.08M.
     try:
-        row = (await session.execute(text("""
-            WITH me AS (
-              SELECT bin, centroid, construction_year, height_roof
-              FROM building_footprints
-              WHERE replace(bin,'.0','') = :bin AND centroid IS NOT NULL
-              LIMIT 1
-            )
-            SELECT
-              (SELECT construction_year FROM me)                     AS my_year,
-              (SELECT height_roof FROM me)                           AS my_height,
-              count(*)                                               AS neighbours,
-              round(avg(f.construction_year)
-                    FILTER (WHERE f.construction_year > 1700))       AS avg_year,
-              min(f.construction_year)
-                    FILTER (WHERE f.construction_year > 1700)        AS oldest,
-              round(max(f.height_roof))                              AS tallest
-            FROM building_footprints f, me
-            WHERE f.bin <> me.bin
-              AND ST_DWithin(f.centroid::geography, me.centroid::geography, 100)
-        """), {"bin": bin_val})).fetchone()
+        async with get_footprints_db() as fdb:
+            if fdb is None:
+                return None
+            row = (await fdb.execute(text("""
+                WITH me AS (
+                  SELECT f.bin, f.centroid, y.construction_year, f.height_roof
+                  FROM building_footprints f
+                  LEFT JOIN footprint_years y ON y.bin = f.bin
+                  WHERE f.bin = :bin AND f.centroid IS NOT NULL
+                  LIMIT 1
+                )
+                SELECT
+                  (SELECT construction_year FROM me)                     AS my_year,
+                  (SELECT height_roof FROM me)                           AS my_height,
+                  count(*)                                               AS neighbours,
+                  round(avg(y.construction_year)
+                        FILTER (WHERE y.construction_year > 1700))       AS avg_year,
+                  min(y.construction_year)
+                        FILTER (WHERE y.construction_year > 1700)        AS oldest,
+                  round(max(f.height_roof))                              AS tallest
+                FROM me, building_footprints f
+                LEFT JOIN footprint_years y ON y.bin = f.bin
+                WHERE f.bin <> me.bin
+                  AND f.centroid && ST_Expand(me.centroid, 0.0015)
+                  AND ST_DWithin(f.centroid::geography, me.centroid::geography, 100)
+            """), {"bin": bin_val.replace(".0", "")})).fetchone()
     except Exception as e:
         logger.warning(f"block context failed for BIN {bin_val}: {e}")
         return None
@@ -247,11 +258,14 @@ async def _get_nearby_lore(session: AsyncSession, bin_val: str,
     to avoid.
     """
     try:
-        row = (await session.execute(text("""
-            SELECT ST_Y(centroid::geometry) AS lat, ST_X(centroid::geometry) AS lng
-            FROM building_footprints
-            WHERE replace(bin,'.0','') = :bin AND centroid IS NOT NULL LIMIT 1
-        """), {"bin": bin_val})).fetchone()
+        async with get_footprints_db() as fdb:
+            if fdb is None:
+                return None
+            row = (await fdb.execute(text("""
+                SELECT ST_Y(centroid::geometry) AS lat, ST_X(centroid::geometry) AS lng
+                FROM building_footprints
+                WHERE bin = :bin AND centroid IS NOT NULL LIMIT 1
+            """), {"bin": bin_val.replace(".0", "")})).fetchone()
     except Exception as e:
         logger.warning(f"nearby-lore centroid lookup failed for {bin_val}: {e}")
         return None
