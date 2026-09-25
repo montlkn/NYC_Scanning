@@ -2084,13 +2084,24 @@ _REPORT_NOISE_RE = re.compile(
     r"Landmarks Preservation Commission|Designation List \d+|\bLP-\d+|"
     r"\bBorough of (?:Manhattan|Brooklyn|Queens|the Bronx|Staten Island)\b|"
     r"\bTax Map Block\b|\bLandmark Site\b|\(Item No\.|\bCalendar No\.|"
-    r"\bpublic hearing\b|\bdesignation report\b",
+    r"\bpublic hearing\b|\bdesignation report\b|\btestif|\bspoke in (?:favor|support|opposition)|"
+    r"\brepresentatives? of\b|\bthe Commission\b",
     re.IGNORECASE,
 )
+# LPC reports are one fixed document format; their section headings run
+# straight into the first sentence once the PDF text is flattened
+# ("DESCRIPTION AND ANALYSIS Summary The Chrysler Building...").
+_REPORT_HEADING_RE = re.compile(
+    r"^(?:[•\-–\s]*(?:[A-Z][A-Z'’]+(?:\s+(?:AND|OF|THE|[A-Z][A-Z'’]+))*\b|"
+    r"Summary|Setbacks|Introduction|Background|History|Description|Architecture|"
+    r"Building Description|Findings and Designations?|Conclusion)\s+)+(?=[A-Z])"
+)
+# Footnote markers left inline: "They 5 include", "11 Other new buildings".
+_FOOTNOTE_RE = re.compile(r"(?<=[a-z,;])\s\d{1,2}(?=\s[a-z])|^\d{1,2}\s(?=[A-Z])")
 # Scanned-PDF damage: stray tildes, a word split by a space ("lar ger"), a
 # lone consonant fused to a word ("L ~berty"). Sentences carrying it are
 # skipped rather than shown.
-_OCR_DAMAGE_RE = re.compile(r"[~|\\]|(?:^|\s)[B-HJ-Zb-hj-z] [a-z]{2,}\b")
+_OCR_DAMAGE_RE = re.compile(r"[~|\\·]|(?:^|\s)[B-HJ-Zb-hj-z] [a-z]{2,}\b|\b[a-z]+ Is\b|\b[a-z]+ Its\b")
 _SENTENCE_RE = re.compile(r"[^.!?]+[.!?]+(?=\s|$)|[^.!?]+$")
 
 
@@ -2102,7 +2113,11 @@ def _prose_sentence(text: str, q_toks: set, width: int = WHY_MAX) -> Optional[st
     when nothing clean is left, and the client hides an empty line."""
     flat = re.sub(r"\s+", " ", text)
     for sent in _SENTENCE_RE.findall(flat):
-        sent = sent.strip(" ,;:-")
+        sent = _FOOTNOTE_RE.sub("", _REPORT_HEADING_RE.sub("", sent.strip(" ,;:-•"))).strip(" ,;:-")
+        # A sentence that starts lowercase was cut mid-word by the splitter
+        # or the chunker ("mbody to some extent...").
+        if not sent or not sent[0].isupper():
+            continue
         words = sent.split()
         if len(words) < 6 or _REPORT_NOISE_RE.search(sent) or _OCR_DAMAGE_RE.search(sent):
             continue
