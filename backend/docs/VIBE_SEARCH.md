@@ -144,3 +144,59 @@ To add a note, append a row to `cards/venue_notes.jsonl` and deploy:
   about 0.1s.
 - The ~250 older v2 cards in LES/EV have no `kind`. Re-card them with v3
   when there is budget (~$2.50).
+
+## Curator lists (designed 2026-09-26, not built)
+
+Real people are the most accurate source of vibe. Upstairs Bar proved it:
+the web says "happy hour", and the regulars say cutty. Lists turn that
+knowledge into search signal at no per-venue cost.
+
+**Decisions (user):**
+- Any public list is a curator. There is no curator role; trust comes from
+  agreement between lists, and later from saves and follows.
+- Publishing is opt-in. Lists are private by default.
+- Private lists count only as anonymous save counts ("saved by 12 people"),
+  and only once at least 5 different people have saved a place, so no one
+  person's list can be worked out. A private list's title, descriptors and
+  comments never leave it. This must be stated in settings or the privacy
+  policy.
+
+**Publish gate:**
+- Each place needs 1-5 vibe descriptors: free text, 1-3 words each. 1 is
+  the minimum; requiring 5 makes a long list a chore.
+- The list title and mood apply to every place on it, so per-place
+  descriptors only add what is specific.
+- Descriptor suggestions come from what others already used for that place
+  and across lists. They are data-derived; there is no hardcoded word list.
+- Comments are optional, prompted with "What's it like?".
+- Moderation mirrors community contributions: flag-to-hide, a length cap,
+  and a rate limit.
+
+**Into search:**
+- A nightly job reads public lists on MAIN and builds per-venue notes on
+  the search backend: lists joined, titles and moods, descriptors with
+  counts, and comments.
+- The judge sees them as local notes, e.g. "cutty (4 lists), sceney (3),
+  stairs are the point".
+- Weighting: agreement across lists beats one list; a comment beats a tag;
+  a place's own descriptors beat the list title.
+- Anonymous save counts are a popularity signal only, never vibe text.
+- Web cards remain the fallback where no list covers a place.
+- `venue_notes.jsonl` (the hand-written editor notes) keeps working
+  alongside.
+
+**Where lists are seen:**
+- v1: "On N lists" on result rows, tappable; "On these lists" plus
+  descriptors on the venue page; public lists on a profile.
+- Later: browse lists nearby, follow a list or person, copy a list.
+
+**Smallest first version:**
+1. Lists can hold venues (today they hold only buildings and lore:
+   `user_lists`, `user_list_buildings`, `user_list_lore`), with a public
+   toggle.
+2. The descriptor gate and suggestions.
+3. The nightly lists → notes job.
+4. "On N lists" in results and on the venue page.
+
+**Cold start:** the user plus friends write about 10 LES/EV lists.
+Editorial guides can come in as "editorial lists" for the famous places.
