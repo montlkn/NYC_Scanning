@@ -311,13 +311,15 @@
    "q": "sceney LES bars",
    "at": "hudson_yards",
    "any_of": [
+    "Le Dive",
     "Clandestino",
+    "Time Again",
+    "Treasure Club",
     "Attaboy",
-    "Mr. Purple",
-    "Hotel Chantelle"
+    "Mr. Purple"
    ],
    "topk": 8,
-   "why": "2026-09-26: 'LES' in the query was ignored when the map sat elsewhere; Hell's Kitchen bars came back"
+   "why": "2026-09-26: 'LES' in the query was ignored when the map sat elsewhere; Hell's Kitchen bars came back; 2026-09-26: the set is 'LES scene bars', and the named neighborhood now resolves to a centre, not a boundary"
   },
   {
    "q": "bars id like",
