@@ -160,7 +160,9 @@ To add a note, append a row to `cards/venue_notes.jsonl` and deploy:
 - App: LIST button on the venue page, descriptor editor with suggestions,
   public toggle on the list page, "On N lists" on result rows, "On these
   lists" (with REPORT) on the venue page.
-- Not yet: public lists on a profile, browse/follow/copy.
+- Deliberately not built: there is no profile viewer, so lists surface on
+  venue pages, result rows and in search instead. Browse/follow/copy only
+  if a profile viewer ever exists.
 
 Real people are the most accurate source of vibe. Upstairs Bar proved it:
 the web says "happy hour", and the regulars say cutty. Lists turn that
@@ -202,7 +204,8 @@ knowledge into search signal at no per-venue cost.
 
 **Where lists are seen:**
 - v1: "On N lists" on result rows, tappable; "On these lists" plus
-  descriptors on the venue page; public lists on a profile.
+  descriptors on the venue page. No profile surface (there is no profile
+  viewer).
 - Later: browse lists nearby, follow a list or person, copy a list.
 
 **Smallest first version:**
