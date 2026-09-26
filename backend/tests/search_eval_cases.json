@@ -304,8 +304,7 @@
     "Clandestino"
    ],
    "topk": 8,
-   "category_matches": "bar|lounge|speakeasy|club",
-   "why": "2026-09-26 field test: vibe query; picks were thin and a hair salon filed as Speakeasy ranked"
+   "why": "2026-09-26 field test: vibe query; picks were thin and a hair salon filed as Speakeasy ranked; FSQ category no longer checked: Le Dive is filed as a French restaurant and is a bar"
   },
   {
    "q": "sceney LES bars",

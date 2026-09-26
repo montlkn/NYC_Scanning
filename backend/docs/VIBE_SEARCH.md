@@ -71,6 +71,24 @@ discovering that a row is junk.
 The same key also powers production lore lookups, so a card run can starve
 lore. Ask before any run over ~$5, and do a small test first.
 
+## Strategy (decided 2026-09-26: hold the $47, do not pre-card the city)
+
+One card serves every vibe: the judge reads the same card for "punk",
+"cutty" and "date spot". So cost scales with the number of venues, not the
+number of vibes. The plan, most accurate first:
+
+1. **Curators and user lists are the ground truth.** A public list such as
+   "cutty Dimes Square bars" is a batch of first-hand notes: the list title
+   is the vibe, and every member gets a note. The mechanism already exists
+   (`venue_notes.jsonl`); it needs a feed from the app's Lists and community
+   contributions, moderated, with a few trusted curators per neighborhood.
+2. **Editorial guides for the well-known places.** One "best dive bars East
+   Village" page names about 20 places. A few hundred guide pages cover most
+   searched venues for a few dollars. Caveat: snippets name few places, so
+   pages must be fetched, and some block it. Use them as a ranking signal,
+   never republished.
+3. **Paid cards only where people search** (lazy carding, below).
+
 ## Cheaper ways to scale
 
 In rough order of value:
