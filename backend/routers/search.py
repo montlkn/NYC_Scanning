@@ -24,6 +24,7 @@ from models.search_session import get_search_db
 from services.text_embeddings import embed_query
 from utils.rate_limit import limiter, LIMIT_SEARCH
 from services.openai_text import openai_text
+from services import vibe_judge
 from services.unified_search import (
     HARD_RADIUS_INTENTS,
     facet_adjustments,
@@ -1813,7 +1814,7 @@ The database holds three things:
 3. Business listings: a venue name, a category such as "Cocktail Bar", "Wine Bar", "Speakeasy", "Coffee Shop", "Art Gallery", and a neighborhood.
 
 Reply with JSON only, no prose, no code fences:
-{"queries": [...], "categories": [...], "neighborhoods": [...], "boroughs": [...], "styles": [...], "years": [from, to] or null, "about": "buildings" | "places" | "stories" | "mixed", "picks": [{"name": ..., "hood": ..., "note": ...}], "events": true | false, "genres": [...], "kinds": [...], "when": "tonight" | "today" | "weekend" | "week" | null}
+{"queries": [...], "categories": [...], "neighborhoods": [...], "boroughs": [...], "styles": [...], "years": [from, to] or null, "about": "buildings" | "places" | "stories" | "mixed", "picks": [{"name": ..., "hood": ..., "note": ...}], "events": true | false, "genres": [...], "kinds": [...], "when": "tonight" | "today" | "weekend" | "week" | null, "vibe": "..." | null}
 
 queries: 1 to 3 phrases of 1 to 5 words, written the way the DATABASE describes things, never the way people search. Turn moods into concrete things a report, a history or a listing would literally say. When the query is vague, give each phrase a DIFFERENT angle (architecture, history, a place to go) rather than three wordings of one idea. When the query asks for a kind of place (a bar, a cafe, a church), EVERY phrase names that kind of place. Use distinctive words only: never "house", "building", "place", "spot", "site", "location", "NYC", "New York", "near me", "best", "ideas", "things to do". If the query names a specific building, business, person or event, return that exact name as the only phrase.
 categories: listing categories, only when the query asks for a kind of place to go. Otherwise [].
@@ -1823,6 +1824,7 @@ styles: architectural style names, as a designation report writes them, that the
 years: [from, to] when the query names or implies a period ("modernist" -> [1930, 1975], "gilded age" -> [1870, 1910], "prewar" -> [1880, 1940]). Otherwise null.
 If the query is misspelt, the FIRST phrase is the query with its spelling fixed and nothing else changed.
 picks: the specific real New York places or buildings a well-informed local would name as the best answers, up to 8, when the query is a vibe, a mood, a scene, slang, a superlative, a cuisine or style of place, or an architect's or firm's work ("chic bars", "dim lit bars", "romantic dinner", "old school italian", "cool hangout", "buildings by frank lloyd wright"). Read slang generously: "cunt", "slay", "serving", "giving" mean fashionable, fierce, glamorous, see-and-be-seen. name is the exact name the place goes by; hood is its neighborhood; note is 3 to 8 plain words on why it fits ("Piano bar inside the Carlyle"). Only places that exist; prefer ones still open; never invent. Name a place only if you are confident it fits this query; three right answers beat eight guesses. [] when the query already names one specific thing, or asks about history or architectural features rather than where to go or whose work.
+vibe: the words in the query that describe the mood, scene, crowd or character wanted, copied from the query ("sceney", "punk", "cutty", "dim lit", "romantic", "where artists drink"). null when the query only names a kind of place, a place, a thing or a time.
 events: true when the query asks what is on or happening now or soon (tonight, this weekend, a party, a gig, a DJ, live music, clubbing), or asks for exhibitions, gallery shows or openings, or film screenings. Otherwise false.
 genres: music genres the query names or implies for events ("techno", "house", "jazz"). Otherwise [].
 kinds: which listings the query asks about, any of "music", "art_opening" (gallery shows and openings), "exhibition" (museum shows), "film" (screenings). [] when it asks about all of them or none.
@@ -2416,6 +2418,13 @@ async def search_unified(
     elif interp is None and interp_task is not None:
         asyncio.create_task(_mark_direct_when_ready(q, interp_task, bool(direct)))
 
+    # Vibe queries ("punk bar", "sceney LES bars"): a model judges real
+    # descriptions of nearby places of the asked-for kind. Started now so it
+    # runs alongside the expansion legs; joined where picks are placed.
+    vibe_task: Optional[asyncio.Task] = None
+    if intent != "address" and vibe_judge.wants_judge(interp):
+        vibe_task = asyncio.create_task(vibe_judge.judge(q, interp, lat, lng))
+
     t_llm = time.monotonic()
     legs = {
         name: [RankedHit(name, h["id"], i + 1, h) for i, h in enumerate(hits) if h.get("id")]
@@ -2696,9 +2705,24 @@ async def search_unified(
     # not find them (a direct match means the words did), so they are what
     # the query meant. Anything already in the list moves up, not in twice.
     picks: List[dict] = []
+    vibe_picks: List[dict] = []
+    if vibe_task is not None:
+        try:
+            vibe_picks = await asyncio.wait_for(vibe_task, timeout=vibe_judge.JUDGE_TIMEOUT_S + 1)
+        except Exception as e:
+            logger.info(f"[unified] vibe judge skipped for {q!r}: {e}")
+    if vibe_picks:
+        # Already the asked-for kind of place, in the asked-for place. A
+        # neighborhood named in the query beats the map, so only "search this
+        # area" bounds them further.
+        picks = vibe_picks
+        if area_bound and radius_m:
+            picks = [p for p in picks if p.get("dist_m") is not None and p["dist_m"] <= radius_m * 1.05]
+        if not (interp or {}).get("neighborhoods") and lat is not None:
+            picks.sort(key=lambda p: p["dist_m"] if p.get("dist_m") is not None else 1e12)
     # A history question ("where did famous writers live") is answered by
     # stories, not by a building the model thinks of.
-    if interp and interp.get("picks") and interp.get("about") != "stories":
+    elif interp and interp.get("picks") and interp.get("about") != "stories":
         picks = await _resolve_picks(interp["picks"], interp.get("about"), lat, lng)
         # A venue pick must be the kind of place asked for: "art deco bar"
         # picked the Russian Tea Room, a restaurant. Sharing one category
@@ -2715,29 +2739,39 @@ async def search_unified(
             picks = [p for p in picks if p.get("dist_m") is not None and p["dist_m"] <= radius_m * 1.05]
         if lat is not None and lng is not None:
             picks.sort(key=lambda p: p["dist_m"] if p.get("dist_m") is not None else 1e12)
-        if picks:
-            ids = {p["id"] for p in picks}
-            bins = {p["bin"] for p in picks if p["type"] == "building" and p.get("bin")}
-            names = {(p["name"] or "").lower() for p in picks}
-            def _dup(h):
-                return (h.get("id") in ids
-                        or (h.get("type") == "building" and h.get("bin") in bins)
-                        or (h.get("type") in ("venue", "apple") and (h.get("name") or "").lower() in names))
-            if debug:
-                for p in picks:
-                    p["_debug"] = {"pick": True}
-            rest_hits = [h for h in hits if not _dup(h)]
-            # When the query named a thing and it was found, it and whatever
-            # carries its name (the bars inside Grand Central) stay first.
-            lead = ([h for h in rest_hits if tier_by_id.get(id(h), 2) <= 1]
-                    if 0 in tiers else [])
-            lead_ids = {id(h) for h in lead}
-            hits = (lead + picks + [h for h in rest_hits if id(h) not in lead_ids])[:max(limit, len(picks))]
+    if picks:
+        ids = {p["id"] for p in picks}
+        bins = {p["bin"] for p in picks if p["type"] == "building" and p.get("bin")}
+        names = {(p["name"] or "").lower() for p in picks}
+        def _dup(h):
+            return (h.get("id") in ids
+                    or (h.get("type") == "building" and h.get("bin") in bins)
+                    or (h.get("type") in ("venue", "apple") and (h.get("name") or "").lower() in names))
+        if debug:
+            for p in picks:
+                p["_debug"] = {"pick": True}
+        rest_hits = [h for h in hits if not _dup(h)]
+        # When the query named a thing and it was found, it and whatever
+        # carries its name (the bars inside Grand Central) stay first.
+        lead = ([h for h in rest_hits if tier_by_id.get(id(h), 2) <= 1]
+                if 0 in tiers else [])
+        lead_ids = {id(h) for h in lead}
+        hits = (lead + picks + [h for h in rest_hits if id(h) not in lead_ids])[:max(limit, len(picks))]
+
+    # A venue whose card found it is not a real place of this kind, or has
+    # closed (a hair salon filed as a Speakeasy), never shows.
+    hits = [h for h in hits if not (h.get("type") == "venue" and vibe_judge.is_rejected(h.get("id")))]
 
     # Some listings carry stray whitespace and CRLFs in their names.
     for h in hits:
         if isinstance(h.get("name"), str):
             h["name"] = " ".join(h["name"].split())
+        # The full description, for the venue page ("knows nothing about
+        # Clockwork" was this field not existing).
+        if h.get("type") == "venue" and not h.get("summary"):
+            about = vibe_judge.card_text(h.get("id"))
+            if about:
+                h["summary"] = about
 
     header = build_header(hits, intent)
     facets = build_facets({

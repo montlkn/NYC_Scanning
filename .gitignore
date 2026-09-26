@@ -79,3 +79,6 @@ tiles_out/
 # both re-derivable by their scripts.
 backend/scripts/.lore_vecs.pkl
 backend/scripts/.nta_2020.geojson
+
+# Venue list cache written by scripts/build_venue_cards.py
+backend/cards/venues_*.json

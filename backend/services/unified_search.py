@@ -1522,7 +1522,7 @@ def build_facets(available: Dict[str, List[Any]]) -> List[Dict[str, Any]]:
 # candidates but cannot outrank what was literally asked for.
 # ---------------------------------------------------------------------------
 
-INTERP_VERSION = 9
+INTERP_VERSION = 10
 MAX_EXPANSION_QUERIES = 3
 W_EXPANSION_LEG = 1.0        # a rewrite leg counts as much as a corpus leg...
 # ...and the user's own legs are halved when rewrites run. Rewrites only run
@@ -1589,6 +1589,7 @@ def parse_interpretation(raw: Optional[str], q: str) -> Optional[Dict[str, Any]]
         "genres": _str_list(d.get("genres"), 4, 30),
         "kinds": [k for k in _str_list(d.get("kinds"), 4, 20) if k in _EVENT_KINDS],
         "when": d.get("when") if d.get("when") in _EVENT_WHEN else None,
+        "vibe": d.get("vibe").strip()[:60] if isinstance(d.get("vibe"), str) and d.get("vibe").strip() else None,
     }
 
 
@@ -2158,6 +2159,19 @@ def evidence_why(h: Dict[str, Any], q_lex: str) -> Optional[str]:
                 return ex
         return None
     if t == "venue":
+        # What the place is like beats what building it is in: "Punk rock
+        # dive bar..." instead of "1900 store". The sentence that mentions
+        # the query if there is one, else the card's first.
+        from services.vibe_judge import card_text
+        card = card_text(h.get("id"))
+        if card:
+            ex = _prose_sentence(card, q_toks) if q_toks else None
+            if not ex:
+                first = (_SENTENCE_RE.findall(re.sub(r"\s+", " ", card)) or [card])[0].strip()
+                cut = first.rfind(" ", 0, WHY_MAX - 1)
+                ex = first if len(first) <= WHY_MAX else first[: cut if cut > 0 else WHY_MAX - 1].rstrip(" ,;:") + "…"
+            if ex:
+                return ex
         text = h.get("text") or ""
         parts = []
         host = _VENUE_HOST_RE.search(text)
