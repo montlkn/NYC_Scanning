@@ -43,7 +43,7 @@ POOL = 800
 RADIUS_M = 1200
 JUDGE_TIMEOUT_S = 6.0
 MAX_PICKS = 8
-JUDGE_VERSION = 3
+JUDGE_VERSION = 4
 # Below this many carded candidates the judge would be choosing by names
 # alone, which is worse than the rewrite's recalled picks: outside the
 # carded area "chic bars" lost Bemelmans and Le Bain to whatever bar was
@@ -70,13 +70,45 @@ def _load_cards() -> Dict[str, Dict[str, Any]]:
 
 _CARDS = _load_cards()
 
+# Local knowledge the web does not have, written by hand, one per venue:
+# cards/venue_notes.jsonl, {fsq_id, name, kind?, note, by, date}. Upstairs
+# Bar's web evidence is "cocktails, happy hour"; everyone who drinks there
+# knows it is cutty. A note wins over the card's kind and is shown first.
+NOTES_PATH = os.path.join(os.path.dirname(CARDS_PATH), "venue_notes.jsonl")
 
-def card_text(fsq_id: Optional[str]) -> Optional[str]:
-    """The description for a venue, when there is a usable one."""
-    c = _CARDS.get(fsq_id or "")
+
+def _load_notes() -> Dict[str, Dict[str, Any]]:
+    notes: Dict[str, Dict[str, Any]] = {}
+    try:
+        with open(NOTES_PATH) as f:
+            for line in f:
+                if line.strip():
+                    row = json.loads(line)
+                    if row.get("note"):
+                        notes[row["fsq_id"]] = row
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning(f"[vibe] could not load venue notes: {e}")
+    return notes
+
+
+_NOTES = _load_notes()
+
+
+def _web_card(fsq_id: str) -> Optional[str]:
+    c = _CARDS.get(fsq_id)
     if c and c.get("match") and not c.get("closed") and c.get("card"):
         return c["card"]
     return None
+
+
+def card_text(fsq_id: Optional[str]) -> Optional[str]:
+    """The description for a venue, when there is a usable one: the local
+    note first, then the web card."""
+    note = (_NOTES.get(fsq_id or "") or {}).get("note")
+    card = _web_card(fsq_id or "")
+    return " ".join(x for x in (note, card) if x) or None
 
 
 def is_rejected(fsq_id: Optional[str]) -> bool:
@@ -84,7 +116,7 @@ def is_rejected(fsq_id: Optional[str]) -> bool:
     were this place (a hair salon filed as a Speakeasy). No results at all is
     not evidence, so it never hides a venue."""
     c = _CARDS.get(fsq_id or "")
-    if not c:
+    if not c or (fsq_id in _NOTES):
         return False
     return bool(c.get("closed")) or (not c.get("match") and c.get("found") is True)
 
@@ -99,15 +131,20 @@ def kind_matches(categories: List[str]) -> List[str]:
     as a French one. The card's `kind` ("bar and lounge") shares a word with
     a wanted category ("Bar")."""
     want = set().union(*(_words(c) for c in categories)) if categories else set()
-    return [fid for fid, c in _CARDS.items()
-            if want & _words(c.get("kind") or "") and card_text(fid)]
+    ids = set(_CARDS) | set(_NOTES)
+    return [fid for fid in ids
+            if want & _words(_kind(fid)) and card_text(fid)]
+
+
+def _kind(fid: str) -> str:
+    return ((_NOTES.get(fid) or {}).get("kind")
+            or (_CARDS.get(fid) or {}).get("kind") or "")
 
 
 def label(r: dict) -> str:
     """What the place is, for the judge: the card's kind when there is one,
     since the listed category is often wrong."""
-    c = _CARDS.get(r.get("fsq_id") or "")
-    return (c or {}).get("kind") or r.get("category") or ""
+    return _kind(r.get("fsq_id") or "") or r.get("category") or ""
 
 
 def wants_judge(interp: Optional[Dict[str, Any]]) -> bool:
@@ -121,7 +158,7 @@ You get the search and a numbered list of real places near where the person is l
 
 Reply with JSON only: {"picks": [{"n": <number>, "why": "..."}]}
 
-Pick up to 8 places that genuinely fit what the search asks for, best fit first. Read slang and scene words the way a New Yorker means them, including what a neighborhood's scene implies for the places in it. Judge mainly from the description, and add what you reliably know about the place or its scene; a place with no description may be picked only if you know it well and are sure it fits. Fewer right answers beat a full list: return fewer, or [], rather than padding with places that merely match the kind of place. why: at most 10 plain words, taken from the description, saying why it fits (e.g. "Punk dive, graffiti walls, loud non-Top-40 music")."""
+Pick up to 8 places that genuinely fit what the search asks for, best fit first. Read slang and scene words the way a New Yorker means them, including what a neighborhood's scene implies for the places in it. A "Local note" is first-hand knowledge from someone who drinks there; trust it over the rest of the description. Judge mainly from the description, and add what you reliably know about the place or its scene; a place with no description may be picked only if you know it well and are sure it fits. Fewer right answers beat a full list: return fewer, or [], rather than padding with places that merely match the kind of place. why: at most 10 plain words, taken from the description, saying why it fits (e.g. "Punk dive, graffiti walls, loud non-Top-40 music"). Describe the place itself; never mention notes, descriptions or reviews."""
 
 
 # Keyed on the query and where it was asked, so the same words in another
@@ -227,8 +264,10 @@ async def judge(q: str, interp: Dict[str, Any], lat: Optional[float],
 
     lines = []
     for i, r in enumerate(cands, 1):
-        card = card_text(r["fsq_id"])
-        lines.append(f"{i}. {r['name']} ({label(r)})" + (f": {card}" if card else ""))
+        note = (_NOTES.get(r["fsq_id"]) or {}).get("note")
+        card = _web_card(r["fsq_id"])
+        desc = " ".join(x for x in ((f"Local note: {note}" if note else None), card) if x)
+        lines.append(f"{i}. {r['name']} ({label(r)})" + (f": {desc}" if desc else ""))
     user = f"Search: {q}\n\nPlaces:\n" + "\n".join(lines)
     t0 = time.monotonic()
     raw = await openai_text(system=_JUDGE_SYSTEM, user=user, max_tokens=500,
