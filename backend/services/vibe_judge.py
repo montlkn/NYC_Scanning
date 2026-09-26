@@ -43,7 +43,7 @@ POOL = 800
 RADIUS_M = 1500
 JUDGE_TIMEOUT_S = 6.0
 MAX_PICKS = 8
-JUDGE_VERSION = 1
+JUDGE_VERSION = 2
 # Below this many carded candidates the judge would be choosing by names
 # alone, which is worse than the rewrite's recalled picks: outside the
 # carded area "chic bars" lost Bemelmans and Le Bain to whatever bar was
@@ -89,6 +89,27 @@ def is_rejected(fsq_id: Optional[str]) -> bool:
     return bool(c.get("closed")) or (not c.get("match") and c.get("found") is True)
 
 
+def _words(x: str) -> set:
+    return {w for w in re.split(r"[^a-z]+", (x or "").lower()) if len(w) > 2}
+
+
+def kind_matches(categories: List[str]) -> List[str]:
+    """Carded venues whose real kind is the kind asked for, whatever their
+    listed category: Upstairs Bar is filed as a Chinese restaurant, Le Dive
+    as a French one. The card's `kind` ("bar and lounge") shares a word with
+    a wanted category ("Bar")."""
+    want = set().union(*(_words(c) for c in categories)) if categories else set()
+    return [fid for fid, c in _CARDS.items()
+            if want & _words(c.get("kind") or "") and card_text(fid)]
+
+
+def label(r: dict) -> str:
+    """What the place is, for the judge: the card's kind when there is one,
+    since the listed category is often wrong."""
+    c = _CARDS.get(r.get("fsq_id") or "")
+    return (c or {}).get("kind") or r.get("category") or ""
+
+
 def wants_judge(interp: Optional[Dict[str, Any]]) -> bool:
     return bool(interp and interp.get("vibe") and interp.get("categories")
                 and interp.get("about") in ("places", "mixed"))
@@ -100,7 +121,7 @@ You get the search and a numbered list of real places near where the person is l
 
 Reply with JSON only: {"picks": [{"n": <number>, "why": "..."}]}
 
-Pick up to 8 places that genuinely fit what the search asks for, best fit first. Read slang and scene words the way a New Yorker means them. Judge from the description; a place with no description may be picked only if you know it well and are sure it fits. Fewer right answers beat a full list: return fewer, or [], rather than padding with places that merely match the kind of place. why: at most 10 plain words, taken from the description, saying why it fits (e.g. "Punk dive, graffiti walls, loud non-Top-40 music")."""
+Pick up to 8 places that genuinely fit what the search asks for, best fit first. Read slang and scene words the way a New Yorker means them, including what a neighborhood's scene implies for the places in it. Judge mainly from the description, and add what you reliably know about the place or its scene; a place with no description may be picked only if you know it well and are sure it fits. Fewer right answers beat a full list: return fewer, or [], rather than padding with places that merely match the kind of place. why: at most 10 plain words, taken from the description, saying why it fits (e.g. "Punk dive, graffiti walls, loud non-Top-40 music")."""
 
 
 # Keyed on the query and where it was asked, so the same words in another
@@ -124,31 +145,34 @@ async def _candidates(categories: List[str], hoods: List[str],
     A named neighborhood wins over the map: "sceney LES bars" asked with the
     map on Hell's Kitchen means the Lower East Side."""
     cats = tuple(c.lower() for c in categories)
+    extra = tuple(kind_matches(categories)) or ("-",)
     geo = lat is not None and lng is not None
     dist = ("6371000 * acos(GREATEST(-1, LEAST(1, cos(radians(:lat)) * cos(radians(lat)) "
             "* cos(radians(lng) - radians(:lng)) + sin(radians(:lat)) * sin(radians(lat)))))")
     base = ("SELECT fsq_id, name, category, lat, lng, bin, bbl, building_year, building_style, "
             "photo_url, snippet, neighborhood{d} FROM venues WHERE searchable IS NOT FALSE "
-            "AND lat IS NOT NULL AND lower(category) IN :cats")
+            "AND lat IS NOT NULL AND (lower(category) IN :cats OR fsq_id IN :extra)")
     rows: List[Any] = []
     async with get_search_db() as db:
         if db is None:
             return []
         if hoods:
-            params: Dict[str, Any] = {"cats": cats, "pool": POOL,
+            params: Dict[str, Any] = {"cats": cats, "extra": extra, "pool": POOL,
                                       "hoods": [f"%{h.lower()}%" for h in hoods]}
             sql = (base.format(d=f", {dist} AS dist_m" if geo else ", NULL AS dist_m")
                    + " AND lower(coalesce(neighborhood, '')) LIKE ANY(:hoods)"
                    + (" ORDER BY dist_m" if geo else "") + " LIMIT :pool")
             if geo:
                 params.update(lat=lat, lng=lng)
-            rows = (await db.execute(text(sql).bindparams(bindparam("cats", expanding=True)),
+            rows = (await db.execute(text(sql).bindparams(bindparam("cats", expanding=True),
+                                                          bindparam("extra", expanding=True)),
                                      params)).mappings().all()
         if not rows and geo:
             sql = base.format(d=f", {dist} AS dist_m") + \
                 f" AND {dist} <= :radius ORDER BY dist_m LIMIT :pool"
-            rows = (await db.execute(text(sql).bindparams(bindparam("cats", expanding=True)),
-                                     {"cats": cats, "pool": POOL, "lat": lat, "lng": lng,
+            rows = (await db.execute(text(sql).bindparams(bindparam("cats", expanding=True),
+                                                          bindparam("extra", expanding=True)),
+                                     {"cats": cats, "extra": extra, "pool": POOL, "lat": lat, "lng": lng,
                                       "radius": RADIUS_M})).mappings().all()
     return [dict(r) for r in rows]
 
@@ -194,7 +218,7 @@ async def judge(q: str, interp: Dict[str, Any], lat: Optional[float],
     lines = []
     for i, r in enumerate(cands, 1):
         card = card_text(r["fsq_id"])
-        lines.append(f"{i}. {r['name']} ({r['category']})" + (f": {card}" if card else ""))
+        lines.append(f"{i}. {r['name']} ({label(r)})" + (f": {card}" if card else ""))
     user = f"Search: {q}\n\nPlaces:\n" + "\n".join(lines)
     t0 = time.monotonic()
     raw = await openai_text(system=_JUDGE_SYSTEM, user=user, max_tokens=500,
