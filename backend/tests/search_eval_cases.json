@@ -12,6 +12,14 @@
   "village": [
    40.73,
    -73.995
+  ],
+  "les": [
+   40.7155,
+   -73.9905
+  ],
+  "hudson_yards": [
+   40.754,
+   -74.002
   ]
  },
  "cases": [
@@ -279,6 +287,45 @@
    "at": "midtown",
    "events": true,
    "why": "the app shows live events only when the backend says the query asks what is on"
+  },
+  {
+   "q": "punk bar",
+   "at": "les",
+   "any_of": [
+    "Clockwork"
+   ],
+   "topk": 5,
+   "why": "2026-09-26 field test: Clockwork, the iconic LES punk bar, never surfaced; results were generic dives with no punk association"
+  },
+  {
+   "q": "sceney LES bars",
+   "at": "les",
+   "any_of": [
+    "Clandestino"
+   ],
+   "topk": 8,
+   "category_matches": "bar|lounge|speakeasy|club",
+   "why": "2026-09-26 field test: vibe query; picks were thin and a hair salon filed as Speakeasy ranked"
+  },
+  {
+   "q": "sceney LES bars",
+   "at": "hudson_yards",
+   "any_of": [
+    "Clandestino",
+    "Attaboy",
+    "Mr. Purple",
+    "Hotel Chantelle"
+   ],
+   "topk": 8,
+   "why": "2026-09-26: 'LES' in the query was ignored when the map sat elsewhere; Hell's Kitchen bars came back"
+  },
+  {
+   "q": "bars id like",
+   "at": "les",
+   "why": "2026-09-26: a furniture store whose NAME contains 'Bars' ranked first",
+   "none_of_top3": [
+    "Champ Depot - Custom Restaurant Furniture: Tables, Chairs, Booths, Barstools, Bars, and Reupholstery"
+   ]
   }
  ]
 }
