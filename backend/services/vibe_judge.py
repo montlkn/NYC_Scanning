@@ -47,7 +47,8 @@ JUDGE_VERSION = 1
 # Below this many carded candidates the judge would be choosing by names
 # alone, which is worse than the rewrite's recalled picks: outside the
 # carded area "chic bars" lost Bemelmans and Le Bain to whatever bar was
-# nearest. Measured on the eval: Midtown has 0 cards, the LES pilot 60+.
+# nearest. 15 is a judgment call, not a measured threshold; revisit once
+# more areas are carded.
 MIN_CARDED = 15
 
 
