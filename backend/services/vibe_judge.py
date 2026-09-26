@@ -44,6 +44,11 @@ RADIUS_M = 1500
 JUDGE_TIMEOUT_S = 6.0
 MAX_PICKS = 8
 JUDGE_VERSION = 1
+# Below this many carded candidates the judge would be choosing by names
+# alone, which is worse than the rewrite's recalled picks: outside the
+# carded area "chic bars" lost Bemelmans and Le Bain to whatever bar was
+# nearest. Measured on the eval: Midtown has 0 cards, the LES pilot 60+.
+MIN_CARDED = 15
 
 
 def _load_cards() -> Dict[str, Dict[str, Any]]:
@@ -179,6 +184,10 @@ async def judge(q: str, interp: Dict[str, Any], lat: Optional[float],
         if len(cands) >= MAX_CANDIDATES:
             break
     if not cands:
+        return []
+    carded = sum(card_text(r["fsq_id"]) is not None for r in cands)
+    if carded < MIN_CARDED:
+        logger.info(f"[vibe] {q!r}: only {carded} carded candidates, using recalled picks")
         return []
 
     lines = []
