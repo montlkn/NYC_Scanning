@@ -40,10 +40,10 @@ CARDS_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file
 # with a card and ~10 without, so 120 is roughly 5-7k input tokens.
 MAX_CANDIDATES = 120
 POOL = 800
-RADIUS_M = 1500
+RADIUS_M = 1200
 JUDGE_TIMEOUT_S = 6.0
 MAX_PICKS = 8
-JUDGE_VERSION = 2
+JUDGE_VERSION = 3
 # Below this many carded candidates the judge would be choosing by names
 # alone, which is worse than the rewrite's recalled picks: outside the
 # carded area "chic bars" lost Bemelmans and Le Bain to whatever bar was
@@ -153,27 +153,37 @@ async def _candidates(categories: List[str], hoods: List[str],
             "photo_url, snippet, neighborhood{d} FROM venues WHERE searchable IS NOT FALSE "
             "AND lat IS NOT NULL AND (lower(category) IN :cats OR fsq_id IN :extra)")
     rows: List[Any] = []
+    bind = lambda sql: text(sql).bindparams(bindparam("cats", expanding=True),
+                                            bindparam("extra", expanding=True))
     async with get_search_db() as db:
         if db is None:
             return []
+        # A named neighborhood is resolved to its centre and searched by
+        # radius, not by boundary: the city's boundaries file Canal and
+        # Division (Dimes Square) under Chinatown, but "LES bars" means them.
+        centre = None
         if hoods:
-            params: Dict[str, Any] = {"cats": cats, "extra": extra, "pool": POOL,
-                                      "hoods": [f"%{h.lower()}%" for h in hoods]}
-            sql = (base.format(d=f", {dist} AS dist_m" if geo else ", NULL AS dist_m")
-                   + " AND lower(coalesce(neighborhood, '')) LIKE ANY(:hoods)"
-                   + (" ORDER BY dist_m" if geo else "") + " LIMIT :pool")
-            if geo:
-                params.update(lat=lat, lng=lng)
-            rows = (await db.execute(text(sql).bindparams(bindparam("cats", expanding=True),
-                                                          bindparam("extra", expanding=True)),
-                                     params)).mappings().all()
-        if not rows and geo:
-            sql = base.format(d=f", {dist} AS dist_m") + \
-                f" AND {dist} <= :radius ORDER BY dist_m LIMIT :pool"
-            rows = (await db.execute(text(sql).bindparams(bindparam("cats", expanding=True),
-                                                          bindparam("extra", expanding=True)),
-                                     {"cats": cats, "extra": extra, "pool": POOL, "lat": lat, "lng": lng,
-                                      "radius": RADIUS_M})).mappings().all()
+            c = (await db.execute(text(
+                "SELECT avg(lat) AS lat, avg(lng) AS lng, count(*) AS n FROM venues "
+                "WHERE searchable IS NOT FALSE AND lat IS NOT NULL "
+                "AND lower(coalesce(neighborhood, '')) LIKE ANY(:hoods)"),
+                {"hoods": [f"%{h.lower()}%" for h in hoods]})).mappings().first()
+            if c and c["n"]:
+                centre = (float(c["lat"]), float(c["lng"]))
+        if centre is None and geo:
+            centre = (lat, lng)
+        if centre is None:
+            return []
+        # Ranked by distance from where the person is looking; dist_m stays
+        # the distance from the person, which is what the row shows.
+        dist_c = dist.replace(":lat", ":clat").replace(":lng", ":clng")
+        sql = (base.format(d=(f", {dist} AS dist_m" if geo else ", NULL AS dist_m"))
+               + f" AND {dist_c} <= :radius ORDER BY {dist_c} LIMIT :pool")
+        params = {"cats": cats, "extra": extra, "pool": POOL, "radius": RADIUS_M,
+                  "clat": centre[0], "clng": centre[1]}
+        if geo:
+            params.update(lat=lat, lng=lng)
+        rows = (await db.execute(bind(sql), params)).mappings().all()
     return [dict(r) for r in rows]
 
 
