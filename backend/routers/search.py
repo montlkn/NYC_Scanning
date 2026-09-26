@@ -25,6 +25,7 @@ from services.text_embeddings import embed_query
 from utils.rate_limit import limiter, LIMIT_SEARCH
 from services.openai_text import openai_text
 from services import vibe_judge
+from services import list_notes
 from services.unified_search import (
     HARD_RADIUS_INTENTS,
     facet_adjustments,
@@ -2772,6 +2773,11 @@ async def search_unified(
             about = vibe_judge.card_text(h.get("id"))
             if about:
                 h["summary"] = about
+        # "On N lists": how many public lists hold it (services/list_notes).
+        if h.get("type") == "venue":
+            n = list_notes.list_count(h.get("id"))
+            if n:
+                h["list_count"] = n
 
     header = build_header(hits, intent)
     facets = build_facets({

@@ -209,6 +209,11 @@ async def lifespan(app: FastAPI):
 
     asyncio.create_task(_warm_search_rewrites())
 
+    # Public lists -> venue notes for the vibe judge, refreshed every few
+    # hours from MAIN (services/list_notes.py).
+    from services import list_notes as _list_notes
+    asyncio.create_task(_list_notes.run_forever())
+
     yield
 
     # Shutdown

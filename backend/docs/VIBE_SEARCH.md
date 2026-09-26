@@ -145,7 +145,22 @@ To add a note, append a row to `cards/venue_notes.jsonl` and deploy:
 - The ~250 older v2 cards in LES/EV have no `kind`. Re-card them with v3
   when there is budget (~$2.50).
 
-## Curator lists (designed 2026-09-26, not built)
+## Curator lists (designed 2026-09-26, v1 built the same day)
+
+**Built (v1):**
+- MAIN: `user_list_venues` (venue_id = fsq_id, descriptors, comment),
+  `user_lists.is_public`, a trigger that refuses to publish a list with an
+  undescribed place, `flag_user_list` (3 flags hide it), a 150/day add limit,
+  and three read RPCs: `venue_public_lists`, `venue_descriptor_suggestions`,
+  `venue_list_notes`. Migration: Jink_Swift
+  `supabase/migrations/20260926e_curator_lists_MAIN_DB.sql`.
+- Backend: `services/list_notes.py` pulls `venue_list_notes()` at startup
+  and every 3 hours (instead of a nightly job; no new infrastructure). The
+  judge reads it as a "Lists:" line; venue hits carry `list_count`.
+- App: LIST button on the venue page, descriptor editor with suggestions,
+  public toggle on the list page, "On N lists" on result rows, "On these
+  lists" (with REPORT) on the venue page.
+- Not yet: public lists on a profile, browse/follow/copy.
 
 Real people are the most accurate source of vibe. Upstairs Bar proved it:
 the web says "happy hour", and the regulars say cutty. Lists turn that

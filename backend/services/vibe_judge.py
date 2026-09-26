@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy import bindparam, text
 
 from models.search_session import get_search_db
+from services import list_notes
 from services.openai_text import openai_text
 
 logger = logging.getLogger(__name__)
@@ -43,7 +44,7 @@ POOL = 800
 RADIUS_M = 1200
 JUDGE_TIMEOUT_S = 6.0
 MAX_PICKS = 8
-JUDGE_VERSION = 4
+JUDGE_VERSION = 5
 # Below this many carded candidates the judge would be choosing by names
 # alone, which is worse than the rewrite's recalled picks: outside the
 # carded area "chic bars" lost Bemelmans and Le Bain to whatever bar was
@@ -111,12 +112,17 @@ def card_text(fsq_id: Optional[str]) -> Optional[str]:
     return " ".join(x for x in (note, card) if x) or None
 
 
+def has_desc(fsq_id: Optional[str]) -> bool:
+    """Anything the judge can read: an editor note, a public list, a card."""
+    return bool(card_text(fsq_id) or list_notes.text_for(fsq_id))
+
+
 def is_rejected(fsq_id: Optional[str]) -> bool:
     """Carded and found to be closed, or the web had results and none of them
     were this place (a hair salon filed as a Speakeasy). No results at all is
     not evidence, so it never hides a venue."""
     c = _CARDS.get(fsq_id or "")
-    if not c or (fsq_id in _NOTES):
+    if not c or (fsq_id in _NOTES) or list_notes.list_count(fsq_id):
         return False
     return bool(c.get("closed")) or (not c.get("match") and c.get("found") is True)
 
@@ -158,7 +164,7 @@ You get the search and a numbered list of real places near where the person is l
 
 Reply with JSON only: {"picks": [{"n": <number>, "why": "..."}]}
 
-Pick up to 8 places that genuinely fit what the search asks for, best fit first. Read slang and scene words the way a New Yorker means them, including what a neighborhood's scene implies for the places in it. A "Local note" is first-hand knowledge from someone who drinks there; trust it over the rest of the description. Judge mainly from the description, and add what you reliably know about the place or its scene; a place with no description may be picked only if you know it well and are sure it fits. Fewer right answers beat a full list: return fewer, or [], rather than padding with places that merely match the kind of place. why: at most 10 plain words, taken from the description, saying why it fits (e.g. "Punk dive, graffiti walls, loud non-Top-40 music"). Describe the place itself; never mention notes, descriptions or reviews."""
+Pick up to 8 places that genuinely fit what the search asks for, best fit first. Read slang and scene words the way a New Yorker means them, including what a neighborhood's scene implies for the places in it. A "Local note" is first-hand knowledge from someone who drinks there; trust it over the rest of the description. "Lists" is what locals wrote when they put the place on their public lists: a descriptor used by several lists is agreement and counts for more than one used once, a comment counts for more than a descriptor, and the list titles describe the list as a whole. Trust Lists over the web description too. Judge mainly from the description, and add what you reliably know about the place or its scene; a place with no description may be picked only if you know it well and are sure it fits. Fewer right answers beat a full list: return fewer, or [], rather than padding with places that merely match the kind of place. why: at most 10 plain words, taken from the description, saying why it fits (e.g. "Punk dive, graffiti walls, loud non-Top-40 music"). Describe the place itself; never mention notes, descriptions or reviews."""
 
 
 # Keyed on the query and where it was asked, so the same words in another
@@ -172,7 +178,7 @@ _CACHE_TTL_S = 6 * 3600
 def _cache_key(q: str, hoods: List[str], lat: Optional[float], lng: Optional[float]) -> str:
     where = ",".join(sorted(h.lower() for h in hoods)) if hoods else (
         f"{lat:.2f},{lng:.2f}" if lat is not None and lng is not None else "city")
-    return f"v{JUDGE_VERSION}|{q.strip().lower()}|{where}"
+    return f"v{JUDGE_VERSION}.{list_notes.generation()}|{q.strip().lower()}|{where}"
 
 
 async def _candidates(categories: List[str], hoods: List[str],
@@ -245,7 +251,7 @@ async def judge(q: str, interp: Dict[str, Any], lat: Optional[float],
     # One row per name: FSQ holds duplicates (four "Hotel Chantelle" rows).
     # The carded, nearest one wins.
     rows = [r for r in rows if not is_rejected(r["fsq_id"])]
-    rows.sort(key=lambda r: (card_text(r["fsq_id"]) is None,
+    rows.sort(key=lambda r: (not has_desc(r["fsq_id"]),
                              r["dist_m"] if r.get("dist_m") is not None else 1e12))
     seen, cands = set(), []
     for r in rows:
@@ -257,7 +263,7 @@ async def judge(q: str, interp: Dict[str, Any], lat: Optional[float],
             break
     if not cands:
         return []
-    carded = sum(card_text(r["fsq_id"]) is not None for r in cands)
+    carded = sum(has_desc(r["fsq_id"]) for r in cands)
     if carded < MIN_CARDED:
         logger.info(f"[vibe] {q!r}: only {carded} carded candidates, using recalled picks")
         return []
@@ -266,7 +272,11 @@ async def judge(q: str, interp: Dict[str, Any], lat: Optional[float],
     for i, r in enumerate(cands, 1):
         note = (_NOTES.get(r["fsq_id"]) or {}).get("note")
         card = _web_card(r["fsq_id"])
-        desc = " ".join(x for x in ((f"Local note: {note}" if note else None), card) if x)
+        lists = list_notes.text_for(r["fsq_id"])
+        saves = list_notes.save_count(r["fsq_id"])
+        desc = " ".join(x for x in ((f"Local note: {note}" if note else None),
+                                    (f"Lists: {lists}." if lists else None), card,
+                                    (f"(Saved by {saves} people.)" if saves else None)) if x)
         lines.append(f"{i}. {r['name']} ({label(r)})" + (f": {desc}" if desc else ""))
     user = f"Search: {q}\n\nPlaces:\n" + "\n".join(lines)
     t0 = time.monotonic()
@@ -274,7 +284,7 @@ async def judge(q: str, interp: Dict[str, Any], lat: Optional[float],
                             timeout_s=JUDGE_TIMEOUT_S, cache_key=f"jink-vibe-judge-v{JUDGE_VERSION}")
     picks = _parse(raw, len(cands))
     logger.info(f"[vibe] {q!r}: {len(cands)} candidates "
-                f"({sum(card_text(r['fsq_id']) is not None for r in cands)} carded), "
+                f"({carded} carded), "
                 f"{len(picks)} picks in {(time.monotonic() - t0) * 1000:.0f}ms")
     if raw is None:
         return []  # a failed call is not an answer; do not cache it
