@@ -24,3 +24,20 @@ def test_popularity_only_row_gives_no_text():
         assert list_notes.list_count("abc") == 0
     finally:
         list_notes._NOTES = {}
+
+
+def test_key_for_venues_and_buildings():
+    assert list_notes.key_for({"type": "venue", "id": "fsq1"}) == "fsq1"
+    assert list_notes.key_for({"type": "building", "id": "b", "bin": "1001234.0"}) == "bin:1001234"
+    assert list_notes.key_for({"type": "lore", "id": "x"}) is None
+
+
+def test_descriptor_bonus_needs_every_word_and_caps():
+    list_notes._NOTES = {"bin:1": {"descriptors": {"cast iron": 2, "moody": 1, "loud": 9}}}
+    try:
+        assert list_notes.descriptor_bonus("cast iron soho", "bin:1") == 2 * list_notes.W_LIST_DESCRIPTOR
+        assert list_notes.descriptor_bonus("iron works", "bin:1") == 0.0
+        assert list_notes.descriptor_bonus("loud moody bar", "bin:1") == list_notes.W_LIST_DESCRIPTOR_MAX
+        assert list_notes.descriptor_bonus("cast iron", "bin:2") == 0.0
+    finally:
+        list_notes._NOTES = {}

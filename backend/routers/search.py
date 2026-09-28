@@ -2608,6 +2608,9 @@ async def search_unified(
         nudged += _t("llm_style_bonus", llm_style_bonus(interp, h))
         nudged += _t("llm_era_bonus", llm_era_bonus(interp, h))
         nudged += _t("place_adjustment", place_adjustment(place_req, h, neighborhood_vocab()))
+        # Curator lists: descriptors people gave this venue or building on
+        # public lists, when the query uses them (services/list_notes).
+        nudged += _t("list_descriptor_bonus", list_notes.descriptor_bonus(q_lex, list_notes.key_for(h)))
         # Evidence, not internals: see evidence_why. Buildings and venues show
         # nothing rather than repeat the year/style the row already shows.
         why = evidence_why(h, q_lex)
@@ -2774,10 +2777,9 @@ async def search_unified(
             if about:
                 h["summary"] = about
         # "On N lists": how many public lists hold it (services/list_notes).
-        if h.get("type") == "venue":
-            n = list_notes.list_count(h.get("id"))
-            if n:
-                h["list_count"] = n
+        n = list_notes.list_count(list_notes.key_for(h))
+        if n:
+            h["list_count"] = n
 
     header = build_header(hits, intent)
     facets = build_facets({
