@@ -1009,7 +1009,7 @@ def layer_title_bonus(q_lex: str, hit_type: Optional[str],
                       name: Optional[str]) -> float:
     """Scaled by how much of the title the query actually covers, so a full
     title match ("kitty genovese") far outweighs a single shared word."""
-    if hit_type not in ("lore", "plaque", "contribution") or not name:
+    if hit_type not in ("lore", "plaque", "contribution", "place") or not name:
         return 0.0
     q_toks = {t for t in _tokens(q_lex) if len(t) >= 4}
     if not q_toks:
@@ -1710,7 +1710,7 @@ def llm_category_bonus(interp: Optional[Dict[str, Any]], hit: Dict[str, Any]) ->
     """A venue whose category is one the model named as the kind of place
     asked for ("Cocktail Bar" for "modernist bars"). Exact category match on
     normalised words, venues only."""
-    if not interp or hit.get("type") != "venue":
+    if not interp or hit.get("type") not in ("venue", "place"):
         return 0.0
     cat = " ".join(_tokens(hit.get("category") or ""))
     if not cat:
@@ -1940,7 +1940,7 @@ def tier_of(h: Dict[str, Any], q_toks: set, named_toks: set,
     # Only a PLACE can be "the thing itself". A lore title that contains the
     # words ("Murder of ...") is a topical match, sorted by distance like any
     # other real match.
-    if covered and named_toks and h.get("type") in ("building", "venue"):
+    if covered and named_toks and h.get("type") in ("building", "venue", "place"):
         # The query must account for EVERY distinctive word of the name (or
         # host building name): "chrysler" is the Chrysler Building, but
         # "gargoyles" is not the gift shop "Dragonflies & Gargoyles".
@@ -1959,12 +1959,14 @@ def tier_of(h: Dict[str, Any], q_toks: set, named_toks: set,
     # cotta"), so they are evidence for the rewrite, not for the query:
     # counted, they sorted rewrite hits by distance as if they were answers.
     own_words = not h.get("_rewrite")
-    if own_words and (h.get("name_sim") or 0.0) >= FUZZY_NAME_FULL and h.get("type") in ("building", "venue"):
+    if own_words and (h.get("name_sim") or 0.0) >= FUZZY_NAME_FULL and h.get("type") in ("building", "venue", "place"):
         return 0  # a typo of a name is still the name
     # When the rewrite says the query wants a KIND of place ("modernist
     # bars"), only places of that kind are real matches; a modernist bank
     # whose report mentions a bar is context.
-    if interp and interp.get("categories") and h.get("type") != "venue":
+    # Parks, cemeteries and landmarks are places to go too ("parks in
+    # brooklyn").
+    if interp and interp.get("categories") and h.get("type") not in ("venue", "place"):
         return 2
     if covered or (own_words and phrase and (h.get("lore_lex") or 0.0) >= LORE_LEX_DIRECT) or _llm_qualified(interp, h):
         return 1

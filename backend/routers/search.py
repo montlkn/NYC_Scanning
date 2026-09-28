@@ -1610,6 +1610,56 @@ async def _leg_list_venues(
     return hits
 
 
+async def _leg_list_places(
+    ids: List[str], lat: Optional[float], lng: Optional[float],
+    radius_m: Optional[float], soft_radius: bool,
+) -> List[dict]:
+    """Places ("place:<id>") public lists describe with the query's words,
+    from the layer index, in the given order."""
+    if not ids:
+        return []
+    params: dict = {"ids": ids}
+    geo = lat is not None and lng is not None
+    dist_sql, radius_clause = "", ""
+    if geo:
+        params["lat"], params["lng"] = lat, lng
+        hav = ("6371000 * acos(GREATEST(-1, LEAST(1, "
+               "cos(radians(:lat)) * cos(radians(l.lat)) * cos(radians(l.lng) - radians(:lng)) "
+               "+ sin(radians(:lat)) * sin(radians(l.lat)))))")
+        dist_sql = f", {hav} AS dist_m"
+        if radius_m is not None and not soft_radius:
+            params["radius_m"] = radius_m
+            radius_clause = f"AND l.lat IS NOT NULL AND {hav} <= :radius_m"
+    sql = f"""
+        SELECT l.id, l.title, l.snippet, l.lat, l.lng, l.category, l.photo_url {dist_sql}
+        FROM layer_search_index l
+        WHERE l.id = ANY(:ids) AND l.layer = 'place' {radius_clause}
+    """
+    try:
+        async with get_search_db() as db:
+            if db is None:
+                return []
+            result = await db.execute(text(sql), params)
+            rows = {r._mapping["id"]: r._mapping for r in result.fetchall()}
+    except Exception as e:
+        logger.warning(f"[unified/lists] place fetch failed: {e}")
+        return []
+    hits = []
+    for pid in ids:
+        r = rows.get(pid)
+        if not r:
+            continue
+        hits.append({
+            "type": "place", "id": r["id"], "bin": None, "bbl": None,
+            "name": r["title"], "snippet": r["snippet"], "year": None, "style": None,
+            "category": r["category"], "landmark": None, "lat": r["lat"], "lng": r["lng"],
+            "score": 0.0, "matched_field": "lists",
+            "dist_m": round(float(r["dist_m"]), 1) if geo and r.get("dist_m") is not None else None,
+            "photo_url": r["photo_url"], "lore_status": None, "summary": None,
+        })
+    return hits
+
+
 async def _leg_venues_vector_only(
     qvec_lit: str, limit: int,
     lat: Optional[float], lng: Optional[float], radius_m: Optional[float],
@@ -1783,7 +1833,7 @@ async def _leg_layers(
         # before 20260710_index_enrich.sql / the updated embed_layers.py ran.
         lore_status = r[8] or (category if (category and category.lower() in _STATUS_TOKENS) else None)
         layer_val = r[1]
-        hit_type = layer_val if layer_val in ("lore", "plaque", "contribution", "wiki") else "lore"
+        hit_type = layer_val if layer_val in ("lore", "plaque", "contribution", "wiki", "place") else "lore"
         hits.append({
             "type": hit_type,
             "id": r[0],
@@ -1861,7 +1911,7 @@ async def _leg_layers_vector_only(
         category = r[8]
         lore_status = category if (category and category.lower() in _STATUS_TOKENS) else None
         layer_val = r[1]
-        hit_type = layer_val if layer_val in ("lore", "plaque", "contribution", "wiki") else "lore"
+        hit_type = layer_val if layer_val in ("lore", "plaque", "contribution", "wiki", "place") else "lore"
         out.append({
             "type": hit_type, "id": r[0], "bin": None, "bbl": None, "name": r[2], "snippet": r[3],
             "year": r[7], "style": None, "category": category, "landmark": None,
@@ -2512,16 +2562,22 @@ async def search_unified(
     # places lists call "cutty" or "hip".
     if intent != "address":
         venue_w = corpus_weights(intent).get("venues", 1.0)
+        layer_w = corpus_weights(intent).get("layers", 1.0)
         exact_ids = list_notes.match(q_lex)
         similar_ids = [k for k in await list_notes.similar(qvec) if k not in exact_ids]
-        for leg, ids, w in (("lists", exact_ids, venue_w), ("lists~similar", similar_ids, venue_w * 0.5)):
-            if not ids:
-                continue
-            list_hits = await _leg_list_venues(ids, q_lex, lat, lng, radius_m,
-                                               soft_radius and not area_bound)
-            if list_hits:
-                legs[leg] = [RankedHit("venues", h["id"], i + 1, h) for i, h in enumerate(list_hits)]
-                weights[leg] = w
+        soft = soft_radius and not area_bound
+        for leg, ids, w in (("lists", exact_ids, 1.0), ("lists~similar", similar_ids, 0.5)):
+            venue_ids = [k for k in ids if not k.startswith("place:")]
+            place_ids = [k for k in ids if k.startswith("place:")]
+            venue_hits = await _leg_list_venues(venue_ids, q_lex, lat, lng, radius_m, soft)
+            place_hits = await _leg_list_places(place_ids, lat, lng, radius_m, soft)
+            if venue_hits:
+                legs[leg] = [RankedHit("venues", h["id"], i + 1, h) for i, h in enumerate(venue_hits)]
+                weights[leg] = venue_w * w
+            if place_hits:
+                # Same corpus as the layers leg, so a place both find merges.
+                legs[leg + ":places"] = [RankedHit("layers", h["id"], i + 1, h) for i, h in enumerate(place_hits)]
+                weights[leg + ":places"] = layer_w * w
 
     if direct:
         expansion_queries, expanded = [], None

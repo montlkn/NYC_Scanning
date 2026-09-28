@@ -167,6 +167,11 @@ To add a note, append a row to `cards/venue_notes.jsonl` and deploy:
   `list_notes.descriptor_bonus` to venues and buildings whose descriptors
   the query uses, and building hits carry `list_count`. Places are not a
   search corpus yet, so their descriptors only show on their own pages.
+- Places (2026-09-28): parks, cemeteries and landmarks are search results
+  (type "place"). `scripts/embed_layers.py --layer place` indexes the
+  BUILDINGS `places` table into layer_search_index as "place:<id>", which is
+  also their list key, so list descriptors find and boost them. Re-run it
+  after adding places.
 - Deliberately not built: there is no profile viewer, so lists surface on
   venue pages, result rows and in search instead. Browse/follow/copy only
   if a profile viewer ever exists.

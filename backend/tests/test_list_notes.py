@@ -81,3 +81,16 @@ def test_similar_ranks_by_meaning_and_skips_buildings(monkeypatch):
         list_notes._NOTES = {}
         list_notes._VECS.clear()
         list_notes._VEC_TEXT.clear()
+
+
+def test_places_are_keyed_and_found_by_lists():
+    assert list_notes.key_for({"type": "place", "id": "place:park-union-square"}) == "place:park-union-square"
+    list_notes._NOTES = {
+        "place:park-x": {"list_count": 2, "descriptors": {"sunset": 2}},
+        "bin:9": {"list_count": 1, "descriptors": {"sunset": 1}},
+    }
+    try:
+        assert list_notes.match("sunset spots") == ["place:park-x"]
+        assert list_notes.status()["places"] == 1
+    finally:
+        list_notes._NOTES = {}

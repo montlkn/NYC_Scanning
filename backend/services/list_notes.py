@@ -79,6 +79,8 @@ def key_for(hit: Dict[str, Any]) -> Optional[str]:
         return hit.get("id")
     if t == "building" and hit.get("bin"):
         return "bin:" + str(hit["bin"]).replace(".0", "")
+    if t == "place" and str(hit.get("id") or "").startswith("place:"):
+        return hit["id"]  # the index id is already the list key
     return None
 
 
@@ -103,13 +105,13 @@ def match(q_lex: str, limit: int = MATCH_LIMIT) -> List[str]:
     """Venue fsq ids whose public-list descriptors the query uses, most lists
     first. This is recall, not reordering: a bar described only by lists as
     "cutty" is found by "cutty" even when nothing else about it says so.
-    Buildings and places ("bin:"/"place:" keys) are left to the nudge."""
+    Venues and places ("place:<id>"); buildings are left to the nudge."""
     q_words = set((q_lex or "").lower().split())
     if not q_words:
         return []
     scored = []
     for key, n in _NOTES.items():
-        if ":" in key or not n.get("list_count"):
+        if key.startswith("bin:") or key.startswith("apple:") or not n.get("list_count"):
             continue
         s = sum(int(c or 0) for d, c in (n.get("descriptors") or {}).items()
                 if d and _desc_words(d) <= q_words)
@@ -140,7 +142,7 @@ async def _ensure_vectors() -> None:
     import numpy as np
     from services.text_embeddings import embed_texts
     want = {k: _descriptor_text(n) for k, n in _NOTES.items()
-            if ":" not in k and n.get("list_count") and n.get("descriptors")}
+            if not k.startswith(("bin:", "apple:")) and n.get("list_count") and n.get("descriptors")}
     todo = [k for k, t in want.items() if _VEC_TEXT.get(k) != t]
     if todo:
         vecs = await asyncio.to_thread(embed_texts, [want[k] for k in todo])
@@ -158,7 +160,7 @@ async def _ensure_vectors() -> None:
 
 async def similar(qvec: List[float], limit: int = SIMILAR_LIMIT,
                   floor: float = SIMILAR_FLOOR) -> List[str]:
-    """Venue fsq ids whose list descriptors mean what the query means, most
+    """Venue fsq ids and place keys whose list descriptors mean what the query means, most
     similar first. Never raises: a failure only loses this leg."""
     try:
         await _ensure_vectors()

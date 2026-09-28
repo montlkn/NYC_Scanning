@@ -18,6 +18,9 @@ Env:
                    community_posts. Falls back to DATABASE_URL if unset.
                    NOTE: this is the MAIN project, NOT the buildings project that
                    embed_buildings.py reads via DATABASE_URL.            [one required]
+  BUILDINGS_DB_URL BUILDINGS Supabase Postgres — holds `places` (the
+                   "place" layer). Falls back to DATABASE_URL, which
+                   embed_buildings.py uses for that same project.
   SEARCH_DB_URL    Railway Postgres (the search index lives here)        [required]
 
 Usage:
@@ -99,6 +102,17 @@ def _contribution_text(r):
         None, None  # community_posts has no status/image column exposed here
 
 
+def _place_text(r):
+    kind = _clean(r.get("kind"))
+    acres = r.get("acres")
+    size = f"{float(acres):.0f} acres" if acres else ""
+    text = _join(r.get("name"), kind, r.get("borough"), size, r.get("wikipedia"))
+    snippet = " · ".join(p for p in (kind.capitalize(), _clean(r.get("borough"))) if p)
+    return text, _clean(r.get("name")), snippet, \
+        r.get("lat"), r.get("lng"), None, kind or None, \
+        None, None
+
+
 LAYERS = {
     "lore": {
         "sql": "SELECT id, title, summary, category, lat, lng, address, year, status, image_url "
@@ -115,6 +129,15 @@ LAYERS = {
                "FROM community_posts WHERE is_flagged IS NOT TRUE "
                "AND (place_name IS NOT NULL OR caption IS NOT NULL)",
         "map": _contribution_text,
+    },
+    # Parks, cemeteries and landmarks (the app's Places layer). They live on
+    # the BUILDINGS project, so this layer reads BUILDINGS_DB_URL. The id
+    # "place:<id>" is also the key public lists use for them (list_notes).
+    "place": {
+        "sql": "SELECT id, name, kind, borough, acres, lat, lng, wikipedia "
+               "FROM places WHERE name IS NOT NULL",
+        "map": _place_text,
+        "db": "buildings",
     },
 }
 
@@ -186,10 +209,16 @@ def main():
     indexed = set() if args.rebuild else load_indexed(rail_url)
     logger.info(f"{len(indexed)} layer rows already indexed")
 
+    buildings_url = os.environ.get("BUILDINGS_DB_URL") or os.environ.get("DATABASE_URL")
     layers = [args.layer] if args.layer else list(LAYERS)
     all_rows = []
     for layer in layers:
-        rows = fetch_rows(supa_url, layer, LAYERS[layer], args.rebuild, indexed)
+        cfg = LAYERS[layer]
+        src = buildings_url if cfg.get("db") == "buildings" else supa_url
+        if not src:
+            logger.warning(f"  {layer}: skipped, BUILDINGS_DB_URL / DATABASE_URL not set")
+            continue
+        rows = fetch_rows(src, layer, cfg, args.rebuild, indexed)
         logger.info(f"  {layer}: {len(rows)} to embed")
         all_rows.extend(rows)
 
