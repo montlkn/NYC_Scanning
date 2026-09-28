@@ -21,6 +21,8 @@ Env:
   BUILDINGS_DB_URL BUILDINGS Supabase Postgres — holds `places` (the
                    "place" layer). Falls back to DATABASE_URL, which
                    embed_buildings.py uses for that same project.
+  SEARCH_DB_WRITE_URL  Owner login for the search index (writes). Falls back
+                   to SEARCH_DB_URL, which on the API is read-only.
   SEARCH_DB_URL    Railway Postgres (the search index lives here)        [required]
 
 Usage:
@@ -201,7 +203,10 @@ def main():
     # The lore/plaque/contribution tables live on the MAIN Supabase project, NOT
     # the buildings project that DATABASE_URL points at. Prefer MAIN_DB_URL.
     supa_url = os.environ.get("MAIN_DB_URL") or os.environ.get("DATABASE_URL")
-    rail_url = os.environ.get("SEARCH_DB_URL")
+    # The API's SEARCH_DB_URL is a read-only user (jink_search_app); writing
+    # the index needs the owner. SEARCH_DB_WRITE_URL is set only on the
+    # index job, never on the API service.
+    rail_url = os.environ.get("SEARCH_DB_WRITE_URL") or os.environ.get("SEARCH_DB_URL")
     if not supa_url or not rail_url:
         logger.error("MAIN_DB_URL (or DATABASE_URL) and SEARCH_DB_URL must be set")
         sys.exit(1)
@@ -212,19 +217,27 @@ def main():
     buildings_url = os.environ.get("BUILDINGS_DB_URL") or os.environ.get("DATABASE_URL")
     layers = [args.layer] if args.layer else list(LAYERS)
     all_rows = []
+    failed = False
     for layer in layers:
         cfg = LAYERS[layer]
         src = buildings_url if cfg.get("db") == "buildings" else supa_url
         if not src:
             logger.warning(f"  {layer}: skipped, BUILDINGS_DB_URL / DATABASE_URL not set")
             continue
-        rows = fetch_rows(src, layer, cfg, args.rebuild, indexed)
+        # One layer's source failing (no MAIN_DB_URL on the cron service,
+        # say) must not stop the others from indexing.
+        try:
+            rows = fetch_rows(src, layer, cfg, args.rebuild, indexed)
+        except Exception as e:
+            logger.error(f"  {layer}: source read failed, skipped: {e}")
+            failed = True
+            continue
         logger.info(f"  {layer}: {len(rows)} to embed")
         all_rows.extend(rows)
 
     if not all_rows:
         logger.info("nothing to embed")
-        return
+        sys.exit(1 if failed else 0)
 
     if args.dry_run:
         for r in all_rows[:8]:
@@ -249,6 +262,8 @@ def main():
         logger.info(f"  upserted {total}/{len(all_rows)}")
 
     logger.info(f"✅ done — {total} layer rows embedded into layer_search_index")
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

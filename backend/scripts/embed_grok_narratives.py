@@ -91,7 +91,8 @@ def main() -> int:
     rows = fetch_narratives()
     log.info("%d usable narratives on MAIN", len(rows))
 
-    conn = psycopg2.connect(os.environ["SEARCH_DB_URL"])
+    # SEARCH_DB_URL is read-only on the API; see cron/reindex_search.sh.
+    conn = psycopg2.connect(os.environ.get("SEARCH_DB_WRITE_URL") or os.environ["SEARCH_DB_URL"])
     with conn.cursor() as cur:
         cur.execute("SET lock_timeout = '3s'")
         cur.execute("ALTER TABLE building_lore_index "

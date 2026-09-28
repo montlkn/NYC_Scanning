@@ -171,7 +171,8 @@ To add a note, append a row to `cards/venue_notes.jsonl` and deploy:
   (type "place"). `scripts/embed_layers.py --layer place` indexes the
   BUILDINGS `places` table into layer_search_index as "place:<id>", which is
   also their list key, so list descriptors find and boost them. Re-run it
-  after adding places.
+  after adding places (see docs/SEARCH_INDEX_JOBS.md; writes need the index
+  owner login, the API user is read-only).
 - Deliberately not built: there is no profile viewer, so lists surface on
   venue pages, result rows and in search instead. Browse/follow/copy only
   if a profile viewer ever exists.
