@@ -1537,6 +1537,79 @@ async def _leg_venues(
     return hits
 
 
+async def _leg_list_venues(
+    ids: List[str], q_lex: str,
+    lat: Optional[float], lng: Optional[float], radius_m: Optional[float],
+    soft_radius: bool,
+) -> List[dict]:
+    """Venues public lists describe with the query's words, in
+    list_notes.match order. Same row shape as _leg_venues, so fusion and
+    every nudge treat them alike."""
+    if not ids:
+        return []
+    params: dict = {"ids": ids}
+    geo = lat is not None and lng is not None
+    dist_sql = ""
+    radius_clause = ""
+    if geo:
+        params["lat"], params["lng"] = lat, lng
+        hav = ("6371000 * acos(GREATEST(-1, LEAST(1, "
+               "cos(radians(:lat)) * cos(radians(v.lat)) * cos(radians(v.lng) - radians(:lng)) "
+               "+ sin(radians(:lat)) * sin(radians(v.lat)))))")
+        dist_sql = f", {hav} AS dist_m"
+        if radius_m is not None and not soft_radius:
+            params["radius_m"] = radius_m
+            radius_clause = f"AND v.lat IS NOT NULL AND v.lng IS NOT NULL AND {hav} <= :radius_m"
+    sql = f"""
+        SELECT v.fsq_id, v.name, v.category, v.snippet, v.lat, v.lng,
+               v.bin, v.bbl, v.building_year, v.building_style, v.photo_url,
+               v.category_labels, v.neighborhood, v.borough, v.lex_text, v.text
+               {dist_sql}
+        FROM venues v
+        WHERE v.fsq_id = ANY(:ids) AND v.searchable IS NOT FALSE {radius_clause}
+    """
+    try:
+        async with get_search_db() as db:
+            if db is None:
+                return []
+            result = await db.execute(text(sql), params)
+            rows = {r._mapping["fsq_id"]: r._mapping for r in result.fetchall()}
+    except Exception as e:
+        logger.warning(f"[unified/lists] venue fetch failed: {e}")
+        return []
+    hits = []
+    for fsq_id in ids:
+        r = rows.get(fsq_id)
+        if not r:
+            continue
+        hits.append({
+            "type": "venue",
+            "id": r["fsq_id"],
+            "bin": str(r["bin"]).replace(".0", "") if r["bin"] else None,
+            "bbl": str(r["bbl"]).replace(".0", "") if r["bbl"] else None,
+            "name": r["name"],
+            "snippet": r["snippet"],
+            "year": r["building_year"],
+            "style": r["building_style"],
+            "category": r["category"],
+            "neighborhood": r["neighborhood"],
+            "borough": r["borough"],
+            "lex_text": r["lex_text"],
+            "text": r["text"],
+            "landmark": None,
+            "lat": r["lat"],
+            "lng": r["lng"],
+            "score": 0.0,
+            "lex_score": 0.0,
+            "matched_field": "lists",
+            "dist_m": round(float(r["dist_m"]), 1) if geo and r.get("dist_m") is not None else None,
+            "category_labels": list(r["category_labels"]) if r["category_labels"] else None,
+            "photo_url": r["photo_url"],
+            "lore_status": None,
+        })
+    return hits
+
+
 async def _leg_venues_vector_only(
     qvec_lit: str, limit: int,
     lat: Optional[float], lng: Optional[float], radius_m: Optional[float],
@@ -2431,6 +2504,18 @@ async def search_unified(
         name: [RankedHit(name, h["id"], i + 1, h) for i, h in enumerate(hits) if h.get("id")]
         for name, hits in raw_legs.items()
     }
+    # Curator lists as their own source: venues public lists describe with the
+    # query's words, even when nothing else about them matches. Weighted like
+    # the venues corpus for this intent, so a bar query leans on it and a
+    # building query barely does.
+    if intent != "address":
+        list_ids = list_notes.match(q_lex)
+        if list_ids:
+            list_hits = await _leg_list_venues(list_ids, q_lex, lat, lng, radius_m,
+                                               soft_radius and not area_bound)
+            if list_hits:
+                legs["lists"] = [RankedHit("venues", h["id"], i + 1, h) for i, h in enumerate(list_hits)]
+                weights["lists"] = corpus_weights(intent).get("venues", 1.0)
 
     if direct:
         expansion_queries, expanded = [], None
@@ -2511,6 +2596,8 @@ async def search_unified(
     _facet_adj = facet_adjustments(q_lex, [rh.payload for _, _, rh in fused])
     for idx, (gk, score, ranked_hit) in enumerate(fused):
         h = dict(ranked_hit.payload)
+        # Read by tier_of: a list's word for a place counts as a match.
+        h["list_words"] = list_notes.words_for(list_notes.key_for(h))
         dbg: Dict[str, float] = {}
 
         def _t(label: str, val: float) -> float:
@@ -2834,6 +2921,13 @@ async def search_unified(
 
 _facets_cache: Dict[str, Any] = {"data": None, "ts": 0.0}
 _FACETS_TTL_S = 3600.0
+
+
+@router.get("/list-notes/status")
+async def list_notes_status() -> Dict[str, Any]:
+    """Is public-list knowledge reaching search? `loaded: false` with a
+    `last_error` means the MAIN fetch (SUPABASE_URL / SUPABASE_KEY) fails."""
+    return list_notes.status()
 
 
 @router.get("/facets")

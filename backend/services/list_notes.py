@@ -40,6 +40,10 @@ MAX_COMMENT_CHARS = 160
 
 _NOTES: Dict[str, Dict[str, Any]] = {}
 _generation = 0
+# For /search/list-notes/status: whether list knowledge is reaching search.
+_last_ok: Optional[float] = None
+_last_error: Optional[str] = None
+MATCH_LIMIT = 40
 
 
 def generation() -> int:
@@ -74,6 +78,51 @@ def descriptor_bonus(q_lex: str, key: Optional[str]) -> float:
     lists = sum(int(n or 0) for d, n in descs.items()
                 if d and set(d.lower().split()) <= q_words)
     return min(W_LIST_DESCRIPTOR_MAX, W_LIST_DESCRIPTOR * lists)
+
+
+def _desc_words(d: str) -> set:
+    return set(d.lower().split())
+
+
+def match(q_lex: str, limit: int = MATCH_LIMIT) -> List[str]:
+    """Venue fsq ids whose public-list descriptors the query uses, most lists
+    first. This is recall, not reordering: a bar described only by lists as
+    "cutty" is found by "cutty" even when nothing else about it says so.
+    Buildings and places ("bin:"/"place:" keys) are left to the nudge."""
+    q_words = set((q_lex or "").lower().split())
+    if not q_words:
+        return []
+    scored = []
+    for key, n in _NOTES.items():
+        if ":" in key or not n.get("list_count"):
+            continue
+        s = sum(int(c or 0) for d, c in (n.get("descriptors") or {}).items()
+                if d and _desc_words(d) <= q_words)
+        if s:
+            scored.append((s, key))
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    return [k for _, k in scored[:limit]]
+
+
+def words_for(key: Optional[str]) -> Optional[str]:
+    """Every descriptor public lists gave it, as one string, or None."""
+    descs = (get(key) or {}).get("descriptors") or {}
+    return " ".join(descs) or None
+
+
+def status() -> Dict[str, Any]:
+    """Counts only, no list content."""
+    keys = [k for k, v in _NOTES.items() if v.get("list_count")]
+    return {
+        "loaded": _last_ok is not None,
+        "last_refresh_ok_at": _last_ok,
+        "last_error": _last_error,
+        "generation": _generation,
+        "venues": sum(1 for k in keys if ":" not in k),
+        "buildings": sum(1 for k in keys if k.startswith("bin:")),
+        "places": sum(1 for k in keys if k.startswith("place:")),
+        "save_counts": sum(1 for v in _NOTES.values() if v.get("save_count")),
+    }
 
 
 def list_count(fsq_id: Optional[str]) -> int:
@@ -117,7 +166,7 @@ def format_note(n: Dict[str, Any]) -> str:
 async def refresh() -> bool:
     """Replace the in-memory notes from MAIN. Keeps the old ones on failure,
     so a MAIN hiccup never empties search of list knowledge."""
-    global _NOTES, _generation
+    global _NOTES, _generation, _last_ok, _last_error
     s = get_settings()
     url = s.supabase_url.rstrip("/") + "/rest/v1/rpc/venue_list_notes"
     headers = {"apikey": s.supabase_key, "Authorization": f"Bearer {s.supabase_key}",
@@ -128,9 +177,11 @@ async def refresh() -> bool:
         r.raise_for_status()
         rows = r.json()
     except Exception as e:
+        _last_error = f"{type(e).__name__}: {e}"[:300]
         logger.warning(f"[lists] refresh failed, keeping {len(_NOTES)} notes: {e}")
         return False
-    fresh = {row["venue_id"]: row for row in rows if row.get("venue_id")}
+    _last_ok, _last_error = time.time(), None
+    fresh = {row["venue_id"]: row for row in rows if isinstance(row, dict) and row.get("venue_id")}
     if fresh != _NOTES:
         _NOTES = fresh
         _generation += 1

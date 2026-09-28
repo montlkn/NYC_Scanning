@@ -41,3 +41,20 @@ def test_descriptor_bonus_needs_every_word_and_caps():
         assert list_notes.descriptor_bonus("cast iron", "bin:2") == 0.0
     finally:
         list_notes._NOTES = {}
+
+
+def test_match_finds_venues_by_descriptor_most_lists_first():
+    list_notes._NOTES = {
+        "a": {"list_count": 1, "descriptors": {"cutty": 1}},
+        "b": {"list_count": 3, "descriptors": {"cutty": 3, "dim lit": 1}},
+        "c": {"list_count": 2, "descriptors": {"loud": 2}},
+        "bin:1": {"list_count": 5, "descriptors": {"cutty": 5}},
+    }
+    try:
+        assert list_notes.match("cutty bars") == ["b", "a"]
+        assert list_notes.match("dim lit spots") == ["b"]
+        assert list_notes.match("dim") == []
+        s = list_notes.status()
+        assert (s["venues"], s["buildings"]) == (3, 1)
+    finally:
+        list_notes._NOTES = {}

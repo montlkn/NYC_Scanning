@@ -1873,6 +1873,9 @@ def _hit_match_tokens(h: Dict[str, Any], with_prose: bool = True) -> set:
         h.get("name"), h.get("category"), h.get("style"), h.get("neighborhood"),
         h.get("borough"), h.get("architect"), (h.get("aesthetic") or "").replace("_", " "),
         h.get("material"), h.get("lex_text"),
+        # Descriptors public lists gave it (services/list_notes): people's
+        # word for a place is a real match for that word.
+        h.get("list_words"),
         *( (h.get("lore_text"),) if with_prose else () ),
         *( (h.get("snippet"),) if with_prose or h.get("type") not in ("building",) else () ),
     )
