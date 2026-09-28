@@ -155,7 +155,7 @@ To add a note, append a row to `cards/venue_notes.jsonl` and deploy:
   `venue_list_notes`. Migration: Jink_Swift
   `supabase/migrations/20260926e_curator_lists_MAIN_DB.sql`.
 - Backend: `services/list_notes.py` pulls `venue_list_notes()` at startup
-  and every 3 hours (instead of a nightly job; no new infrastructure). The
+  and every 15 minutes (was 3 hours until 2026-09-28) (instead of a nightly job; no new infrastructure). The
   judge reads it as a "Lists:" line; venue hits carry `list_count`.
 - App: LIST button on the venue page, descriptor editor with suggestions,
   public toggle on the list page, "On N lists" on result rows, "On these

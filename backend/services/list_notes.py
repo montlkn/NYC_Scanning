@@ -5,9 +5,9 @@ places (parks, cemeteries, landmarks) on lists in the app; a public list gives
 each one 1-5 short descriptors and an optional comment. MAIN aggregates them
 in `venue_list_notes()`, keyed by the venue's fsq id, "bin:<bin>" for a
 building, or "place:<id>" for a place (see `key_for`),
-and this module pulls that every few hours and keeps it in memory, next to the
+and this module pulls that every 15 minutes and keeps it in memory, next to the
 hand-written editor notes. Changes reach search within REFRESH_S, not
-instantly; that was the agreed trade for needing no new job infrastructure.
+instantly; that is the trade for needing no new job infrastructure.
 
 Weighting is in the text, not in code: descriptors are shown with the number
 of lists that used them, most agreed first, so the judge sees "cutty (4
@@ -28,7 +28,11 @@ from models.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-REFRESH_S = 3 * 3600
+# 15 minutes. The RPC is one aggregate over the list tables (milliseconds
+# at today's size) and only changed descriptor texts are re-embedded, so a
+# shorter interval costs next to nothing. Revisit if lists reach the tens of
+# thousands.
+REFRESH_S = 15 * 60
 # Per public list that used a descriptor the query names, capped. A rank step
 # is ~0.016 after RRF_SCALE, so one list moves a hit ~2 steps and the cap ~7:
 # a tiebreak among real matches, never enough to lift an unrelated row.
