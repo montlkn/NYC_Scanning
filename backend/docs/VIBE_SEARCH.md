@@ -160,6 +160,13 @@ To add a note, append a row to `cards/venue_notes.jsonl` and deploy:
 - App: LIST button on the venue page, descriptor editor with suggestions,
   public toggle on the list page, "On N lists" on result rows, "On these
   lists" (with REPORT) on the venue page.
+- v2 (2026-09-28): lists hold anything searchable. Buildings and places
+  (park, cemetery, landmark) take descriptors too; lore, plaques and wiki
+  don't. `venue_list_notes` keys them `bin:<bin>` and `place:<id>`
+  (Jink_Swift `20260928c_list_rpcs_all_entries_MAIN_DB.sql`). Search adds
+  `list_notes.descriptor_bonus` to venues and buildings whose descriptors
+  the query uses, and building hits carry `list_count`. Places are not a
+  search corpus yet, so their descriptors only show on their own pages.
 - Deliberately not built: there is no profile viewer, so lists surface on
   venue pages, result rows and in search instead. Browse/follow/copy only
   if a profile viewer ever exists.
