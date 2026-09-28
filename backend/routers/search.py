@@ -2508,14 +2508,20 @@ async def search_unified(
     # query's words, even when nothing else about them matches. Weighted like
     # the venues corpus for this intent, so a bar query leans on it and a
     # building query barely does.
+    # A second, weaker leg matches by meaning: "sceney les bars" also reaches
+    # places lists call "cutty" or "hip".
     if intent != "address":
-        list_ids = list_notes.match(q_lex)
-        if list_ids:
-            list_hits = await _leg_list_venues(list_ids, q_lex, lat, lng, radius_m,
+        venue_w = corpus_weights(intent).get("venues", 1.0)
+        exact_ids = list_notes.match(q_lex)
+        similar_ids = [k for k in await list_notes.similar(qvec) if k not in exact_ids]
+        for leg, ids, w in (("lists", exact_ids, venue_w), ("lists~similar", similar_ids, venue_w * 0.5)):
+            if not ids:
+                continue
+            list_hits = await _leg_list_venues(ids, q_lex, lat, lng, radius_m,
                                                soft_radius and not area_bound)
             if list_hits:
-                legs["lists"] = [RankedHit("venues", h["id"], i + 1, h) for i, h in enumerate(list_hits)]
-                weights["lists"] = corpus_weights(intent).get("venues", 1.0)
+                legs[leg] = [RankedHit("venues", h["id"], i + 1, h) for i, h in enumerate(list_hits)]
+                weights[leg] = w
 
     if direct:
         expansion_queries, expanded = [], None

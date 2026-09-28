@@ -58,3 +58,26 @@ def test_match_finds_venues_by_descriptor_most_lists_first():
         assert (s["venues"], s["buildings"]) == (3, 1)
     finally:
         list_notes._NOTES = {}
+
+
+def test_similar_ranks_by_meaning_and_skips_buildings(monkeypatch):
+    import asyncio
+    import sys
+    import types
+    # Stand-in model: 2-d vectors, "vibe" words along x, "quiet" words along y.
+    fake = types.ModuleType("services.text_embeddings")
+    fake.embed_texts = lambda texts: [[1.0, 0.1] if "cutty" in t or "hip" in t else [0.1, 1.0] for t in texts]
+    monkeypatch.setitem(sys.modules, "services.text_embeddings", fake)
+    list_notes._NOTES = {
+        "a": {"list_count": 1, "descriptors": {"cutty": 1, "hip": 1}},
+        "b": {"list_count": 1, "descriptors": {"quiet": 1}},
+        "bin:1": {"list_count": 1, "descriptors": {"cutty": 1}},
+    }
+    list_notes._generation += 1
+    try:
+        ids = asyncio.run(list_notes.similar([1.0, 0.0], floor=0.9))
+        assert ids == ["a"]
+    finally:
+        list_notes._NOTES = {}
+        list_notes._VECS.clear()
+        list_notes._VEC_TEXT.clear()

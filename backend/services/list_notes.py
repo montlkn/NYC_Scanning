@@ -44,6 +44,17 @@ _generation = 0
 _last_ok: Optional[float] = None
 _last_error: Optional[str] = None
 MATCH_LIMIT = 40
+# Semantic match: "sceney les bars" should also reach places lists call
+# "cutty" or "hip". Each venue's descriptors are embedded as one short text
+# with the search model; the query vector is compared to them. Measured on
+# bge-small 2026-09-28: "sceney les bars" vs "cutty, sceney, cool, dim lit,
+# hip" 0.66, "cutty bars" 0.69, "date night spot" vs "romantic, candlelit"
+# 0.74; unrelated pairs 0.41-0.57. Tune against real queries.
+SIMILAR_LIMIT = 25
+SIMILAR_FLOOR = 0.62
+_VECS: Dict[str, Any] = {}          # venue key -> unit numpy vector
+_VEC_TEXT: Dict[str, str] = {}      # venue key -> text the vector was made from
+_vec_generation = -1
 
 
 def generation() -> int:
@@ -108,6 +119,57 @@ def words_for(key: Optional[str]) -> Optional[str]:
     """Every descriptor public lists gave it, as one string, or None."""
     descs = (get(key) or {}).get("descriptors") or {}
     return " ".join(descs) or None
+
+
+def _descriptor_text(n: Dict[str, Any]) -> str:
+    descs = sorted((n.get("descriptors") or {}).items(), key=lambda kv: (-kv[1], kv[0]))
+    return ", ".join(d for d, _ in descs)
+
+
+async def _ensure_vectors() -> None:
+    """Embed descriptor texts that are new or changed since the last refresh.
+    Lazy, on the first search after a refresh, so the model is only loaded by
+    search traffic (see services/text_embeddings)."""
+    global _vec_generation
+    if _vec_generation == _generation:
+        return
+    import numpy as np
+    from services.text_embeddings import embed_texts
+    want = {k: _descriptor_text(n) for k, n in _NOTES.items()
+            if ":" not in k and n.get("list_count") and n.get("descriptors")}
+    todo = [k for k, t in want.items() if _VEC_TEXT.get(k) != t]
+    if todo:
+        vecs = await asyncio.to_thread(embed_texts, [want[k] for k in todo])
+        for k, v in zip(todo, vecs):
+            a = np.asarray(v, dtype=np.float32)
+            norm = float(np.linalg.norm(a)) or 1.0
+            _VECS[k] = a / norm
+            _VEC_TEXT[k] = want[k]
+    for k in list(_VECS):
+        if k not in want:
+            _VECS.pop(k, None)
+            _VEC_TEXT.pop(k, None)
+    _vec_generation = _generation
+
+
+async def similar(qvec: List[float], limit: int = SIMILAR_LIMIT,
+                  floor: float = SIMILAR_FLOOR) -> List[str]:
+    """Venue fsq ids whose list descriptors mean what the query means, most
+    similar first. Never raises: a failure only loses this leg."""
+    try:
+        await _ensure_vectors()
+        if not _VECS or not qvec:
+            return []
+        import numpy as np
+        q = np.asarray(qvec, dtype=np.float32)
+        q = q / (float(np.linalg.norm(q)) or 1.0)
+        keys = list(_VECS)
+        sims = np.stack([_VECS[k] for k in keys]) @ q
+        order = np.argsort(-sims)
+        return [keys[i] for i in order[:limit] if float(sims[i]) >= floor]
+    except Exception as e:
+        logger.warning(f"[lists] similar failed: {e}")
+        return []
 
 
 def status() -> Dict[str, Any]:
