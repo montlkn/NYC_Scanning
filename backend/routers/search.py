@@ -89,6 +89,9 @@ from services.unified_search import (
 )
 
 router = APIRouter(prefix="/search", tags=["search"])
+
+# ~6 rank steps down for a venue nothing vouches for (see _unverified).
+W_UNVERIFIED_VENUE = -0.10
 logger = logging.getLogger(__name__)
 
 
@@ -1488,6 +1491,7 @@ async def _leg_venues(
         SELECT v.fsq_id, v.name, v.category, v.snippet, v.lat, v.lng,
                v.bin, v.bbl, v.building_year, v.building_style, v.photo_url,
                v.category_labels, v.neighborhood, v.borough, v.lex_text, v.text,
+               (v.website IS NOT NULL OR v.instagram IS NOT NULL OR v.tel IS NOT NULL) AS has_contact,
                {fused} AS score, wl.lex AS lex_score
                {dist_sql}
         FROM venues v
@@ -1535,6 +1539,7 @@ async def _leg_venues(
             ),
             "dist_m": round(float(r["dist_m"]), 1) if geo and r.get("dist_m") is not None else None,
             "category_labels": list(r["category_labels"]) if r["category_labels"] else None,
+            "has_contact": r.get("has_contact"),
             "photo_url": r["photo_url"],
             "lore_status": None,
         })
@@ -1567,7 +1572,8 @@ async def _leg_list_venues(
     sql = f"""
         SELECT v.fsq_id, v.name, v.category, v.snippet, v.lat, v.lng,
                v.bin, v.bbl, v.building_year, v.building_style, v.photo_url,
-               v.category_labels, v.neighborhood, v.borough, v.lex_text, v.text
+               v.category_labels, v.neighborhood, v.borough, v.lex_text, v.text,
+               (v.website IS NOT NULL OR v.instagram IS NOT NULL OR v.tel IS NOT NULL) AS has_contact
                {dist_sql}
         FROM venues v
         WHERE v.fsq_id IN :ids AND v.searchable IS NOT FALSE {radius_clause}
@@ -1609,6 +1615,7 @@ async def _leg_list_venues(
             "matched_field": "lists",
             "dist_m": round(float(r["dist_m"]), 1) if geo and r.get("dist_m") is not None else None,
             "category_labels": list(r["category_labels"]) if r["category_labels"] else None,
+            "has_contact": r.get("has_contact"),
             "photo_url": r["photo_url"],
             "lore_status": None,
         })
@@ -2669,6 +2676,12 @@ async def search_unified(
         h = dict(ranked_hit.payload)
         # Read by tier_of: a list's word for a place counts as a match.
         h["list_words"] = list_notes.words_for(list_notes.key_for(h))
+        # A venue with no website, Instagram or phone and nothing else vouching
+        # for it (no card, no public list) is usually a user-made check-in
+        # ("Hangoverpocalypse", "Closing with Connor"), not a bar. It ranks
+        # below verified places and is never a real match on its own.
+        h["_unverified"] = (h.get("type") == "venue" and h.get("has_contact") is False
+                            and not vibe_judge.has_desc(h.get("id")))
         dbg: Dict[str, float] = {}
 
         def _t(label: str, val: float) -> float:
@@ -2766,6 +2779,8 @@ async def search_unified(
         nudged += _t("llm_style_bonus", llm_style_bonus(interp, h))
         nudged += _t("llm_era_bonus", llm_era_bonus(interp, h))
         nudged += _t("place_adjustment", place_adjustment(place_req, h, neighborhood_vocab()))
+        if h["_unverified"]:
+            nudged += _t("unverified_venue", W_UNVERIFIED_VENUE)
         # Curator lists: descriptors people gave this venue or building on
         # public lists, when the query uses them (services/list_notes).
         nudged += _t("list_descriptor_bonus", list_notes.descriptor_bonus(q_lex, list_notes.key_for(h)))
@@ -2845,6 +2860,9 @@ async def search_unified(
                 and query_content_tokens(_lexical_query(h.get("name") or "")) == q_toks):
             tiers[i] = 0
     tiers = resolve_entity_mode(tiers, [_asks_kind and carries_name(h["_src"], named_toks) for h in diversified])
+    # Unverified venues are never a "real match" (tier 1); searched by their
+    # own name they stay the answer (tier 0).
+    tiers = [2 if (t == 1 and h["_src"].get("_unverified")) else t for h, t in zip(diversified, tiers)]
     if debug:
         for h, t in zip(diversified, tiers):
             h["_debug"]["tier"] = t
