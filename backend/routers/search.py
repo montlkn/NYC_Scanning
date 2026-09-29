@@ -1566,13 +1566,14 @@ async def _leg_list_venues(
                v.category_labels, v.neighborhood, v.borough, v.lex_text, v.text
                {dist_sql}
         FROM venues v
-        WHERE v.fsq_id = ANY(:ids) AND v.searchable IS NOT FALSE {radius_clause}
+        WHERE v.fsq_id IN :ids AND v.searchable IS NOT FALSE {radius_clause}
     """
     try:
         async with get_search_db() as db:
             if db is None:
                 return []
-            result = await db.execute(text(sql), params)
+            # Expanding IN, not = ANY(:ids): see venue_categories on why.
+            result = await db.execute(text(sql).bindparams(bindparam("ids", expanding=True)), params)
             rows = {r._mapping["fsq_id"]: r._mapping for r in result.fetchall()}
     except Exception as e:
         logger.warning(f"[unified/lists] venue fetch failed: {e}")
@@ -1633,13 +1634,14 @@ async def _leg_list_places(
     sql = f"""
         SELECT l.id, l.title, l.snippet, l.lat, l.lng, l.category, l.photo_url {dist_sql}
         FROM layer_search_index l
-        WHERE l.id = ANY(:ids) AND l.layer = 'place' {radius_clause}
+        WHERE l.id IN :ids AND l.layer = 'place' {radius_clause}
     """
     try:
         async with get_search_db() as db:
             if db is None:
                 return []
-            result = await db.execute(text(sql), params)
+            # Expanding IN, not = ANY(:ids): see venue_categories on why.
+            result = await db.execute(text(sql).bindparams(bindparam("ids", expanding=True)), params)
             rows = {r._mapping["id"]: r._mapping for r in result.fetchall()}
     except Exception as e:
         logger.warning(f"[unified/lists] place fetch failed: {e}")
@@ -2560,6 +2562,7 @@ async def search_unified(
     # building query barely does.
     # A second, weaker leg matches by meaning: "sceney les bars" also reaches
     # places lists call "cutty" or "hip".
+    lists_dbg: Dict[str, int] = {}
     if intent != "address":
         venue_w = corpus_weights(intent).get("venues", 1.0)
         layer_w = corpus_weights(intent).get("layers", 1.0)
@@ -2571,6 +2574,8 @@ async def search_unified(
             place_ids = [k for k in ids if k.startswith("place:")]
             venue_hits = await _leg_list_venues(venue_ids, q_lex, lat, lng, radius_m, soft)
             place_hits = await _leg_list_places(place_ids, lat, lng, radius_m, soft)
+            lists_dbg[leg] = len(ids)
+            lists_dbg[leg + "_found"] = len(venue_hits) + len(place_hits)
             if venue_hits:
                 legs[leg] = [RankedHit("venues", h["id"], i + 1, h) for i, h in enumerate(venue_hits)]
                 weights[leg] = venue_w * w
@@ -2964,7 +2969,7 @@ async def search_unified(
             "llm_wait_ms": round((t_llm - t_first) * 1000),
             "expansion_ms": round((t_expand - t_llm) * 1000),
             "total_ms": round(latency_ms),
-            "direct": direct, "pre_expand": pre_expand,
+            "direct": direct, "pre_expand": pre_expand, "lists": lists_dbg,
             "local_matches": widened,
             "local_names": [h.get("name") for h in _local][:10] if widened is not None else None,
             "expansions": expansion_queries,
