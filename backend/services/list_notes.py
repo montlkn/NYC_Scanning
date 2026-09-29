@@ -257,7 +257,9 @@ async def refresh() -> bool:
     # Production answered 401 with SUPABASE_KEY, so list knowledge never
     # loaded. Try each configured key in turn; the service key is server-side
     # only and venue_list_notes is granted to service_role.
-    keys = [k for k in (s.supabase_key, s.supabase_service_key) if k]
+    # MAIN rejects SUPABASE_KEY (its legacy JWT keys look disabled), so the
+    # service key, which works, goes first; the anon key is the fallback.
+    keys = [k for k in (s.supabase_service_key, s.supabase_key) if k]
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             r = None
