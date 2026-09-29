@@ -928,3 +928,15 @@ def test_why_skips_ocr_damage_and_returns_none_when_nothing_clean():
     from services.unified_search import _prose_sentence, query_content_tokens
     text = "Standing in lower Manhattan, L ~berty Tower is now surrounded by many larger structures."
     assert _prose_sentence(text, query_content_tokens("liberty tower")) is None
+
+
+def test_dedupe_keeps_the_place_over_a_same_named_venue():
+    from services.unified_search import dedupe_near_identical
+    hits = [
+        {"type": "venue", "id": "v", "name": "Union Square Park", "lat": 40.7359, "lng": -73.9911, "score": 1.0},
+        {"type": "building", "id": "b", "name": "Other", "lat": 40.7, "lng": -73.9, "score": 0.9},
+        {"type": "place", "id": "place:park-union-square", "name": "Union Square Park",
+         "lat": 40.7360, "lng": -73.9910, "score": 0.3},
+    ]
+    out = dedupe_near_identical(hits)
+    assert [h["id"] for h in out] == ["place:park-union-square", "b"]

@@ -47,7 +47,9 @@ def fetch_narratives() -> list[tuple[str, str]]:
     """Page grok_narratives off MAIN via PostgREST (no direct DSN for it)."""
     url = os.environ["SUPABASE_URL"].rstrip("/") + "/rest/v1/grok_narratives"
     key = os.environ.get("SUPABASE_SERVICE_KEY") or os.environ["SUPABASE_KEY"]
-    headers = {"apikey": key, "Authorization": f"Bearer {key}"}
+    headers = {"apikey": key}
+    if key.startswith("eyJ"):  # sb_* keys are not JWTs; no Bearer for them
+        headers["Authorization"] = f"Bearer {key}"
     out, offset = [], 0
     while True:
         r = requests.get(url, params={"select": "bin,narrative",

@@ -237,11 +237,24 @@ async def refresh() -> bool:
     global _NOTES, _generation, _last_ok, _last_error
     s = get_settings()
     url = s.supabase_url.rstrip("/") + "/rest/v1/rpc/venue_list_notes"
-    headers = {"apikey": s.supabase_key, "Authorization": f"Bearer {s.supabase_key}",
-               "Content-Type": "application/json"}
+    # Production answered 401 with SUPABASE_KEY, so list knowledge never
+    # loaded. Try each configured key in turn; the service key is server-side
+    # only and venue_list_notes is granted to service_role.
+    keys = [k for k in (s.supabase_key, s.supabase_service_key) if k]
     try:
         async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.post(url, headers=headers, json={})
+            r = None
+            for key in keys:
+                headers = {"apikey": key, "Content-Type": "application/json"}
+                # New-style keys (sb_publishable_/sb_secret_) are not JWTs and
+                # must not be sent as a Bearer token.
+                if key.startswith("eyJ"):
+                    headers["Authorization"] = f"Bearer {key}"
+                r = await client.post(url, headers=headers, json={})
+                if r.status_code not in (401, 403):
+                    break
+        if r is None:
+            raise RuntimeError("no SUPABASE_KEY / SUPABASE_SERVICE_KEY set")
         r.raise_for_status()
         rows = r.json()
     except Exception as e:

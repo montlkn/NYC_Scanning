@@ -1247,6 +1247,7 @@ def dedupe_near_identical(
 
     kept_idx: List[int] = []
     absorbed: set = set()
+    substitute: Dict[int, int] = {}  # kept position -> hit shown there
 
     for i in range(n):
         if i in absorbed:
@@ -1275,13 +1276,26 @@ def dedupe_near_identical(
             continue
 
         best = max(cluster, key=lambda k: hits[k].get(score_key) or 0.0)
+        # A place (park, cemetery, landmark) is the thing itself: a
+        # Foursquare venue or a parcel "building" that shares its name is a
+        # copy of it. Keep the place, at the best-ranked copy's position, so
+        # "union square park" opens the park and not the venue listing.
+        places = [k for k in cluster if hits[k].get("type") == "place"]
+        if places and best not in places:
+            keep = places[0]
+            substitute[best] = keep
+            for k in cluster:
+                if k != best:
+                    absorbed.add(k)
+            kept_idx.append(best)
+            continue
         kept_idx.append(best)
         for k in cluster:
             if k != best:
                 absorbed.add(k)
 
     kept_idx_sorted = sorted(set(kept_idx))
-    return [hits[i] for i in kept_idx_sorted]
+    return [hits[substitute.get(i, i)] for i in kept_idx_sorted]
 
 
 @dataclass
