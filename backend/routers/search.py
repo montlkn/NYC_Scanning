@@ -1404,6 +1404,13 @@ async def _leg_buildings(
     return hits
 
 
+# Venues within this many metres of the user get their own recall pool and a
+# guaranteed share of the venue leg. See the comment in _leg_venues.
+NEAR_POOL_M = 1200.0
+NEAR_POOL = 40
+NEAR_KEEP = 12
+
+
 async def _leg_venues(
     qvec_lit: str, q_lex: str, limit: int,
     lat: Optional[float], lng: Optional[float], radius_m: Optional[float],
@@ -1469,7 +1476,41 @@ async def _leg_venues(
         params["lex_wb"] = word_boundary
         lex_word_boundary_clause = "AND lex_text ~ :lex_wb"
 
-    sql = f"""
+    # Local recall. The vector and trigram pools rank the whole radius, so in
+    # a dense area they fill with the best matches CITYWIDE and the venues on
+    # your own block never reach tiering: "irish bars" from Sunnyside missed
+    # Molly Blooms and Bantry Bay, which "pub sunnyside" finds. A third pool
+    # takes the closest matches inside NEAR_POOL_M by embedding similarity,
+    # and the final cut keeps NEAR_KEEP of them even if they score below the
+    # citywide top. Tiering then orders them nearest first as usual.
+    near_pool_sql = ""
+    near_union = ""
+    final_select = "ORDER BY score DESC\n        LIMIT :limit"
+    if geo:
+        params["near_m"] = NEAR_POOL_M
+        params["near_pool"] = NEAR_POOL
+        params["near_keep"] = NEAR_KEEP
+        near_pool_sql = f""",
+        near_pool AS (
+            SELECT fsq_id FROM venues
+            {where}
+            AND lat IS NOT NULL AND lng IS NOT NULL AND {haversine} <= :near_m
+            ORDER BY embedding <=> CAST(:qvec AS vector) LIMIT :near_pool
+        )"""
+        near_union = " UNION SELECT fsq_id FROM near_pool"
+
+    inner = f"""
+        SELECT v.fsq_id, v.name, v.category, v.snippet, v.lat, v.lng,
+               v.bin, v.bbl, v.building_year, v.building_style, v.photo_url,
+               v.category_labels, v.neighborhood, v.borough, v.lex_text, v.text,
+               {fused} AS score, wl.lex AS lex_score
+               {dist_sql}
+        FROM venues v
+        JOIN pool USING (fsq_id)
+        CROSS JOIN LATERAL (
+            SELECT word_similarity(lower(:q_lex), coalesce(v.lex_text, lower(v.name))) AS lex
+        ) wl"""
+    pools = f"""
         WITH vec_pool AS (
             SELECT fsq_id FROM venues {where}
             ORDER BY embedding <=> CAST(:qvec AS vector) LIMIT :pool
@@ -1481,20 +1522,27 @@ async def _leg_venues(
             {lex_word_boundary_clause}
             ORDER BY word_similarity(lower(:q_lex), lex_text) DESC
             LIMIT :pool
-        ),
+        ){near_pool_sql},
         pool AS (
-            SELECT fsq_id FROM vec_pool UNION SELECT fsq_id FROM lex_pool
+            SELECT fsq_id FROM vec_pool UNION SELECT fsq_id FROM lex_pool{near_union}
+        )"""
+    if geo:
+        sql = f"""{pools},
+        scored AS ({inner}
+        ),
+        ranked AS (
+            SELECT scored.*,
+                   ROW_NUMBER() OVER (ORDER BY score DESC) AS rn,
+                   (dist_m <= :near_m) AS is_near,
+                   ROW_NUMBER() OVER (PARTITION BY (dist_m <= :near_m) ORDER BY score DESC) AS rn_grp
+            FROM scored
         )
-        SELECT v.fsq_id, v.name, v.category, v.snippet, v.lat, v.lng,
-               v.bin, v.bbl, v.building_year, v.building_style, v.photo_url,
-               v.category_labels, v.neighborhood, v.borough, v.lex_text, v.text,
-               {fused} AS score, wl.lex AS lex_score
-               {dist_sql}
-        FROM venues v
-        JOIN pool USING (fsq_id)
-        CROSS JOIN LATERAL (
-            SELECT word_similarity(lower(:q_lex), coalesce(v.lex_text, lower(v.name))) AS lex
-        ) wl
+        SELECT * FROM ranked
+        WHERE rn <= :limit OR (is_near AND rn_grp <= :near_keep)
+        ORDER BY score DESC
+    """
+    else:
+        sql = f"""{pools}{inner}
         ORDER BY score DESC
         LIMIT :limit
     """
@@ -1970,19 +2018,46 @@ Examples:
 "flatiron building" -> {"queries":["Flatiron Building"],"categories":[],"neighborhoods":[],"boroughs":[],"styles":[],"years":null,"about":"buildings","picks":[],"events":false,"genres":[]}"""
 
 
+def _interp_keys(q: str) -> List[str]:
+    """Cache keys for a query: the exact lowercased text (what older rows are
+    stored under), then a normalized form so "irish bars", "Irish Bar" and
+    "irish  bars?" share one model call instead of paying 3s each."""
+    exact = q.strip().lower()
+    toks = re.sub(r"[^a-z0-9\s]", " ", exact).split()
+    toks = [t[:-1] if len(t) > 3 and t.endswith("s") and not t.endswith("ss") else t for t in toks]
+    norm = " ".join(toks)
+    return [exact] if norm == exact or not norm else [exact, norm]
+
+
+# One model call per distinct query at a time. A prefetch fired while the user
+# types and the search they then submit share the same task.
+_interp_inflight: Dict[str, "asyncio.Task"] = {}
+
+
+def _start_interp(q: str) -> "asyncio.Task":
+    key = _interp_keys(q)[-1]
+    task = _interp_inflight.get(key)
+    if task is None or task.done():
+        task = asyncio.create_task(_interpret_and_cache(q))
+        _interp_inflight[key] = task
+        task.add_done_callback(lambda _t, k=key: _interp_inflight.pop(k, None))
+    return task
+
+
 async def _get_cached_interpretation(q: str) -> Optional[dict]:
     try:
         async with get_search_db() as db:
             if db is None:
                 return None
-            result = await db.execute(
-                text("SELECT interpretation FROM search_interpretation_cache WHERE query = :q"),
-                {"q": q.strip().lower()},
-            )
-            row = result.fetchone()
-            interp = row[0] if row else None
-            if isinstance(interp, dict) and interp.get("v") == INTERP_VERSION:
-                return interp
+            for key in _interp_keys(q):
+                result = await db.execute(
+                    text("SELECT interpretation FROM search_interpretation_cache WHERE query = :q"),
+                    {"q": key},
+                )
+                row = result.fetchone()
+                interp = row[0] if row else None
+                if isinstance(interp, dict) and interp.get("v") == INTERP_VERSION:
+                    return interp
             return None
     except Exception as e:
         logger.info(f"[unified] interpretation cache check skipped: {e}")
@@ -1994,14 +2069,15 @@ async def _store_interpretation(q: str, interp: dict) -> None:
     try:
         async with get_search_db() as db:
             if db is not None:
-                await db.execute(
-                    text(
-                        "INSERT INTO search_interpretation_cache (query, interpretation) "
-                        "VALUES (:q, CAST(:interp AS jsonb)) "
-                        "ON CONFLICT (query) DO UPDATE SET interpretation = EXCLUDED.interpretation, created_at = now()"
-                    ),
-                    {"q": q.strip().lower(), "interp": json.dumps(interp)},
-                )
+                for key in _interp_keys(q):
+                    await db.execute(
+                        text(
+                            "INSERT INTO search_interpretation_cache (query, interpretation) "
+                            "VALUES (:q, CAST(:interp AS jsonb)) "
+                            "ON CONFLICT (query) DO UPDATE SET interpretation = EXCLUDED.interpretation, created_at = now()"
+                        ),
+                        {"q": key, "interp": json.dumps(interp)},
+                    )
                 await db.commit()
     except Exception as e:
         logger.info(f"[unified] interpretation store skipped for {q!r}: {e}")
@@ -2268,6 +2344,21 @@ def _result_cache_put(key: tuple, resp: Dict[str, Any]) -> None:
         _result_cache.popitem(last=False)
 
 
+@router.get("/prefetch", status_code=202)
+async def prefetch_interpretation(q: str = Query(..., min_length=3, max_length=200)):
+    """Start the query rewrite before the search is submitted. The app calls
+    this while the user is still typing; the answer lands in the same cache
+    the search reads, so the search itself skips the 2-4s model wait. Never
+    waits on the model and never fails the caller."""
+    q = q.strip()
+    try:
+        if classify_intent(q) != "address" and await _get_cached_interpretation(q) is None:
+            _start_interp(q)
+    except Exception as e:
+        logger.info(f"[unified] prefetch skipped for {q!r}: {e}")
+    return {"ok": True}
+
+
 @router.get("/unified")
 @limiter.limit(LIMIT_SEARCH)
 async def search_unified(
@@ -2346,7 +2437,7 @@ async def search_unified(
     interp = await _get_cached_interpretation(q)
     interp_task: Optional[asyncio.Task] = None
     if interp is None and intent != "address" and len(q) >= 3:
-        interp_task = asyncio.create_task(_interpret_and_cache(q))
+        interp_task = _start_interp(q)
 
     try:
         # to_thread: the ONNX forward pass is sync CPU work — off the event
