@@ -94,3 +94,13 @@ def test_places_are_keyed_and_found_by_lists():
         assert list_notes.status()["places"] == 1
     finally:
         list_notes._NOTES = {}
+
+
+def test_descriptor_words_are_folded_and_cached():
+    list_notes._NOTES = {"a": {"list_count": 1, "descriptors": {"cutty": 1, "dim lit": 1, "dives": 1}}}
+    list_notes._generation += 1
+    try:
+        assert list_notes.descriptor_words() == {"cutty", "dim", "lit", "dive"}
+    finally:
+        list_notes._NOTES = {}
+        list_notes._generation += 1

@@ -872,6 +872,10 @@ async def _named_tokens(q_lex: str, q_toks: set) -> set:
     "art deco" (299/300) is excluded because both words are style vocabulary."""
     from services.unified_search import _field_tokens
     gen = generic_vocab()
+    # Words people use as list descriptors ("cutty") are vibe, not names.
+    # Unseen words count as proper nouns, so without this "cutty bars" only
+    # matched a bar NAMED Cutty and Clandestino (lists: cutty) sank.
+    gen = gen | list_notes.descriptor_words()
     named = await _proper_nouns({t for t in q_toks if t not in gen})
     words = [w for w in re.split(r"[^a-z0-9]+", q_lex.lower()) if len(w) >= 3]
     pairs = {f"{a} {b}": (a, b) for a, b in zip(words, words[1:])

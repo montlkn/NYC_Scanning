@@ -121,6 +121,23 @@ def match(q_lex: str, limit: int = MATCH_LIMIT) -> List[str]:
     return [k for _, k in scored[:limit]]
 
 
+_desc_words_cache: tuple = (-1, frozenset())
+
+
+def descriptor_words() -> frozenset:
+    """Every word used in any public-list descriptor, folded like search
+    tokens. Rebuilt once per refresh."""
+    global _desc_words_cache
+    if _desc_words_cache[0] != _generation:
+        from services.unified_search import _field_tokens
+        words = set()
+        for n in _NOTES.values():
+            for d in (n.get("descriptors") or {}):
+                words |= _field_tokens(d)
+        _desc_words_cache = (_generation, frozenset(words))
+    return _desc_words_cache[1]
+
+
 def words_for(key: Optional[str]) -> Optional[str]:
     """Every descriptor public lists gave it, as one string, or None."""
     descs = (get(key) or {}).get("descriptors") or {}
