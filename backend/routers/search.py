@@ -2680,7 +2680,10 @@ async def search_unified(
         # for it (no card, no public list) is usually a user-made check-in
         # ("Hangoverpocalypse", "Closing with Connor"), not a bar. It ranks
         # below verified places and is never a real match on its own.
+        # Overture rows ("ovt:") never store contact fields; they were
+        # already vetted by Overture's confidence cutoff at ingest.
         h["_unverified"] = (h.get("type") == "venue" and h.get("has_contact") is False
+                            and not str(h.get("id") or "").startswith("ovt:")
                             and not vibe_judge.has_desc(h.get("id")))
         dbg: Dict[str, float] = {}
 
