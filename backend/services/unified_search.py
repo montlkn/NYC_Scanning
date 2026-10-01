@@ -1943,6 +1943,15 @@ def tier_of(h: Dict[str, Any], q_toks: set, named_toks: set,
     covered = (bool(q_toks)
                and (q_toks - named_toks) <= _hit_match_tokens(h, with_prose=phrase)
                and named_toks <= _hit_name_tokens(h))
+    # A kind-of-place word ("bars") is what a venue IS, so its category must
+    # say it; the name is not enough. "Champ Depot - Custom Restaurant
+    # Furniture: ... Barstools, Bars, and Reupholstery" is a furniture store,
+    # and as the nearest "real match" it led "bars id like" in the LES. A bar
+    # filed under another category still qualifies through the rewrite below.
+    if covered and h.get("type") == "venue":
+        kinds = {w for w in q_toks - named_toks if w in _POI_NOUNS}
+        if kinds - _field_tokens(h.get("category")):
+            covered = False
     # An architect's own buildings are the answer to their name; a report
     # that MENTIONS Frank Lloyd Wright (2 Park Avenue, Lever House) is not,
     # and those sorted nearer than the Guggenheim. Two words minimum, so a

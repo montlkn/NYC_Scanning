@@ -13,4 +13,9 @@ cd "$(dirname "$0")/.."
 status=0
 python3 scripts/embed_layers.py || status=1
 python3 -m scripts.embed_grok_narratives || status=1
+# Buildings whose generated lore changed. The API can't re-index them itself:
+# it reads the index as the read-only jink_search_app. embed_buildings reads
+# BUILDINGS through DATABASE_URL, which on this service is MAIN.
+DATABASE_URL="${BUILDINGS_DB_URL:-$DATABASE_URL}" SEARCH_DB_URL="$SEARCH_DB_WRITE_URL" \
+  python3 scripts/embed_buildings.py --changed || status=1
 exit $status
