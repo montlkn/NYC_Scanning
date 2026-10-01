@@ -17,6 +17,7 @@ Usage:
   python scripts/embed_buildings.py --dry-run        # preview text + counts, no writes
   python scripts/embed_buildings.py                  # embed rows not yet indexed
   python scripts/embed_buildings.py --rebuild        # re-embed all
+  python scripts/embed_buildings.py --changed        # re-embed rows whose text changed (new lore)
   python scripts/embed_buildings.py --limit 500      # cap (testing)
 """
 
@@ -268,6 +269,51 @@ def load_indexed_bins(rail_url: str) -> set:
         return {row[0] for row in cur.fetchall()}
 
 
+def load_indexed_texts(rail_url: str) -> dict:
+    with psycopg.connect(rail_url) as conn, conn.cursor() as cur:
+        cur.execute("SELECT bin, text FROM building_search_index")
+        return dict(cur.fetchall())
+
+
+def update_changed(rail_url: str, batch: list):
+    """batch: list of (text, snippet, vec_literal, bin). Touches only what the
+    text drives, so the backfilled columns (material from LPC, fame,
+    neighborhood, aesthetic) keep their values."""
+    with psycopg.connect(rail_url) as conn, conn.cursor() as cur:
+        cur.executemany(
+            "UPDATE building_search_index SET text = %s, snippet = %s,"
+            " embedding = %s::vector, updated_at = now() WHERE bin = %s",
+            batch,
+        )
+        conn.commit()
+
+
+def embed_changed(supa_url: str, rail_url: str, dry_run: bool, batch_size: int) -> None:
+    """Re-embed indexed buildings whose source text has changed since they were
+    embedded: lore the app generated lands in `storytelling`, the last clause
+    of build_text. The API used to re-index a building itself after writing
+    its lore, but it reads the index as the read-only jink_search_app, so the
+    nightly index-cron does it instead."""
+    indexed = load_indexed_texts(rail_url)
+    rows = [r for r in fetch_source_rows(supa_url, None, True, set())
+            if r["_bin"] in indexed and build_text(r) != indexed[r["_bin"]]]
+    logger.info(f"{len(rows)} of {len(indexed)} indexed buildings changed")
+    if dry_run:
+        for r in rows[:5]:
+            logger.info(f"  [{r['_bin']}] ...{build_text(r)[-160:]}")
+        logger.info("dry-run: no writes")
+        return
+    for i in range(0, len(rows), batch_size):
+        chunk = rows[i : i + batch_size]
+        texts = [build_text(r) for r in chunk]
+        vectors = embed_texts(texts)
+        update_changed(rail_url, [
+            (txt, build_snippet(r), "[" + ",".join(f"{x:.6f}" for x in vec) + "]", r["_bin"])
+            for r, txt, vec in zip(chunk, texts, vectors)
+        ])
+    logger.info(f"re-embedded {len(rows)} changed buildings")
+
+
 def upsert(rail_url: str, batch: list):
     """batch: list of (bin, bbl, text, snippet, vec_literal, year, is_landmark, lat, lng,
     style_family, borough, material, profile_vec_literal_or_None, photo_url).
@@ -304,6 +350,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--rebuild", action="store_true", help="re-embed all rows")
+    ap.add_argument("--changed", action="store_true",
+                    help="re-embed indexed rows whose text changed (generated lore)")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--batch-size", type=int, default=128)
     args = ap.parse_args()
@@ -313,6 +361,10 @@ def main():
     if not supa_url or not rail_url:
         logger.error("DATABASE_URL and SEARCH_DB_URL must both be set")
         sys.exit(1)
+
+    if args.changed:
+        embed_changed(supa_url, rail_url, args.dry_run, args.batch_size)
+        return
 
     indexed = set() if args.rebuild else load_indexed_bins(rail_url)
     logger.info(f"{len(indexed)} BINs already indexed")

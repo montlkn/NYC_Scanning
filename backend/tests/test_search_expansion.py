@@ -231,6 +231,13 @@ class TestTiers:
         shop = {"type": "venue", "name": "Dragonflies & Gargoyles", "category": "Gift Store"}
         assert self.t(shop, "gargoyles") == 1
 
+    def test_a_kind_word_in_a_name_does_not_make_the_kind(self):
+        store = {"type": "venue", "category": "Furniture and Home Store",
+                 "name": "Champ Depot - Custom Restaurant Furniture: Tables, Chairs, Booths, Barstools, Bars, and Reupholstery"}
+        assert self.t(store, "bars") == 2
+        bar = {"type": "venue", "name": "Bar Snack", "category": "Bar"}
+        assert self.t(bar, "bars") == 1
+
     def test_report_prose_counts_for_phrases_only(self):
         b = {"type": "building", "name": "340 East 6th Street",
              "lore_text": "historic fire escape; pressed-tin ceiling in front of store"}

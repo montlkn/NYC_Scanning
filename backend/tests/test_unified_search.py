@@ -940,3 +940,14 @@ def test_dedupe_keeps_the_place_over_a_same_named_venue():
     ]
     out = dedupe_near_identical(hits)
     assert [h["id"] for h in out] == ["place:park-union-square", "b"]
+
+
+def test_word_boundary_pattern_folds_a_trailing_s():
+    import re
+    from routers.search import _word_boundary_pattern
+    pat = _word_boundary_pattern("clandestinos")
+    # Postgres \m/\M are word starts/ends; \b stands in for both here.
+    py = pat.replace(r"\m", r"\b").replace(r"\M", r"\b")
+    assert re.search(py, "clandestino bar lower east side")
+    assert re.search(_word_boundary_pattern("bar").replace(r"\m", r"\b").replace(r"\M", r"\b"), "the bars")
+    assert not re.search(_word_boundary_pattern("bar").replace(r"\m", r"\b").replace(r"\M", r"\b"), "barstools")

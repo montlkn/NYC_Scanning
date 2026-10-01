@@ -13,6 +13,7 @@ read-only on purpose. Anything that WRITES the index needs the owner login
 | Places (BUILDINGS `places`) | `scripts/embed_layers.py --layer place` | after adding places |
 | Lore, plaques, contributions (MAIN) | `scripts/embed_layers.py` | as they grow |
 | Kit narratives (MAIN `grok_narratives`) | `scripts.embed_grok_narratives` | as they grow |
+| Buildings whose generated lore changed | `scripts/embed_buildings.py --changed` | as lore is written |
 
 All of them embed only rows not yet indexed. `cron/reindex_search.sh` runs
 them all.

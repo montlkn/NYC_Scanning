@@ -180,12 +180,17 @@ _WORD_BOUNDARY_MIN_LEN = 3  # tokens shorter than this (e.g. "a", "16") are too
 def _word_boundary_pattern(q_lex: str) -> Optional[str]:
     """Build a Postgres regex alternation of \\m<token>\\M for each q_lex token
     with len >= _WORD_BOUNDARY_MIN_LEN. Returns None if no token qualifies
-    (caller should skip the whole-word predicate in that case)."""
+    (caller should skip the whole-word predicate in that case).
+
+    A trailing "s" is optional either way, the same fold tiering uses
+    (unified_search._fold): "clandestinos" with no location missed the bar
+    Clandestino, because nothing else recalls a venue citywide by name."""
     import re as _re
-    toks = [t for t in q_lex.split() if len(t) >= _WORD_BOUNDARY_MIN_LEN]
+    toks = [t.lower() for t in q_lex.split() if len(t) >= _WORD_BOUNDARY_MIN_LEN]
     if not toks:
         return None
-    return "|".join(rf"\m{_re.escape(t.lower())}\M" for t in toks)
+    stems = [t[:-1] if len(t) > 3 and t.endswith("s") else t for t in toks]
+    return "|".join(rf"\m{_re.escape(s)}s?\M" for s in stems)
 
 
 # Raised from 0.3: a bare word_similarity floor of 0.3 still admits a single
