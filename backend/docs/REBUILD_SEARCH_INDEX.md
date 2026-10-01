@@ -38,8 +38,9 @@ belong to PostGIS), create the `jink_search_app` read-only role, then:
 psql "$SEARCH_DB_WRITE_URL" -f migrations/20261001_search_db_settings.sql
 ```
 
-This sets `hnsw.iterative_scan`, the trigram index and
-`layer_search_index.in_nyc`. No other migration has them. Without `in_nyc`,
+This sets `hnsw.iterative_scan`, the trigram index,
+`layer_search_index.in_nyc`, `venues.source`, and the API role's write grants
+on `search_query_log` and `search_interpretation_cache`. No other migration has them. Without `in_nyc`,
 `ingest_wikipedia_geo` fails at its final write, after about 9 minutes of
 fetching.
 
