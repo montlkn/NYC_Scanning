@@ -8,7 +8,7 @@ changing the rewrite prompt, or tuning ranking.
 Run the ingest as normal:
 
 ```
-python -m scripts.seed_venues --citywide --shards 8     # Foursquare
+python -m scripts.seed_venues --citywide --shards 100   # Foursquare: all 100 shards (~226k NYC rows)
 python -m scripts.ingest_overture_places                  # Overture
 ```
 

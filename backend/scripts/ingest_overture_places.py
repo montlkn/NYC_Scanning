@@ -30,6 +30,7 @@ Run: python -m scripts.ingest_overture_places [--dry-run] [--limit N]
 from __future__ import annotations
 
 import argparse
+import hashlib
 import logging
 import os
 import re
@@ -281,7 +282,9 @@ def main() -> int:
             ON CONFLICT (fsq_id) DO NOTHING
             """,
             [
-                (f"ovt:{abs(hash((p[0], round(p[4], 6), round(p[5], 6)))):016x}",
+                # sha1, not hash(): hash() is salted per process, so every
+                # re-ingest minted new ids and orphaned the venue cards.
+                ("ovt:" + hashlib.sha1(f"{p[0]}|{p[4]:.6f}|{p[5]:.6f}".encode()).hexdigest()[:16],
                  p[0], p[1], t, p[3], str(v), p[4], p[5], p[6], p[7], p[8], p[9],
                  "overture")
                 for p, t, v in zip(payload, texts, vecs)

@@ -20,7 +20,7 @@ Env:
 Usage:
   python scripts/seed_venues.py --dry-run            # preview text + counts
   python scripts/seed_venues.py                      # slice (SoHo/LES/Williamsburg)
-  python scripts/seed_venues.py --citywide --shards 8
+  python scripts/seed_venues.py --citywide --shards 100   # all 100 shards of the 2024-12-03 release
 """
 
 import argparse
