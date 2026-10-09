@@ -72,8 +72,19 @@ python -m scripts.generate_building_hooks
 python -m scripts.rewrite_narratives_voice --restore
 ```
 
-Both are resumable and cost cents (rewriting supplied text, no web search).
+After step 2, refresh search. `embed_grok_narratives` only ADDS rows (the key
+is bin + text hash), so the old-voice text would stay indexed beside the new.
+Clear Kit's rows first, then re-embed (about 400 rows, a minute):
+
+```sql
+-- on the pgvector DB, as the owner login (SEARCH_DB_WRITE_URL)
+DELETE FROM building_lore_index WHERE source = 'kit';
+```
+```bash
+SEARCH_DB_URL="$SEARCH_DB_WRITE_URL" python -m scripts.embed_grok_narratives
+```
+
+Both jobs are resumable and cost cents (rewriting supplied text, no web search).
 `services/kit_voice.py` holds the voice and the checks; its voice text is a
-copy of `KitAIService.kitVoice` in the Jink_Swift app. Re-embed afterwards so
-search sees the new text: the daily cron does it, or run
-`python -m scripts.embed_grok_narratives` (the script name is unchanged).
+copy of `KitAIService.kitVoice` in the Jink_Swift app. The script name
+`embed_grok_narratives` is unchanged.
