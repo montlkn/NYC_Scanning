@@ -12,7 +12,7 @@ read-only on purpose. Anything that WRITES the index needs the owner login
 |---|---|---|
 | Places (BUILDINGS `places`) | `scripts/embed_layers.py --layer place` | after adding places |
 | Lore, plaques, contributions (MAIN) | `scripts/embed_layers.py` | as they grow |
-| Kit narratives (MAIN `grok_narratives`) | `scripts.embed_grok_narratives` | as they grow |
+| Kit narratives (MAIN `narratives`) | `scripts.embed_grok_narratives` | as they grow |
 | Buildings whose generated lore changed | `scripts/embed_buildings.py --changed` | as lore is written |
 
 All of them embed only rows not yet indexed. `cron/reindex_search.sh` runs
@@ -50,3 +50,30 @@ unset PGU PGP PGP_ENC
 
 Run inside the container (bash): `pgvector.railway.internal` only resolves
 inside Railway, and the Mac's zsh `read` takes different flags.
+
+## Kit voice jobs (run by hand, in this order)
+
+Two jobs write in Kit's voice. Both read and write MAIN, so they need
+`MAIN_DB_URL` (the owner login) and `OPENAI_API_KEY`. Apply
+`20261009_narratives_rename_MAIN.sql` and `20261007_building_hooks_MAIN.sql`
+(in the Jink_Swift repo, `supabase/migrations/`) first.
+
+```bash
+railway ssh --service NYC_Scanning
+# 1. Look first: calls the model, prints before/after, writes nothing.
+python -m scripts.rewrite_narratives_voice --dry-run --limit 5
+# 2. Rewrite every story in place. Backs up to narratives_voice_backup first,
+#    keeps the SOURCES/FACTS tail, skips any rewrite that adds a fact.
+python -m scripts.rewrite_narratives_voice
+# 3. One-line hooks into MAIN.building_hooks (needs FOOTPRINTS_DB_URL for LPC).
+python -m scripts.generate_building_hooks --dry-run --limit 10
+python -m scripts.generate_building_hooks
+# Undo step 2:
+python -m scripts.rewrite_narratives_voice --restore
+```
+
+Both are resumable and cost cents (rewriting supplied text, no web search).
+`services/kit_voice.py` holds the voice and the checks; its voice text is a
+copy of `KitAIService.kitVoice` in the Jink_Swift app. Re-embed afterwards so
+search sees the new text: the daily cron does it, or run
+`python -m scripts.embed_grok_narratives` (the script name is unchanged).

@@ -1,7 +1,7 @@
 """
 Index the cached Kit narratives into building_lore_index.
 
-grok_narratives on MAIN holds LLM-written prose about individual buildings --
+narratives on MAIN (was grok_narratives) holds LLM-written prose about individual buildings --
 309 of them, ~1,692 characters each -- generated and paid for by the app and
 never once searched. Its density of the language the LPC reports never use is
 an order of magnitude better:
@@ -44,8 +44,8 @@ EMBED_THREADS = int(os.environ.get("EMBED_THREADS", "4"))
 
 
 def fetch_narratives() -> list[tuple[str, str]]:
-    """Page grok_narratives off MAIN via PostgREST (no direct DSN for it)."""
-    url = os.environ["SUPABASE_URL"].rstrip("/") + "/rest/v1/grok_narratives"
+    """Page narratives off MAIN via PostgREST (no direct DSN for it)."""
+    url = os.environ["SUPABASE_URL"].rstrip("/") + "/rest/v1/narratives"
     key = os.environ.get("SUPABASE_SERVICE_KEY") or os.environ["SUPABASE_KEY"]
     headers = {"apikey": key}
     if key.startswith("eyJ"):  # sb_* keys are not JWTs; no Bearer for them

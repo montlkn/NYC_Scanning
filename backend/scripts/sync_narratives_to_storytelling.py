@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Sync iOS-generated building lore (MAIN `grok_narratives`) into the buildings DB
+Sync iOS-generated building lore (MAIN `narratives`) into the buildings DB
 `buildings_full_merge_scanning.storytelling`, so the next `embed_buildings.py`
 run folds that prose into the search index.
 
@@ -78,12 +78,12 @@ def main():
 
     # 1. Pull all narratives from MAIN.
     with psycopg.connect(main_url) as conn, conn.cursor() as cur:
-        sql = "SELECT bin, narrative FROM grok_narratives WHERE narrative IS NOT NULL AND narrative <> ''"
+        sql = "SELECT bin, narrative FROM narratives WHERE narrative IS NOT NULL AND narrative <> ''"
         if args.limit:
             sql += f" LIMIT {int(args.limit)}"
         cur.execute(sql)
         rows = cur.fetchall()
-    logger.info(f"{len(rows)} narratives in MAIN.grok_narratives")
+    logger.info(f"{len(rows)} narratives in MAIN.narratives")
 
     pairs = []
     for b, narrative in rows:

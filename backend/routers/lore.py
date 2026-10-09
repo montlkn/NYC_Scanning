@@ -107,7 +107,7 @@ async def get_building_lore(
     # every later request, which is how the column filled with flat prose.
     #
     # Nothing is lost by skipping it. The finished narrative is cached by the
-    # client in MAIN.grok_narratives, keyed by BIN, so the chain below runs at
+    # client in MAIN.narratives, keyed by BIN, so the chain below runs at
     # most once per building — the same number of times the old cache saved.
     if cached and not refresh and not material:
         return {
