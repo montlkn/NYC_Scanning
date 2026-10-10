@@ -17,7 +17,8 @@ python3 -m scripts.embed_grok_narratives || status=1
 # Off until GENERATE_HOOKS=1 is set on this service; it needs MAIN_DB_URL,
 # FOOTPRINTS_DB_URL and OPENAI_API_KEY too. Only new buildings are processed.
 if [ "${GENERATE_HOOKS:-0}" = "1" ]; then
-  python3 -m scripts.generate_building_hooks || status=1
+  # Capped per run so a backlog (20k landmarks) never becomes one big bill.
+  python3 -m scripts.generate_building_hooks --limit "${HOOKS_PER_RUN:-50}" || status=1
 fi
 # Buildings whose generated lore changed. The API can't re-index them itself:
 # it reads the index as the read-only jink_search_app. embed_buildings reads

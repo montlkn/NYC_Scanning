@@ -132,6 +132,14 @@ def build_prompt(d: dict) -> tuple[str, str, str]:
     return facts, facts, "+".join(tags)
 
 
+def _unwrap(h: str) -> str:
+    """Drop quotes wrapped round the whole line, but keep a closing quote
+    that ends a quotation inside it (`... than "any 50 men."`)."""
+    if len(h) > 1 and h[0] in '"\u201c' and h[-1] in '"\u201d' and h.count('"') + h.count('\u201c') <= 2:
+        return h[1:-1].strip()
+    return h
+
+
 async def one(sem, bin_, d, use_judge=True):
     """Up to two attempts; a rejection is fed back once."""
     user, facts, source = build_prompt(d)
@@ -140,7 +148,7 @@ async def one(sem, bin_, d, use_judge=True):
         async with sem:
             out = await openai_text(system=HOOK_SYSTEM, user=prompt, max_tokens=120,
                                     timeout_s=60.0, cache_key="jink-hooks")
-        hook = (out or "").strip().strip('"\u201c\u201d')
+        hook = _unwrap((out or "").strip())
         reason = check_hook(out, facts)
         if not reason and use_judge:
             async with sem:
