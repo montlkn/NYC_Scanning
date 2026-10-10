@@ -262,3 +262,13 @@ def test_rewrite_rejects_meta_and_relationship_drift():
              "while the **Alder Hat Company** moved hats downstairs to customers who knew better than to ask.")
     assert check_rewrite(old, meta).startswith("meta phrase")
     assert check_rewrite(old, owned).startswith("changed relationship word")
+
+
+def test_story_may_end_on_a_citation():
+    from services.kit_voice import check_rewrite
+    old = ("**Harold Pike** occupied **The Alder Building** in 1932 and ran a card game on the fourth floor "
+           "while the **Alder Hat Company** sold hats downstairs [[1]](https://a.org/x/y).")
+    new = ("A card game on the fourth floor. Hats downstairs. In 1932 **Harold Pike** occupied **The Alder "
+           "Building** and the **Alder Hat Company** kept selling below him [[1]](https://a.org/x/y).")
+    r = check_rewrite(old, new)
+    assert r is None or not r.startswith("does not end cleanly"), r

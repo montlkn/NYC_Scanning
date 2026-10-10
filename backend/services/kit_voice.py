@@ -179,7 +179,9 @@ def check_rewrite(old_prose: str, new_prose: Optional[str]) -> Optional[str]:
     if not new_prose or not new_prose.strip():
         return "empty"
     new = new_prose.strip()
-    if new[-1] not in '.!?"”’*_':
+    # A story may end on a citation marker; judge the sentence before it.
+    end = _CITE.sub("", new).rstrip()
+    if not end or end[-1] not in '.!?"”’*_':
         return "does not end cleanly"
     ratio = len(new) / max(1, len(old_prose))
     if not 0.6 <= ratio <= 1.35:
