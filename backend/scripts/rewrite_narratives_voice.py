@@ -69,25 +69,40 @@ def restore(conn) -> None:
     conn.commit()
 
 
+def retry_message(prose: str, reason: str) -> str:
+    return (
+        f"ORIGINAL STORY:\n{prose}\n\n"
+        f"YOUR LAST ATTEMPT WAS REJECTED. Problems:\n{reason}\n\n"
+        "Write it again in Kit's voice. Keep every fact exactly as the ORIGINAL STORY "
+        "states it. Remove or fix whatever was flagged, and add nothing new. "
+        "Output only the story."
+    )
+
+
 async def rewrite_one(sem: asyncio.Semaphore, bin_: str, narrative: str, use_judge: bool = True):
+    """Up to two attempts. A rejection (cheap checks or the fact checker) is
+    fed back once, so one bad aside is fixed instead of costing the story."""
     prose, tail = split_tail(narrative)
-    async with sem:
-        new = await openai_text(
-            system=REWRITE_SYSTEM,
-            user=prose,
-            max_tokens=1400,
-            timeout_s=90.0,
-            cache_key="jink-voice-rewrite",
-        )
-    reason = check_rewrite(prose, new)
-    if reason:
-        return bin_, None, reason
-    if use_judge:
+    user, reason = prose, "no attempt"
+    for attempt in (1, 2):
         async with sem:
-            reason = await judge(prose, new.strip(), label="rewritten story")
-        if reason:
-            return bin_, None, reason
-    return bin_, new.strip() + tail, None
+            new = await openai_text(
+                system=REWRITE_SYSTEM,
+                user=user,
+                max_tokens=1400,
+                timeout_s=90.0,
+                cache_key="jink-voice-rewrite",
+            )
+        reason = check_rewrite(prose, new)
+        if not reason and use_judge:
+            async with sem:
+                reason = await judge(prose, new.strip(), label="rewritten story")
+        if not reason:
+            return bin_, new.strip() + tail, None
+        if reason.startswith("judge unavailable"):
+            break
+        user = retry_message(prose, reason)
+    return bin_, None, reason
 
 
 async def main_async(args) -> int:

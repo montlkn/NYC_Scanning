@@ -71,8 +71,16 @@ TASK. Write ONE line about this building for someone walking past it.
 Use only the facts below. Pick the single most surprising true thing: a person,
 an event, a secret, a reversal. 8 to 18 words. No dates unless the date is the
 surprise. No architecture terms unless the building is famous for them. No
-"nestled", "iconic", "stunning", "boasts". No em dashes. Say it the way a local
-would say it out loud. If nothing in the facts is surprising, return exactly: NONE
+"nestled", "iconic", "stunning", "boasts". No em dashes.
+
+A hook is a FACT, said plainly. The voice lives in word choice, not in asides.
+- No jokes, asides or commentary after the fact ("because apparently...").
+- Use the facts' own words. No intensifiers the facts do not give you (enormous,
+  decades, never, always, extraordinary).
+- Say "here" only if the facts say it happened at THIS building, not at a
+  building that stood on the site before.
+- Keep timing exactly as stated (after is not while).
+- If you cannot say it plainly in the facts' own words, return exactly: NONE
 Output only the line, or NONE. No quotes around it."""
 
 _BANNED = ("squeak", "rat-tastic", "ratatouille", "nestled", "iconic", "stunning", "boasts")

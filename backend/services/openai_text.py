@@ -72,6 +72,7 @@ async def openai_text(
     max_tokens: int = 1200,
     timeout_s: float = 30.0,
     cache_key: str = "jink-lore-synth",
+    model: Optional[str] = None,
 ) -> Optional[str]:
     """Text in, text out. No tools, so no search is ever billed.
 
@@ -88,7 +89,7 @@ async def openai_text(
         return None
 
     body = {
-        "model": OPENAI_TEXT_MODEL,
+        "model": model or OPENAI_TEXT_MODEL,
         "input": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},

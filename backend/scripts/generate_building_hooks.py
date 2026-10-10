@@ -133,15 +133,24 @@ def build_prompt(d: dict) -> tuple[str, str, str]:
 
 
 async def one(sem, bin_, d, use_judge=True):
+    """Up to two attempts; a rejection is fed back once."""
     user, facts, source = build_prompt(d)
-    async with sem:
-        out = await openai_text(system=HOOK_SYSTEM, user=user, max_tokens=120,
-                                timeout_s=60.0, cache_key="jink-hooks")
-    reason = check_hook(out, facts)
-    hook = (out or "").strip().strip('"“”')
-    if not reason and use_judge:
+    prompt, hook, reason = user, "", "no attempt"
+    for attempt in (1, 2):
         async with sem:
-            reason = await judge(facts, hook, label="one-line hook")
+            out = await openai_text(system=HOOK_SYSTEM, user=prompt, max_tokens=120,
+                                    timeout_s=60.0, cache_key="jink-hooks")
+        hook = (out or "").strip().strip('"\u201c\u201d')
+        reason = check_hook(out, facts)
+        if not reason and use_judge:
+            async with sem:
+                reason = await judge(facts, hook, label="one-line hook")
+        if not reason:
+            return bin_, hook, source, None
+        if reason in ("none", "judge unavailable") or reason.startswith("judge unavailable"):
+            break
+        prompt = (f"{user}\n\nYOUR LAST ATTEMPT WAS REJECTED: {reason}\n"
+                  "Write the line again, plainly, in the facts' own words, or return NONE.")
     return bin_, hook, source, reason
 
 

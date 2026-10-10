@@ -106,26 +106,98 @@ def test_real_restructure_passes():
 
 # --- the second-pass fact checker ---------------------------------------
 import asyncio
+import json
 
 from services import kit_judge
 
-
-def test_verdict_parsing_fails_closed():
-    assert kit_judge.parse_verdict("OK") is None
-    assert kit_judge.parse_verdict(" ok. ") is None
-    assert "forced merger" in kit_judge.parse_verdict("UNSUPPORTED: forced merger | while the Titanic sank")
-    assert kit_judge.parse_verdict(None) == "judge unavailable"
-    assert kit_judge.parse_verdict("Looks fine to me!").startswith("judge unclear")
+CAND = "A bomb meant for Russell Sage killed four people here, including the bomber."
 
 
-def test_judge_uses_the_model_and_rejects(monkeypatch):
-    async def fake(**kw):
-        assert "SOURCE:" in kw["user"] and "CANDIDATE" in kw["user"]
-        return "UNSUPPORTED: crowds came while it sank"
-    monkeypatch.setattr(kit_judge, "openai_text", fake)
-    assert "judge:" in asyncio.run(kit_judge.judge("after it sank", "while it sank"))
+def verdict(*issues):
+    return json.dumps({"issues": list(issues)})
 
-    async def ok(**kw):
-        return "OK"
-    monkeypatch.setattr(kit_judge, "openai_text", ok)
-    assert asyncio.run(kit_judge.judge("a", "b")) is None
+
+def test_major_issue_with_a_real_quote_rejects():
+    out = verdict({"severity": "major", "candidate_quote": "killed four people here",
+                   "problem": "the bombing was at the earlier building"})
+    r = kit_judge.parse_verdict(out, CAND)
+    assert r.startswith("judge:") and "earlier building" in r
+
+
+def test_objection_to_words_the_candidate_never_wrote_is_discarded():
+    out = verdict({"severity": "major", "candidate_quote": "the bombing occurred in 1891",
+                   "problem": "year not in source"})
+    assert kit_judge.parse_verdict(out, CAND) is None
+
+
+def test_minor_issues_do_not_reject():
+    out = verdict({"severity": "minor", "candidate_quote": "killed four people",
+                   "problem": "reworded"})
+    assert kit_judge.parse_verdict(out, CAND) is None
+
+
+def test_clean_and_markdown_wrapped_json():
+    assert kit_judge.parse_verdict('{"issues": []}', CAND) is None
+    assert kit_judge.parse_verdict('```json\n{"issues": []}\n```', CAND) is None
+
+
+def test_judge_fails_closed():
+    assert kit_judge.parse_verdict(None, CAND) == "judge unavailable"
+    assert kit_judge.parse_verdict("looks fine!", CAND).startswith("judge unparseable")
+    assert kit_judge.parse_verdict("{not json}", CAND).startswith("judge unparseable")
+
+
+def test_quote_matching_ignores_markdown_and_curly_quotes():
+    cand = "**AT&T** said the tower \u201ctakes charge of the street\u201d."
+    out = verdict({"severity": "major", "candidate_quote": 'takes charge of the street', "problem": "x"})
+    assert kit_judge.parse_verdict(out, cand) is not None
+
+
+# --- the retry loop -------------------------------------------------------
+import scripts.rewrite_narratives_voice as rw
+
+ORIGINAL = (
+    "**Harold Pike**, owner of **The Alder Building**, was arrested in 1932 for running an "
+    "illegal card game on the fourth floor. **Mara Quill** designed it in 1911 for the "
+    "**Alder Hat Company**, with a terracotta facade and ornate cornices."
+)
+ATTEMPT1 = (
+    "In 1932 **Harold Pike** got arrested for an illegal card game on the fourth floor of "
+    "**The Alder Building**, a forgotten hat company tower. **Mara Quill** designed it in "
+    "1911 for the **Alder Hat Company**: terracotta facade, ornate cornices."
+)
+ATTEMPT2 = (
+    "Fourth floor, 1932, one illegal card game, and **Harold Pike**, owner of **The Alder "
+    "Building**, got arrested for it. **Mara Quill** designed the place in 1911 for the "
+    "**Alder Hat Company**: terracotta facade, ornate cornices."
+)
+
+
+def test_rejection_is_fed_back_and_the_second_attempt_wins(monkeypatch):
+    calls = []
+
+    async def fake_text(**kw):
+        calls.append(kw["user"])
+        return ATTEMPT1 if len(calls) == 1 else ATTEMPT2
+
+    async def fake_judge(source, candidate, label="story"):
+        return 'judge: "a forgotten hat company tower": invented' if "forgotten" in candidate else None
+
+    monkeypatch.setattr(rw, "openai_text", fake_text)
+    monkeypatch.setattr(rw, "judge", fake_judge)
+    bin_, new, reason = asyncio.run(rw.rewrite_one(asyncio.Semaphore(1), "9", ORIGINAL + "\n\nSOURCES:\n- a"))
+    assert reason is None and "Fourth floor" in new and new.endswith("SOURCES:\n- a")
+    assert len(calls) == 2 and "forgotten hat company tower" in calls[1] and "ORIGINAL STORY" in calls[1]
+
+
+def test_two_rejections_keep_the_old_story(monkeypatch):
+    async def fake_text(**kw):
+        return ATTEMPT1
+
+    async def always_no(source, candidate, label="story"):
+        return 'judge: "x": invented'
+
+    monkeypatch.setattr(rw, "openai_text", fake_text)
+    monkeypatch.setattr(rw, "judge", always_no)
+    bin_, new, reason = asyncio.run(rw.rewrite_one(asyncio.Semaphore(1), "9", ORIGINAL))
+    assert new is None and reason.startswith("judge:")

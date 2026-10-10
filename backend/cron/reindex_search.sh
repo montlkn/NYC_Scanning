@@ -13,6 +13,12 @@ cd "$(dirname "$0")/.."
 status=0
 python3 scripts/embed_layers.py || status=1
 python3 -m scripts.embed_grok_narratives || status=1
+# One-line hooks for buildings that have a story (or LPC text) but no hook yet.
+# Off until GENERATE_HOOKS=1 is set on this service; it needs MAIN_DB_URL,
+# FOOTPRINTS_DB_URL and OPENAI_API_KEY too. Only new buildings are processed.
+if [ "${GENERATE_HOOKS:-0}" = "1" ]; then
+  python3 -m scripts.generate_building_hooks || status=1
+fi
 # Buildings whose generated lore changed. The API can't re-index them itself:
 # it reads the index as the read-only jink_search_app. embed_buildings reads
 # BUILDINGS through DATABASE_URL, which on this service is MAIN.
