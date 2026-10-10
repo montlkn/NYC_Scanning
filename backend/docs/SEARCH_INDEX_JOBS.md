@@ -84,7 +84,15 @@ DELETE FROM building_lore_index WHERE source = 'kit';
 SEARCH_DB_URL="$SEARCH_DB_WRITE_URL" python -m scripts.embed_grok_narratives
 ```
 
-Both jobs are resumable and cost cents (rewriting supplied text, no web search).
+Every rewrite and hook also goes through a second model call
+(`services/kit_judge.py`) that acts as a hostile fact checker: it compares the
+candidate to its source and rejects any claim the source does not support
+(changed timing, changed wording, invented asides). A rejected candidate keeps
+the old story or writes no hook; the log says why. `--no-judge` skips it, which
+is not recommended.
+
+Both jobs are resumable and cost cents (rewriting supplied text, no web search;
+the fact check roughly doubles the model calls).
 `services/kit_voice.py` holds the voice and the checks; its voice text is a
 copy of `KitAIService.kitVoice` in the Jink_Swift app. The script name
 `embed_grok_narratives` is unchanged.

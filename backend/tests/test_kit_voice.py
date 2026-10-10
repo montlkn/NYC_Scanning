@@ -102,3 +102,30 @@ def test_real_restructure_passes():
         "Trust me, I have seen worse glass."
     )
     assert check_rewrite(REAL, new) is None
+
+
+# --- the second-pass fact checker ---------------------------------------
+import asyncio
+
+from services import kit_judge
+
+
+def test_verdict_parsing_fails_closed():
+    assert kit_judge.parse_verdict("OK") is None
+    assert kit_judge.parse_verdict(" ok. ") is None
+    assert "forced merger" in kit_judge.parse_verdict("UNSUPPORTED: forced merger | while the Titanic sank")
+    assert kit_judge.parse_verdict(None) == "judge unavailable"
+    assert kit_judge.parse_verdict("Looks fine to me!").startswith("judge unclear")
+
+
+def test_judge_uses_the_model_and_rejects(monkeypatch):
+    async def fake(**kw):
+        assert "SOURCE:" in kw["user"] and "CANDIDATE" in kw["user"]
+        return "UNSUPPORTED: crowds came while it sank"
+    monkeypatch.setattr(kit_judge, "openai_text", fake)
+    assert "judge:" in asyncio.run(kit_judge.judge("after it sank", "while it sank"))
+
+    async def ok(**kw):
+        return "OK"
+    monkeypatch.setattr(kit_judge, "openai_text", ok)
+    assert asyncio.run(kit_judge.judge("a", "b")) is None

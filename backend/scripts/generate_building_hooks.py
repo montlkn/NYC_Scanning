@@ -42,6 +42,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 from services.kit_voice import (  # noqa: E402
     HOOK_SYSTEM, VOICE_VERSION, check_hook, split_tail,
 )
+from services.kit_judge import judge  # noqa: E402
 from services.openai_text import is_configured, openai_text  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -131,13 +132,17 @@ def build_prompt(d: dict) -> tuple[str, str, str]:
     return facts, facts, "+".join(tags)
 
 
-async def one(sem, bin_, d):
+async def one(sem, bin_, d, use_judge=True):
     user, facts, source = build_prompt(d)
     async with sem:
         out = await openai_text(system=HOOK_SYSTEM, user=user, max_tokens=120,
                                 timeout_s=60.0, cache_key="jink-hooks")
     reason = check_hook(out, facts)
-    return bin_, (out or "").strip().strip('"“”'), source, reason
+    hook = (out or "").strip().strip('"“”')
+    if not reason and use_judge:
+        async with sem:
+            reason = await judge(facts, hook, label="one-line hook")
+    return bin_, hook, source, reason
 
 
 async def main_async(args) -> int:
@@ -165,7 +170,7 @@ async def main_async(args) -> int:
     reasons: dict[str, int] = {}
     step = args.concurrency * 4
     for i in range(0, len(work), step):
-        results = await asyncio.gather(*(one(sem, b, d) for b, d in work[i:i + step]))
+        results = await asyncio.gather(*(one(sem, b, d, not args.no_judge) for b, d in work[i:i + step]))
         for bin_, hook, source, reason in results:
             if reason:
                 skipped += 1
@@ -200,6 +205,7 @@ def main() -> int:
     ap.add_argument("--bin", default=None)
     ap.add_argument("--refresh", action="store_true", help="redo buildings that already have a hook")
     ap.add_argument("--concurrency", type=int, default=4)
+    ap.add_argument("--no-judge", action="store_true", help="skip the fact-check pass (not recommended)")
     return asyncio.run(main_async(ap.parse_args()))
 
 

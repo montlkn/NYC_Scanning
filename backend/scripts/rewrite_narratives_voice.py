@@ -43,6 +43,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 from services.kit_voice import (  # noqa: E402
     REWRITE_SYSTEM, VOICE_VERSION, check_rewrite, split_tail,
 )
+from services.kit_judge import judge  # noqa: E402
 from services.openai_text import is_configured, openai_text  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -68,7 +69,7 @@ def restore(conn) -> None:
     conn.commit()
 
 
-async def rewrite_one(sem: asyncio.Semaphore, bin_: str, narrative: str):
+async def rewrite_one(sem: asyncio.Semaphore, bin_: str, narrative: str, use_judge: bool = True):
     prose, tail = split_tail(narrative)
     async with sem:
         new = await openai_text(
@@ -81,6 +82,11 @@ async def rewrite_one(sem: asyncio.Semaphore, bin_: str, narrative: str):
     reason = check_rewrite(prose, new)
     if reason:
         return bin_, None, reason
+    if use_judge:
+        async with sem:
+            reason = await judge(prose, new.strip(), label="rewritten story")
+        if reason:
+            return bin_, None, reason
     return bin_, new.strip() + tail, None
 
 
@@ -118,7 +124,7 @@ async def main_async(args) -> int:
     step = args.concurrency * 4
     for i in range(0, len(rows), step):
         batch = rows[i:i + step]
-        results = await asyncio.gather(*(rewrite_one(sem, b, n) for b, n in batch))
+        results = await asyncio.gather(*(rewrite_one(sem, b, n, not args.no_judge) for b, n in batch))
         old_by_bin = dict(batch)
         for bin_, new, reason in results:
             if reason:
@@ -155,6 +161,7 @@ def main() -> int:
     ap.add_argument("--bin", default=None, help="rewrite just this BIN")
     ap.add_argument("--concurrency", type=int, default=4)
     ap.add_argument("--restore", action="store_true", help="put backed-up stories back")
+    ap.add_argument("--no-judge", action="store_true", help="skip the fact-check pass (not recommended)")
     return asyncio.run(main_async(ap.parse_args()))
 
 
