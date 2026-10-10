@@ -14,10 +14,13 @@ CLOSED: a rejected rewrite leaves the old story untouched.
 """
 from __future__ import annotations
 
+import difflib
 import re
 from typing import Optional
 
 VOICE_VERSION = 1
+# A rewrite more similar than this to the original is a copyedit, not a voice.
+SIMILAR_MAX = 0.80
 
 KIT_VOICE = (
     "VOICE. You are Kit, a New York rat. You've lived in the walls, basements and "
@@ -35,20 +38,32 @@ KIT_VOICE = (
 REWRITE_SYSTEM = KIT_VOICE + """
 
 TASK. Below is an existing story about one New York building. Rewrite it in Kit's
-voice.
+voice. The FACTS stay. The SENTENCES do not.
 
-Rules, all hard:
+Do this:
+- Rebuild every sentence. Change the structure, the order and the rhythm. Cut
+  padding and throat-clearing. Mix short sentences with longer ones. If your
+  version reads like the original with a few words swapped, you did it wrong.
+- Open on the single most striking fact, even if the original buried it.
+- Say it the way a local would say it out loud, with dry asides where the facts
+  earn them. The aside comments on a fact; it never adds one.
+
+Hard rules:
 - Keep every fact: every name, date, number, dollar amount, address and event.
-  Add NO fact that is not in the original. Do not guess, do not embellish.
+  Add NO fact that is not in the original. Do not guess, do not embellish, do
+  not imply a motive or a connection the original does not state.
 - Do not soften documented history about communities, immigration, crime or
   controversy. The edge never points at victims.
-- Lead with the single most striking fact if the original does not already.
 - Keep **bold** around proper nouns (building names, people, organisations) and
   _italic_ around architectural terms, styles and foreign words.
-- Flowing paragraphs only. No headers, no bullets.
-- About the same length as the original (within 20%). Finish the last sentence.
+- Flowing paragraphs only. No headers, no bullets. No em dashes.
+- About the same length as the original (within 25%). Finish the last sentence.
 - Never describe what you searched or did not find.
-- Output only the rewritten story. No preface, no notes."""
+- Output only the rewritten story. No preface, no notes.
+
+EXAMPLE (an invented building, to show the move, not to copy words from).
+BEFORE: **The Alder Building** was completed in 1911 for the **Alder Hat Company**, designed by **Mara Quill**. Its terracotta facade features ornate cornices, and the structure is considered a significant example of early commercial architecture. In 1932, the building's owner, **Harold Pike**, was arrested for running an illegal card game on the fourth floor.
+AFTER: **Harold Pike**, owner of **The Alder Building**, got arrested in 1932 for running an illegal card game on the fourth floor. Not a speakeasy. A hat company's building. **Mara Quill** designed it in 1911 for the **Alder Hat Company**: terracotta facade, ornate cornices, a textbook case of early commercial architecture, if that's your thing."""
 
 HOOK_SYSTEM = KIT_VOICE + """
 
@@ -56,8 +71,8 @@ TASK. Write ONE line about this building for someone walking past it.
 Use only the facts below. Pick the single most surprising true thing: a person,
 an event, a secret, a reversal. 8 to 18 words. No dates unless the date is the
 surprise. No architecture terms unless the building is famous for them. No
-"nestled", "iconic", "stunning", "boasts". If nothing in the facts is surprising,
-return exactly: NONE
+"nestled", "iconic", "stunning", "boasts". No em dashes. Say it the way a local
+would say it out loud. If nothing in the facts is surprising, return exactly: NONE
 Output only the line, or NONE. No quotes around it."""
 
 _BANNED = ("squeak", "rat-tastic", "ratatouille", "nestled", "iconic", "stunning", "boasts")
@@ -92,6 +107,17 @@ def _numbers(s: str) -> set[str]:
     return {n.replace(",", "").rstrip(".") for n in _NUM.findall(s)}
 
 
+def _strip_possessive(w: str) -> str:
+    """York's -> York, Brothers' -> Brothers (straight or curly apostrophe)."""
+    for suf in ("'s", "\u2019s"):
+        if w.endswith(suf) and len(w) > 3:
+            return w[:-2]
+    for suf in ("s'", "s\u2019"):
+        if w.endswith(suf) and len(w) > 3:
+            return w[:-1]
+    return w
+
+
 def _mid_sentence_caps(s: str) -> set[str]:
     """Capitalised words that are not the first word of a sentence: the
     proper nouns. Markdown emphasis is stripped first."""
@@ -100,13 +126,16 @@ def _mid_sentence_caps(s: str) -> set[str]:
     for sent in re.split(r"(?<=[.!?])\s+|\n+", plain):
         words = _WORD.findall(sent)
         for w in words[1:]:
-            if w[0].isupper() and w not in _ALLOWED_CAPS:
-                out.add(w.strip("'’-"))
+            w = _strip_possessive(w.strip("'\u2019-"))
+            if w and w[0].isupper() and w not in _ALLOWED_CAPS:
+                out.add(w)
     return out
 
 
 def _unsupported(new: str, source: str) -> list[str]:
-    src_words = {w.lower() for w in _WORD.findall(re.sub(r"[*_]{1,2}", "", source))}
+    src_words = {_strip_possessive(w).lower()
+                 for w in _WORD.findall(re.sub(r"[*_]{1,2}", "", source))}
+    src_words |= {w.lower() for w in _WORD.findall(re.sub(r"[*_]{1,2}", "", source))}
     bad = [w for w in _mid_sentence_caps(new) if w.lower() not in src_words]
     bad += [f"#{n}" for n in _numbers(new) - _numbers(source)]
     return bad
@@ -128,11 +157,16 @@ def check_rewrite(old_prose: str, new_prose: Optional[str]) -> Optional[str]:
             return f"banned phrase: {b}"
     if len(re.findall(r"\brats?\b", low)) > 1:
         return "too much rat"
+    if new.count("\u2014") > old_prose.count("\u2014") + 1:
+        return "added em dashes"
     if len(re.findall(r"(?<![A-Za-z])I(?![A-Za-z'])", new)) > 2:
         return "too much first person"
     bad = _unsupported(new, old_prose)
     if bad:
         return "unsupported: " + ", ".join(sorted(bad)[:6])
+    plain = lambda t: re.sub(r"[*_]{1,2}", "", t).lower()
+    if difflib.SequenceMatcher(None, plain(old_prose), plain(new), autojunk=False).ratio() > SIMILAR_MAX:
+        return "too close to original (voice did not change)"
     return None
 
 

@@ -71,3 +71,34 @@ def test_hook_none_and_shape():
     assert check_hook("Too short.", FACTS) is not None
     assert check_hook("An iconic stunning building that boasts a lot of working families.", FACTS) is not None
     assert check_hook("Built by Henry Phipps so working families could breathe in", FACTS) is not None
+
+
+def test_possessives_are_not_new_proper_nouns():
+    old = "**Trump Tower** is New York's best-known glass lobby and the Brothers' old site."
+    new = "New York's best-known glass lobby sits on the Brothers' old site, at **Trump Tower**."
+    assert check_rewrite(old, new) is None or "unsupported" not in check_rewrite(old, new)
+    assert check_hook("New York's loudest lobby belongs to Trump Tower.", old) is None
+
+
+REAL = (
+    "**Pepsi-Cola Building** was designed by **Natalie de Blois**, one of the very few women "
+    "architects working at that level in mid-century corporate America, with **Gordon Bunshaft** "
+    "guiding **Skidmore, Owings & Merrill**'s New York office. Completed in 1958, it was a glass box."
+)
+
+
+def test_copyedit_is_rejected_as_too_close():
+    copy = REAL.replace("was designed by", "was designed by")  # unchanged
+    assert "too close" in (check_rewrite(REAL, copy) or "")
+    light = REAL.replace("Completed in 1958", "Finished in 1958")
+    assert "too close" in (check_rewrite(REAL, light) or "")
+
+
+def test_real_restructure_passes():
+    new = (
+        "A glass box in 1958, and the person who drew it was **Natalie de Blois**, one of the very "
+        "few women architects working at that level in mid-century corporate America. **Gordon "
+        "Bunshaft** guided **Skidmore, Owings & Merrill**'s New York office. She did the work. "
+        "Trust me, I have seen worse glass."
+    )
+    assert check_rewrite(REAL, new) is None

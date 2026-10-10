@@ -170,6 +170,8 @@ async def main_async(args) -> int:
             if reason:
                 skipped += 1
                 reasons[reason.split(":")[0]] = reasons.get(reason.split(":")[0], 0) + 1
+                if args.dry_run:
+                    log.info("  [%s] skipped (%s): %s", bin_, reason, hook[:140])
                 continue
             if args.dry_run:
                 log.info("  [%s] (%s) %s", bin_, source, hook)

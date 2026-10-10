@@ -128,8 +128,8 @@ async def main_async(args) -> int:
                 log.warning("  [%s] kept old story: %s", bin_, reason)
                 continue
             if args.dry_run:
-                log.info("  [%s] BEFORE: %s", bin_, split_tail(old_by_bin[bin_])[0][:260].replace("\n", " "))
-                log.info("  [%s] AFTER:  %s", bin_, split_tail(new)[0][:260].replace("\n", " "))
+                log.info("  [%s] BEFORE: %s", bin_, split_tail(old_by_bin[bin_])[0][:700].replace("\n", " "))
+                log.info("  [%s] AFTER:  %s", bin_, split_tail(new)[0][:700].replace("\n", " "))
                 ok += 1
                 continue
             with conn.cursor() as cur:
