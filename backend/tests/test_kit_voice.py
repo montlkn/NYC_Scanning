@@ -245,3 +245,10 @@ def test_capitalised_word_after_a_colon_or_quote_is_not_a_proper_noun():
     old = "The house was enlarged in 1888 and pushed toward grandeur by its owners."
     new = "The owners enlarged it in 1888 and pushed it toward grandeur. Their verdict: Subtle was not the assignment."
     assert "unsupported" not in (check_rewrite(old, new) or "")
+
+
+def test_hooks_never_use_spot_captions_as_facts():
+    import scripts.generate_building_hooks as hk
+    user, facts, source = hk.build_prompt(
+        {"name": "X", "story": "a story", "lpc": "lpc text", "locals": ["a stranger says the owner is a crook"]})
+    assert "crook" not in user and "crook" not in facts and "spots" not in source
