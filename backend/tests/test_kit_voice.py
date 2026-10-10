@@ -239,3 +239,26 @@ def test_distortion_citing_words_the_source_never_had_is_discarded():
 def test_too_close_retry_asks_for_a_restructure():
     msg = rw.retry_message("orig", "too close to original (voice did not change)")
     assert "EVERY sentence" in msg and "ORIGINAL STORY" in msg
+
+
+def test_rewrite_must_keep_every_citation():
+    from services.kit_voice import check_rewrite
+    old = ("**The Alder Building** was finished in 1911 for the **Alder Hat Company** [[1]](https://a.org/x/y). "
+           "In 1932 its owner **Harold Pike** was arrested for a card game on the fourth floor [[2]](https://b.org/p/q). "
+           "The terracotta facade has ornate cornices and is a fine example of early commercial work.")
+    dropped = ("**Harold Pike** got arrested in 1932 over a card game on the fourth floor of **The Alder Building**. "
+               "It went up in 1911 for the **Alder Hat Company**, terracotta facade, ornate cornices, "
+               "early commercial work at its most earnest. A hat company. A card game. Sure.")
+    assert check_rewrite(old, dropped).startswith("citations changed")
+
+
+def test_rewrite_rejects_meta_and_relationship_drift():
+    from services.kit_voice import check_rewrite
+    old = ("**Harold Pike** occupied **The Alder Building** in 1932, running a card game on the fourth floor "
+           "while the **Alder Hat Company** sold hats downstairs to people who did not ask questions.")
+    meta = ("The source says **Harold Pike** occupied **The Alder Building** in 1932 and ran a card game on the "
+            "fourth floor, while the **Alder Hat Company** sold hats below to customers who kept quiet.")
+    owned = ("**The Alder Building** belonged to **Harold Pike** in 1932, card game on the fourth floor, "
+             "while the **Alder Hat Company** moved hats downstairs to customers who knew better than to ask.")
+    assert check_rewrite(old, meta).startswith("meta phrase")
+    assert check_rewrite(old, owned).startswith("changed relationship word")

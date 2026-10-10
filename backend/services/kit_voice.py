@@ -19,6 +19,8 @@ import re
 from typing import Optional
 
 VOICE_VERSION = 1
+# Inline citation as the app writes it: [[1]](https://...)
+_CITE = re.compile(r"\[\[\d+\]\]\([^)\s]+\)")
 # A rewrite more similar than this to the original is a copyedit, not a voice.
 SIMILAR_MAX = 0.80
 
@@ -59,6 +61,16 @@ Hard rules:
 - Flowing paragraphs only. No headers, no bullets. No em dashes.
 - About the same length as the original (within 25%). Finish the last sentence.
 - Never describe what you searched or did not find.
+- Never mention "the source", "the original", "the record", "the text" or
+  anything "supplied" or "provided". Kit knows these things; he does not cite
+  paperwork in the prose.
+- Keep relationship words exactly: occupied is not owned, leased is not
+  bought, bombed is not destroyed, proposed is not built.
+- Never attach a date to an event unless the original gives that event that date.
+- CITATIONS. Markers like [[1]](https://example.org/page) are citations. Copy
+  every one exactly, character for character, and put it right after the
+  sentence that carries the fact it backs. Do not drop, merge, renumber or
+  invent any.
 - Output only the rewritten story. No preface, no notes.
 
 EXAMPLE (an invented building, to show the move, not to copy words from).
@@ -93,6 +105,10 @@ certificates here."
 Output only the line, or NONE. No quotes around it."""
 
 _BANNED = ("squeak", "rat-tastic", "ratatouille", "nestled", "iconic", "stunning", "boasts")
+# Meta words a story must not use unless the original already does.
+_META = ("the source", "the original", "the record", "supplied", "provided text",
+         "provided context", "the context", "the text says")
+_RISKY = ("belonged", "owned by", "destroyed", "demolished", "bought", "purchased")
 _RESEARCH = ("searches returned", "no results", "public records show nothing",
              "could not find", "couldn't find", "i searched")
 _NUM = re.compile(r"\d[\d,]*(?:\.\d+)?")
@@ -178,10 +194,20 @@ def check_rewrite(old_prose: str, new_prose: Optional[str]) -> Optional[str]:
         return "added em dashes"
     if len(re.findall(r"(?<![A-Za-z])I(?![A-Za-z'])", new)) > 2:
         return "too much first person"
-    bad = _unsupported(new, old_prose)
+    old_low = old_prose.lower()
+    for m in _META:
+        if m in low and m not in old_low:
+            return f"meta phrase: {m}"
+    for v in _RISKY:
+        if re.search(rf"\b{v}\b", low) and not re.search(rf"\b{v}\b", old_low):
+            return f"changed relationship word: {v}"
+    old_cites, new_cites = _CITE.findall(old_prose), _CITE.findall(new)
+    if sorted(old_cites) != sorted(new_cites):
+        return f"citations changed ({len(old_cites)} before, {len(new_cites)} after)"
+    bad = _unsupported(_CITE.sub("", new), _CITE.sub("", old_prose))
     if bad:
         return "unsupported: " + ", ".join(sorted(bad)[:6])
-    plain = lambda t: re.sub(r"[*_]{1,2}", "", t).lower()
+    plain = lambda t: re.sub(r"[*_]{1,2}", "", _CITE.sub("", t)).lower()
     if difflib.SequenceMatcher(None, plain(old_prose), plain(new), autojunk=False).ratio() > SIMILAR_MAX:
         return "too close to original (voice did not change)"
     return None
