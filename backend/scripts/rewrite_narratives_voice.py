@@ -70,6 +70,10 @@ def restore(conn) -> None:
 
 
 def retry_message(prose: str, reason: str) -> str:
+    if reason.startswith("too close"):
+        reason = ("Your version was nearly the same as the original. Change the structure "
+                  "of EVERY sentence: lead with a different fact than the original leads "
+                  "with, merge some sentences, split others, drop padding, vary the rhythm.")
     return (
         f"ORIGINAL STORY:\n{prose}\n\n"
         f"YOUR LAST ATTEMPT WAS REJECTED. Problems:\n{reason}\n\n"

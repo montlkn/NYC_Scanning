@@ -49,12 +49,19 @@ thing; a different order of the same facts; a flourish that asserts nothing
 checkable ("People had opinions.", "apparently one mansion was not enough").
 "Built between 1978 and 1984" and "went up between 1978 and 1984" are the same.
 
-For EACH issue you must quote the exact words from the CANDIDATE (not the
-SOURCE) in "candidate_quote". Never list something the CANDIDATE does not say.
-If the CANDIDATE only repeats what the SOURCE says, it has no issues.
+For EACH issue give:
+- "candidate_quote": the exact words from the CANDIDATE (never the SOURCE).
+- "kind": "absent" if the SOURCE never says it, or "distorted" if the SOURCE says
+  something different.
+- "evidence": for "absent", the 1 to 3 distinctive words you searched for in the
+  SOURCE and did not find (a name, number or key noun). For "distorted", the
+  exact words from the SOURCE that the candidate distorts.
+Before you answer "absent", search the whole SOURCE for those words. If they are
+there, it is not an issue. If the CANDIDATE only repeats what the SOURCE says, it
+has no issues.
 
 Answer with JSON only, nothing else:
-{"issues":[{"severity":"major"|"minor","candidate_quote":"exact words","problem":"one short sentence"}]}
+{"issues":[{"severity":"major"|"minor","candidate_quote":"...","kind":"absent"|"distorted","evidence":"...","problem":"one short sentence"}]}
 Use {"issues":[]} when there is nothing to list."""
 
 
@@ -64,7 +71,31 @@ def _norm(t: str) -> str:
     return re.sub(r"[^a-z0-9$%]+", " ", t).strip()
 
 
-def parse_verdict(out: Optional[str], candidate: str) -> Optional[str]:
+def _evidence_holds(issue: dict, src: str) -> bool:
+    """Check the judge's objection against the source in code, not on trust.
+
+    absent    -> the words it says are missing must really be missing. If most
+                 of them are in the source, the claim IS there and the judge
+                 was wrong (it said Isaac Liebman was not in a source that
+                 names him).
+    distorted -> the source words it says are distorted must really be there.
+    A flag with no usable evidence is kept: no evidence is not a reason to
+    wave a possible invention through."""
+    ev = _norm(str(issue.get("evidence", "")))
+    kind = str(issue.get("kind", "")).lower()
+    if not ev:
+        return True
+    if kind == "distorted":
+        return ev in src
+    toks = [t for t in ev.split() if len(t) > 3 or any(c.isdigit() for c in t)]
+    if not toks:
+        return True
+    words = set(src.split())
+    present = sum(1 for t in toks if t in words)
+    return present / len(toks) < 0.6
+
+
+def parse_verdict(out: Optional[str], candidate: str, source: str = "") -> Optional[str]:
     """None if the candidate may stand, else the reason (quotes and problems)
     that is also fed back to the writer."""
     if out is None:
@@ -85,6 +116,8 @@ def parse_verdict(out: Optional[str], candidate: str) -> Optional[str]:
         # An objection to words the candidate never wrote is the judge's error.
         if len(quote) < 6 or quote not in cand:
             continue
+        if source and not _evidence_holds(it, _norm(source)):
+            continue
         majors.append(f'"{str(it["candidate_quote"]).strip()[:120]}": {str(it.get("problem", "")).strip()[:140]}')
     if not majors:
         return None
@@ -101,4 +134,4 @@ async def judge(source: str, candidate: str, *, label: str = "story") -> Optiona
         cache_key="jink-voice-judge",
         model=JUDGE_MODEL,
     )
-    return parse_verdict(out, candidate)
+    return parse_verdict(out, candidate, source)

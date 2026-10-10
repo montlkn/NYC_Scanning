@@ -81,6 +81,15 @@ A hook is a FACT, said plainly. The voice lives in word choice, not in asides.
   building that stood on the site before.
 - Keep timing exactly as stated (after is not while).
 - If you cannot say it plainly in the facts' own words, return exactly: NONE
+
+A hook must make a stranger want to open the building. Prefer NONE to a dull line.
+GOOD: "United States Steel was founded inside this building, then Dominique
+Strauss-Kahn served house arrest here."
+GOOD: "Its Bronx plant printed roughly half the securities traded on the New York
+Stock Exchange."
+DULL (return NONE instead): "The statue was intended to symbolize liberty."
+DULL (return NONE instead): "The company produced bank notes, stamps and
+certificates here."
 Output only the line, or NONE. No quotes around it."""
 
 _BANNED = ("squeak", "rat-tastic", "ratatouille", "nestled", "iconic", "stunning", "boasts")

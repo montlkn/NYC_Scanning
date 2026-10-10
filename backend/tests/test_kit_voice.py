@@ -201,3 +201,41 @@ def test_two_rejections_keep_the_old_story(monkeypatch):
     monkeypatch.setattr(rw, "judge", always_no)
     bin_, new, reason = asyncio.run(rw.rewrite_one(asyncio.Semaphore(1), "9", ORIGINAL))
     assert new is None and reason.startswith("judge:")
+
+
+# --- the judge's objections are verified against the source ---------------
+SRC = ("The Empire Building 1891 bombing: Isaac Liebman was injured when seven elevators "
+       "fell in 1915. Olayan Group pursued the renovation with Gensler.")
+
+
+def test_wrong_absent_claim_is_discarded_when_the_source_has_it():
+    cand = "In 1915 seven elevators fell simultaneously, injuring passenger Isaac Liebman."
+    out = verdict({"severity": "major", "candidate_quote": "injuring passenger Isaac Liebman",
+                   "kind": "absent", "evidence": "Isaac Liebman", "problem": "not in source"})
+    assert kit_judge.parse_verdict(out, cand, SRC) is None
+
+
+def test_real_distortion_is_kept():
+    cand = "Olayan Group hired Gensler for a major renovation."
+    out = verdict({"severity": "major", "candidate_quote": "hired Gensler", "kind": "distorted",
+                   "evidence": "pursued the renovation with Gensler", "problem": "source says pursued"})
+    assert "hired Gensler" in kit_judge.parse_verdict(out, cand, SRC)
+
+
+def test_real_insinuation_is_kept():
+    cand = "She held the design leadership that too often gets filed under somebody else's name."
+    out = verdict({"severity": "major", "candidate_quote": "too often gets filed under somebody else's name",
+                   "kind": "absent", "evidence": "filed somebody else's name", "problem": "insinuation"})
+    assert kit_judge.parse_verdict(out, cand, "Natalie de Blois designed the Pepsi-Cola Building.")
+
+
+def test_distortion_citing_words_the_source_never_had_is_discarded():
+    cand = "Olayan Group hired Gensler for a major renovation."
+    out = verdict({"severity": "major", "candidate_quote": "hired Gensler", "kind": "distorted",
+                   "evidence": "words the source never contained", "problem": "x"})
+    assert kit_judge.parse_verdict(out, cand, SRC) is None
+
+
+def test_too_close_retry_asks_for_a_restructure():
+    msg = rw.retry_message("orig", "too close to original (voice did not change)")
+    assert "EVERY sentence" in msg and "ORIGINAL STORY" in msg
