@@ -239,3 +239,9 @@ def test_distortion_citing_words_the_source_never_had_is_discarded():
 def test_too_close_retry_asks_for_a_restructure():
     msg = rw.retry_message("orig", "too close to original (voice did not change)")
     assert "EVERY sentence" in msg and "ORIGINAL STORY" in msg
+
+
+def test_capitalised_word_after_a_colon_or_quote_is_not_a_proper_noun():
+    old = "The house was enlarged in 1888 and pushed toward grandeur by its owners."
+    new = "The owners enlarged it in 1888 and pushed it toward grandeur. Their verdict: Subtle was not the assignment."
+    assert "unsupported" not in (check_rewrite(old, new) or "")

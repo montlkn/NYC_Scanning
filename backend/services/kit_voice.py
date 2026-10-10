@@ -140,7 +140,9 @@ def _mid_sentence_caps(s: str) -> set[str]:
     proper nouns. Markdown emphasis is stripped first."""
     plain = re.sub(r"[*_]{1,2}", "", s)
     out: set[str] = set()
-    for sent in re.split(r"(?<=[.!?])\s+|\n+", plain):
+    # A capitalised word after a colon, semicolon, dash or opening quote starts
+    # a clause; it is not a proper noun ("Subtle was not the assignment").
+    for sent in re.split(r"(?<=[.!?])\s+|\n+|[:;\u2014\u201c\"(]\s*", plain):
         words = _WORD.findall(sent)
         for w in words[1:]:
             w = _strip_possessive(w.strip("'\u2019-"))
