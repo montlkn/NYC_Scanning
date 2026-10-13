@@ -2391,6 +2391,7 @@ async def search_unified(
     scanned_bins: Optional[str] = Query(None, description="CSV of bins the user has already scanned (novelty nudge)"),
     debug: bool = Query(False, description="Include a per-hit score breakdown (_debug). For tuning; never cached."),
     area: bool = Query(False, description="'Search this area': radius_m is a HARD bound for every intent and every leg"),
+    fast: bool = Query(False, description="First pass only: don't wait for the LLM rewrite or the vibe judge. Both still start and cache, so the app's full request (sent alongside) gets them. Lets the client show results at once and swap in the full answer."),
 ) -> Dict[str, Any]:
     """Cross-corpus search: buildings + venues + layers (lore/plaques/
     contributions), fused via Reciprocal Rank Fusion with intent-aware corpus
@@ -2410,7 +2411,7 @@ async def search_unified(
     cache_key = _result_cache_key(
         q, lat, lng, radius_m, limit,
         (year_from, year_to, borough, style_family, material, lore_status,
-         landmark, user_vector, scanned_bins, area),
+         landmark, user_vector, scanned_bins, area, fast),
     )
     cached_resp = None if debug else _result_cache_get(cache_key)
     if cached_resp is not None:
@@ -2635,7 +2636,7 @@ async def search_unified(
     # A kind of place ("chic bars") also waits, once per query: a venue
     # named "Chic Republic" made the words look answered, and the picks,
     # the actual chic bars, never ran.
-    if interp is None and interp_task is not None and (not direct or intent == "poi"):
+    if not fast and interp is None and interp_task is not None and (not direct or intent == "poi"):
         remaining = INTERP_WAIT_S - (time.monotonic() - start)
         if remaining > 0:
             try:
@@ -2655,7 +2656,7 @@ async def search_unified(
     # descriptions of nearby places of the asked-for kind. Started now so it
     # runs alongside the expansion legs; joined where picks are placed.
     vibe_task: Optional[asyncio.Task] = None
-    if intent != "address" and vibe_judge.wants_judge(interp):
+    if not fast and intent != "address" and vibe_judge.wants_judge(interp):
         vibe_task = asyncio.create_task(vibe_judge.judge(q, interp, lat, lng))
 
     t_llm = time.monotonic()
