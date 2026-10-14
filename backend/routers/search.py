@@ -119,6 +119,9 @@ _LEX_STOPWORDS = frozenset({
     # Spot) on the literal token while the word that carried the intent,
     # "spooky", did the work alone.
     "spot", "spots",
+    # Question words name nothing; "who lived at the dakota" keyed the
+    # trigram pool on "who" as much as on "dakota".
+    "who", "whom", "whose", "what", "when", "where", "which", "why", "how",
     # Question words. "where did famous writers live" kept "where" and "did",
     # and long report chunks contain every one of those words, so apartment
     # houses counted as real matches for it.
@@ -786,6 +789,8 @@ def _neighborhood_phrases() -> set:
         _HOOD_PHRASES = phrases
     return _HOOD_PHRASES
 
+
+_QUESTION_LEADS = frozenset({"who", "whose", "what", "when", "where", "which", "why", "how"})
 
 _HOOD_CENTROIDS: Optional[Dict[str, tuple]] = None
 
@@ -2838,6 +2843,7 @@ async def search_unified(
     # near-duplicate clusters, and truncating before dedup could keep two
     # duplicates while dropping a genuinely-different lower-ranked hit.
     all_hits: List[Dict[str, Any]] = []
+    _asks_about = (q.strip().split() or [""])[0].lower() in _QUESTION_LEADS
     # Facet-ness is emergent from the RESULT SET (a token is a material or
     # neighborhood term only because some hit really carries it in that
     # column), so this is computed once over the whole list rather than
@@ -2890,7 +2896,10 @@ async def search_unified(
         nudged += _t("fame_boost", fame_boost(intent, h.get("fame")))
         # Name intent: an exact/subset name match is the answer — this bonus
         # is deliberately dominant over every other nudge (see W_EXACT_NAME).
-        if intent == "name":
+        # A question about a named place ("who lived at the dakota", "what
+        # happened at the stonewall") is a name query too, whatever intent
+        # the other words gave it.
+        if intent == "name" or (_asks_about and intent in ("lore", "prose", "event")):
             _exact = exact_name_bonus(q_lex, h.get("name"))
             nudged += _t("_exact", _exact)
             # A typo of a famous name is still a name match. exact_name_bonus

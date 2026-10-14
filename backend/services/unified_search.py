@@ -473,12 +473,31 @@ W_EXACT_NAME = 0.30    # normalized query == normalized name
 W_NAME_SUBSET = 0.20   # every query content-token appears in the name
 
 
+# Words that ask about a place rather than name it. "who lived at the dakota"
+# reached name matching as "who lived dakota", which no building is called,
+# so the Dakota got no name bonus and buildings that merely mention it won.
+_QUESTION_WORDS = frozenset({
+    "who", "whom", "whose", "what", "when", "where", "which", "why", "how",
+    "did", "does", "do", "is", "was", "were", "lived", "live", "lives", "living",
+    "built", "build", "designed", "design", "owned", "owns", "died", "born",
+    "happened", "story", "history", "behind", "inside", "about", "tell",
+})
+
+
+def _strip_question_words(q: str) -> str:
+    """The query minus question words, or the query itself if that is all it
+    has ("who" alone stays "who")."""
+    kept = [w for w in q.split() if w.lower().strip("?.,!'\"") not in _QUESTION_WORDS]
+    return " ".join(kept) if kept else q
+
+
 def exact_name_bonus(q_lex: str, name: Optional[str]) -> float:
     """Dominant bonus for name-intent queries whose tokens are literally the
-    hit's name (or a subset of it — "chrysler" ⊆ "Chrysler Building")."""
+    hit's name (or a subset of it — "chrysler" ⊆ "Chrysler Building").
+    Question words don't count against the match."""
     if not name:
         return 0.0
-    q_norm = _normalize_name_for_dedupe(q_lex)
+    q_norm = _normalize_name_for_dedupe(_strip_question_words(q_lex))
     n_norm = _normalize_name_for_dedupe(name)
     if not q_norm or not n_norm:
         return 0.0
