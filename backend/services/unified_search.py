@@ -1479,7 +1479,13 @@ def build_header(hits: List[Dict[str, Any]], intent: str) -> str:
         top_style, top_count = styles.most_common(1)[0]
         if top_count * 2 > n:
             dominant_style = top_style
-    dominant_type = types.most_common(1)[0][0] if types else None
+    # Same rule for the noun: "18 buildings" over a list that was half lore
+    # and plaques read as a miscount.
+    dominant_type = None
+    if types:
+        top_type, top_type_count = types.most_common(1)[0]
+        if top_type_count * 2 > n:
+            dominant_type = top_type
 
     _TYPE_NOUNS = {"lore": "lore entries"}
     noun = "results"

@@ -12,6 +12,7 @@ retrieval (Phase 2b).
 
 import asyncio
 import logging
+import math
 import re
 import time
 from collections import OrderedDict
@@ -784,6 +785,79 @@ def _neighborhood_phrases() -> set:
             logger.warning(f"[search] neighborhood phrase load failed ({e})")
         _HOOD_PHRASES = phrases
     return _HOOD_PHRASES
+
+
+_HOOD_CENTROIDS: Optional[Dict[str, tuple]] = None
+
+
+def _hood_centroids() -> Dict[str, tuple]:
+    """NTA name -> (lat, lng) centroid of its indexed buildings. Loaded once."""
+    global _HOOD_CENTROIDS
+    if _HOOD_CENTROIDS is None:
+        import psycopg
+        from models.config import get_settings
+        out: Dict[str, tuple] = {}
+        url = get_settings().search_db_url
+        try:
+            if url:
+                with psycopg.connect(url, connect_timeout=5) as c, c.cursor() as cur:
+                    cur.execute(
+                        "SELECT neighborhood, avg(lat), avg(lng) FROM building_search_index "
+                        "WHERE neighborhood IS NOT NULL AND lat IS NOT NULL AND lng IS NOT NULL "
+                        "GROUP BY neighborhood")
+                    for n, la, ln in cur.fetchall():
+                        out[n] = (float(la), float(ln))
+        except Exception as e:
+            logger.warning(f"[search] neighborhood centroid load failed ({e})")
+        _HOOD_CENTROIDS = out
+    return _HOOD_CENTROIDS
+
+
+# A coordinate this close to a requested neighborhood's centre counts as in
+# it; one this far from every requested centre is somewhere else. Between
+# the two it stays unknown, so a story on the edge of an NTA is never punished.
+HOOD_NEAR_M = 1500.0
+HOOD_FAR_M = 3000.0
+_HOOD_MATCHES: Dict[tuple, List[str]] = {}
+
+
+def _infer_hood(place_req: Optional[Dict[str, Any]], h: Dict[str, Any]) -> Optional[str]:
+    """A neighborhood for a hit that only has coordinates (lore, plaques).
+
+    place_adjustment leaves rows with no neighborhood alone, and lore rows
+    never carry one, so "mob history in little italy" ranked Murder, Inc.
+    (Brownsville) first. Placing the point lets the named area count."""
+    if not place_req or not place_req.get("neighborhoods") or h.get("neighborhood"):
+        return None
+    lat, lng = h.get("lat"), h.get("lng")
+    if lat is None or lng is None:
+        return None
+    cents = _hood_centroids()
+    if not cents:
+        return None
+    vocab = neighborhood_vocab()
+
+    def dist(c: tuple) -> float:
+        dlat = math.radians(c[0] - lat)
+        dlng = math.radians(c[1] - lng) * math.cos(math.radians(lat))
+        return 6371000.0 * math.hypot(dlat, dlng)
+
+    key = tuple(sorted(str(x).lower() for x in place_req["neighborhoods"]))
+    names = _HOOD_MATCHES.get(key)
+    if names is None:
+        names = [n for n in cents
+                 if place_adjustment({"neighborhoods": place_req["neighborhoods"]},
+                                     {"neighborhood": n}, vocab) > 0]
+        _HOOD_MATCHES[key] = names
+    wanted = [(n, dist(cents[n])) for n in names]
+    if not wanted:
+        return None
+    near_name, near_d = min(wanted, key=lambda x: x[1])
+    if near_d <= HOOD_NEAR_M:
+        return near_name
+    if near_d >= HOOD_FAR_M:
+        return min(((n, dist(c)) for n, c in cents.items()), key=lambda x: x[1])[0]
+    return None
 
 
 _GENERIC_VOCAB: Optional[set] = None
@@ -2878,6 +2952,9 @@ async def search_unified(
         nudged += _t("llm_category_bonus", llm_category_bonus(interp, h))
         nudged += _t("llm_style_bonus", llm_style_bonus(interp, h))
         nudged += _t("llm_era_bonus", llm_era_bonus(interp, h))
+        _hood = _infer_hood(place_req, h)
+        if _hood:
+            h["neighborhood"] = _hood
         nudged += _t("place_adjustment", place_adjustment(place_req, h, neighborhood_vocab()))
         if h["_unverified"]:
             nudged += _t("unverified_venue", W_UNVERIFIED_VENUE)
