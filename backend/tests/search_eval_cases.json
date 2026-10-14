@@ -327,6 +327,15 @@
    "none_of_top3": [
     "Champ Depot - Custom Restaurant Furniture: Tables, Chairs, Booths, Barstools, Bars, and Reupholstery"
    ]
+  },
+  {
+   "q": "mob history in little italy",
+   "at": "midtown",
+   "topk": 5,
+   "any_of": [
+    "Umberto"
+   ],
+   "why": "Lore has no neighborhood; a Brownsville story (Murder, Inc.) led until lore was placed by its coordinates"
   }
  ]
 }
