@@ -15,7 +15,15 @@ class TestStreetKey:
         assert _street_key("12 Bank Street", None) != _street_key("12 Bond Street", None)
 
     def test_a_named_building_is_not_grouped_by_accident(self):
-        assert _street_key("Chrysler Building", None) != _street_key("Empire State Building", None)
+        a, b = _street_key("Chrysler Building", None), _street_key("Empire State Building", None)
+        assert a is None or a != b
+
+    def test_a_shared_name_is_not_a_street(self):
+        # Lore titled after the building used to share its "street" and push
+        # the building itself to the bottom of "who lived at the dakota".
+        hits = [{"name": "The Dakota — Rosemary's Baby"}, {"name": "The Dakota"},
+                {"name": "The Dakota Apartments"}, {"name": "Century Apartments"}]
+        assert [h["name"] for h in apply_diversity_cap(hits)] == [h["name"] for h in hits]
 
 
 class TestCap:

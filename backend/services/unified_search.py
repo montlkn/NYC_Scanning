@@ -995,9 +995,19 @@ def _street_key(name: Optional[str], snippet: Optional[str]) -> Optional[str]:
         t = _HOUSE_NUMBER_RE.sub("", t)
         t = re.sub(r"\b(building|house|houses|residence|apartments?)\b", "", t)
         t = " ".join(t.split())
-        if len(t) >= 6:
+        # Only a real street groups hits. Any name used to count, so "The
+        # Dakota", "The Dakota — Rosemary's Baby" and "The Dakota Apartments"
+        # shared the "street" the dakota, and the building itself, third in,
+        # was pushed to the bottom of "who lived at the dakota".
+        if len(t) >= 6 and _STREET_WORD_RE.search(t):
             return t
     return None
+
+
+_STREET_WORD_RE = re.compile(
+    r"\b(street|st|avenue|ave|place|pl|road|rd|boulevard|blvd|drive|dr|lane|ln|"
+    r"broadway|bowery|terrace|court|ct|parkway|pkwy|square|sq|way|alley|row|slip)\b"
+)
 
 
 def apply_diversity_cap(hits: Sequence[dict],

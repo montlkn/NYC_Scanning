@@ -87,6 +87,7 @@ from services.unified_search import (
     llm_category_bonus,
     parse_interpretation,
     place_adjustment,
+    _strip_question_words,
 )
 
 router = APIRouter(prefix="/search", tags=["search"])
@@ -2512,6 +2513,11 @@ async def search_unified(
     q_hoods, q_boros = _query_places(q)
     if q_hoods or q_boros:
         soft_radius = True
+    # A question about a place ("who lived at the dakota") is not "near me"
+    # either: from Queens it returned Queens apartment houses.
+    _asks_about = (q.strip().split() or [""])[0].lower() in _QUESTION_LEADS
+    if _asks_about:
+        soft_radius = True
     # "Search this area" is the user drawing the boundary by moving the map.
     # It overrides every softening above: results outside the viewport are
     # exactly what the button exists to exclude.
@@ -2843,7 +2849,6 @@ async def search_unified(
     # near-duplicate clusters, and truncating before dedup could keep two
     # duplicates while dropping a genuinely-different lower-ranked hit.
     all_hits: List[Dict[str, Any]] = []
-    _asks_about = (q.strip().split() or [""])[0].lower() in _QUESTION_LEADS
     # Facet-ness is emergent from the RESULT SET (a token is a material or
     # neighborhood term only because some hit really carries it in that
     # column), so this is computed once over the whole list rather than
@@ -3021,8 +3026,11 @@ async def search_unified(
     diversified = apply_diversity_cap(deduped)
     # Tiers: the actual thing, then real matches NEAREST FIRST, then the rest
     # by relevance. See order_by_tier in services/unified_search.py.
-    q_toks = query_content_tokens(q_lex)
-    named_toks = await _named_tokens(q_lex, q_toks)
+    # Question words ("lived") aren't part of what is named, so they must
+    # not stop the Dakota counting as the thing itself.
+    _q_core = _strip_question_words(q_lex) if _asks_about else q_lex
+    q_toks = query_content_tokens(_q_core)
+    named_toks = await _named_tokens(_q_core, q_toks)
     # When the named thing itself is in the list ("seagram bar" -> The Bar),
     # the rewrite's looser "any Cocktail Bar" definition of a match is off:
     # other bars near you are not what was asked for.
