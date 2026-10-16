@@ -15,8 +15,16 @@ read-only on purpose. Anything that WRITES the index needs the owner login
 | Kit narratives (MAIN `narratives`) | `scripts.embed_grok_narratives` | as they grow |
 | Buildings whose generated lore changed | `scripts/embed_buildings.py --changed` | as lore is written |
 
-All of them embed only rows not yet indexed. `cron/reindex_search.sh` runs
-them all.
+| Places tapped on Apple Maps (MAIN `venue_requests`) | `scripts.ingest_requested_venues` | nightly, needs `MAIN_DB_URL` |
+| All venues, newest Foursquare release | `scripts/seed_venues.py --citywide --shards 100` | monthly, `REFRESH_VENUES=1` + `HF_TOKEN` |
+
+All of them embed only rows not yet indexed (the monthly venue re-seed
+upserts every row). `cron/reindex_search.sh` runs them all.
+
+Venues added from Apple taps carry `source='apple_request'` and an id
+starting `apple:`, so `DELETE FROM venues WHERE source='apple_request'`
+reverts them. The app side: `ExploreViewModel.requestVenue` in Jink_Swift,
+table `supabase/migrations/20261016_venue_requests_MAIN.sql`.
 
 ## Automatic (recommended): a Railway cron service
 
