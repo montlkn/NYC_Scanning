@@ -130,10 +130,10 @@ def is_searchable(name: str | None, category: str | None, domains: tuple, in_nyc
 def base_parts(text: str) -> list:
     """The leading 'Name. Category. Address' of a venue text, without any
     provenance clauses a previous build appended. Clauses all start with
-    'in ' or 'designed by ', and never come first."""
+    'in ', 'designed by ' or 'known as ', and never come first."""
     out = []
     for p in (text or "").split(". "):
-        if out and (p.startswith("in ") or p.startswith("designed by ")):
+        if out and (p.startswith("in ") or p.startswith("designed by ") or p.startswith("known as ")):
             break
         out.append(p)
     return out
@@ -150,7 +150,7 @@ def host_class(desc: str | None) -> str:
 
 def build_text(parts: list, raw_cat: str | None, cat: str | None, host: str,
                byear, style: str, hood: str, boro: str, arch: str,
-               cls: str = "", material: str = "") -> str:
+               cls: str = "", material: str = "", kind: str = "") -> str:
     parts = list(parts)
     if len(parts) > 1 and raw_cat and parts[1] == raw_cat and cat:
         parts[1] = cat
@@ -168,6 +168,12 @@ def build_text(parts: list, raw_cat: str | None, cat: str | None, host: str,
         parts.append(f"in {place}")
     if arch and arch.lower() not in ("not determined", "unknown"):
         parts.append(f"designed by {arch}")
+    # What the place really is, from its fact-checked card ("chess shop",
+    # "dive bar"), when the listed category says otherwise. FSQ files Chess
+    # Forum as a hobby shop, so "chess" had nothing to match but the name.
+    k = (kind or "").strip()
+    if k and k.lower() not in " ".join(parts).lower():
+        parts.append(f"known as a {k}")
     return ". ".join(parts)
 
 
@@ -267,6 +273,19 @@ def run(*, dry_run: bool = False, limit: int | None = None,
     hoods, boros = locate(lats, lngs)
     log.info("located (%.0fs)", time.time() - t0)
 
+    # Card kinds (services/venue_cards): only cards that matched this venue,
+    # are not closed and passed the fact check. No table yet means no kinds.
+    kinds: dict = {}
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT fsq_id, kind FROM venue_cards "
+                        "WHERE match AND NOT closed AND judge IS NULL AND coalesce(kind, '') <> ''")
+            kinds = dict(cur.fetchall())
+    except Exception as e:  # noqa: BLE001
+        conn.rollback()
+        log.info("no venue card kinds (%s)", str(e).splitlines()[0])
+    log.info("%d venue card kinds", len(kinds))
+
     out = []
     stats = collections.Counter()
     for r, hood, boro in zip(rows, hoods, boros):
@@ -286,9 +305,11 @@ def run(*, dry_run: bool = False, limit: int | None = None,
             host = ""  # an address-only building "name" adds nothing
         mat = (material or "").replace("_", " ").strip().lower()
         new_text = build_text(base_parts(text), raw_cat, cat, host, byear,
-                              bstyle or "", hood or "", boro or "", arch or "", cls, mat)
+                              bstyle or "", hood or "", boro or "", arch or "", cls, mat,
+                              kinds.get(fsq_id, ""))
         lex = " ".join(x for x in (name, cat, host, hood, boro, cls, mat) if x).lower()
         stats["with_class"] += bool(cls)
+        stats["with_kind"] += fsq_id in kinds
         stats["in_nyc"] += in_nyc
         stats["searchable"] += searchable
         stats["cat_changed"] += cat != raw_cat

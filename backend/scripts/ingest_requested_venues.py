@@ -70,6 +70,36 @@ def venue_id(name: str, lat: float, lng: float) -> str:
     return f"apple:{lat:.5f},{lng:.5f}:{slug}"
 
 
+def write_cards(venues: list, search_url: str) -> None:
+    import asyncio
+
+    import httpx
+
+    from services import venue_cards
+    from services.openai_text import is_configured as llm_ready
+    if not (venue_cards.is_configured() and llm_ready()):
+        logger.info("cards skipped: BRAVE_API_KEY or OPENAI_API_KEY not set")
+        return
+
+    async def run() -> list:
+        sem = asyncio.Semaphore(4)
+        async with httpx.AsyncClient(timeout=20) as client:
+            async def one(g: dict):
+                async with sem:
+                    # The address is the best "area" we have before enrichment.
+                    return g, await venue_cards.write_card(client, g, g.get("address") or "New York")
+            return await asyncio.gather(*(one(g) for g in venues))
+
+    done = [(g, c) for g, c in asyncio.run(run()) if c is not None]
+    with psycopg.connect(search_url) as conn, conn.cursor() as cur:
+        cur.executemany(venue_cards.UPSERT_SQL, [
+            venue_cards.upsert_params(g["fsq_id"], g["name"], g["category"], c) for g, c in done])
+        conn.commit()
+    shown = sum(1 for _, c in done if c.get("card"))
+    rejected = sum(1 for _, c in done if c.get("judge"))
+    logger.info(f"cards: {len(done)}/{len(venues)} written, {shown} usable, {rejected} failed the fact check")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
@@ -173,6 +203,13 @@ def main() -> int:
                 (result, g["ids"]),
             )
         conn.commit()
+
+    # Kit's card for each new venue: what it is really like, from two web
+    # searches, fact-checked (services/venue_cards). Shows as the venue's
+    # description, and its `kind` ("chess shop") joins the searchable text in
+    # the enrich step below. Skipped without BRAVE_API_KEY / OPENAI_API_KEY.
+    if new:
+        write_cards(new, search_url)
 
     # New rows have no neighborhood or NYC flag yet; enrich before anyone
     # searches them (same step seed_venues ends with).

@@ -18,6 +18,7 @@ Venues without a card are still offered by name, so the step degrades to name
 recognition outside carded areas instead of switching off.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -70,6 +71,42 @@ def _load_cards() -> Dict[str, Dict[str, Any]]:
 
 
 _CARDS = _load_cards()
+
+# Cards written after deploy live in the search DB's venue_cards table
+# (services/venue_cards.py). Reloaded on a timer so a card a nightly job wrote
+# shows without a redeploy. The JSONL stays the base: a table that is missing
+# or unreachable leaves the file's cards in place.
+CARDS_REFRESH_S = 30 * 60
+
+
+async def refresh_cards() -> bool:
+    try:
+        async with get_search_db() as db:
+            if db is None:
+                return False
+            rows = (await db.execute(text(
+                "SELECT fsq_id, name, category, match, found, closed, kind, card, sources "
+                "FROM venue_cards"))).fetchall()
+    except Exception as e:  # table not created yet, or the DB is down
+        logger.warning(f"[vibe] venue_cards not loaded: {e}")
+        return False
+    fresh = _load_cards()
+    for fid, name, cat, match, found, closed, kind, card, sources in rows:
+        fresh[fid] = {"fsq_id": fid, "name": name, "category": cat, "match": bool(match),
+                      "found": bool(found), "closed": bool(closed), "kind": kind or "",
+                      "card": card or "", "sources": list(sources or [])}
+    # In place: other modules hold no copy, but keep the one dict regardless.
+    _CARDS.clear()
+    _CARDS.update(fresh)
+    logger.info(f"[vibe] {len(_CARDS)} venue cards ({len(rows)} from the table)")
+    return True
+
+
+async def run_cards_forever() -> None:
+    while True:
+        t0 = time.monotonic()
+        await refresh_cards()
+        await asyncio.sleep(max(60.0, CARDS_REFRESH_S - (time.monotonic() - t0)))
 
 # Local knowledge the web does not have, written by hand, one per venue:
 # cards/venue_notes.jsonl, {fsq_id, name, kind?, note, by, date}. Upstairs

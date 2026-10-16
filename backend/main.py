@@ -214,6 +214,10 @@ async def lifespan(app: FastAPI):
     from services import list_notes as _list_notes
     asyncio.create_task(_list_notes.run_forever())
 
+    # Venue cards written by jobs after deploy (venue_cards table), every 30 min.
+    from services import vibe_judge as _vibe_judge
+    asyncio.create_task(_vibe_judge.run_cards_forever())
+
     yield
 
     # Shutdown
