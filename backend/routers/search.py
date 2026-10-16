@@ -2093,7 +2093,7 @@ boroughs: any of Manhattan, Brooklyn, Queens, Bronx, Staten Island the query nam
 styles: architectural style names, as a designation report writes them, that the query names or implies ("modernist" -> "international style", "mid-century modern", "brutalist", "modern"). Otherwise [].
 years: [from, to] when the query names or implies a period ("modernist" -> [1930, 1975], "gilded age" -> [1870, 1910], "prewar" -> [1880, 1940]). Otherwise null.
 If the query is misspelt, the FIRST phrase is the query with its spelling fixed and nothing else changed.
-picks: the specific real New York places or buildings a well-informed local would name as the best answers, up to 8, when the query is a vibe, a mood, a scene, slang, a superlative, a cuisine or style of place, or an architect's or firm's work ("chic bars", "dim lit bars", "romantic dinner", "old school italian", "cool hangout", "buildings by frank lloyd wright"). Read slang generously: "cunt", "slay", "serving", "giving" mean fashionable, fierce, glamorous, see-and-be-seen. name is the exact name the place goes by; hood is its neighborhood; note is 3 to 8 plain words on why it fits ("Piano bar inside the Carlyle"). Only places that exist; prefer ones still open; never invent. Name a place only if you are confident it fits this query; three right answers beat eight guesses. [] when the query already names one specific thing, or asks about history or architectural features rather than where to go or whose work.
+picks: the specific real New York places or buildings a well-informed local would name as the best answers, up to 8, when the query is a vibe, a mood, a scene, slang, a superlative, a cuisine or style of place, or an architect's or firm's work ("chic bars", "dim lit bars", "romantic dinner", "old school italian", "cool hangout", "buildings by frank lloyd wright"). Read slang generously: "cunt", "slay", "serving", "giving" mean fashionable, fierce, glamorous, see-and-be-seen. name is the exact name the place goes by; hood is its neighborhood; note is 3 to 8 plain words on why it fits ("Piano bar inside the Carlyle"). Only places that exist; prefer ones still open; never invent. Name a place only if you are confident it fits this query; three right answers beat eight guesses. When the query names or describes ONE specific business or place to go ("moonstruck diner", "the old chess shop by washington square"), picks is that one place, with its exact name and neighborhood. [] when the query names a landmark building, or asks about history or architectural features rather than where to go or whose work.
 vibe: the words in the query that describe the mood, scene, crowd or character wanted, copied from the query ("sceney", "punk", "cutty", "dim lit", "romantic", "where artists drink"). null when the query only names a kind of place, a place, a thing or a time.
 events: true when the query asks what is on or happening now or soon (tonight, this weekend, a party, a gig, a DJ, live music, clubbing), or asks for exhibitions, gallery shows or openings, or film screenings. Otherwise false.
 genres: music genres the query names or implies for events ("techno", "house", "jazz"). Otherwise [].
@@ -2107,7 +2107,8 @@ Examples:
 "woolworth bar" -> {"queries":["Woolworth Building"],"categories":["Cocktail Bar","Bar","Lounge"],"neighborhoods":[],"boroughs":[],"styles":[],"years":null,"about":"places"}
 "date night queens" -> {"queries":["candlelit restaurant","wine bar garden"],"categories":["Restaurant","Wine Bar","Italian Restaurant","French Restaurant"],"neighborhoods":[],"boroughs":["Queens"],"styles":[],"years":null,"about":"places","picks":[{"name":"Bohemian Hall & Beer Garden","hood":"Astoria","note":"Century-old Czech beer garden"}],"events":false,"genres":[]}
 "techno tonight" -> {"queries":["techno club","dance club warehouse"],"categories":["Dance Club","Music Venue","Nightclub"],"neighborhoods":[],"boroughs":[],"styles":[],"years":null,"about":"places","picks":[{"name":"Nowadays","hood":"Ridgewood","note":"Indoor-outdoor dance club, long sets"},{"name":"Basement","hood":"Maspeth","note":"Concrete techno bunker under a warehouse"}],"events":true,"genres":["techno"],"kinds":["music"],"when":"tonight"}
-"flatiron building" -> {"queries":["Flatiron Building"],"categories":[],"neighborhoods":[],"boroughs":[],"styles":[],"years":null,"about":"buildings","picks":[],"events":false,"genres":[]}"""
+"flatiron building" -> {"queries":["Flatiron Building"],"categories":[],"neighborhoods":[],"boroughs":[],"styles":[],"years":null,"about":"buildings","picks":[],"events":false,"genres":[]}
+"moonstruck diner" -> {"queries":["Moonstruck Diner"],"categories":["Diner"],"neighborhoods":[],"boroughs":[],"styles":[],"years":null,"about":"places","picks":[{"name":"Moonstruck Diner","hood":"Chelsea","note":"Classic 24-hour diner on Ninth Avenue"}],"events":false,"genres":[]}"""
 
 
 def _interp_keys(q: str) -> List[str]:
@@ -2241,7 +2242,8 @@ def _meters(lat1, lng1, lat2, lng2) -> Optional[float]:
 
 async def _resolve_picks(picks: List[dict], about: Optional[str],
                          lat: Optional[float], lng: Optional[float]) -> List[dict]:
-    """One hit per pick that matches a row, in the model's order."""
+    """One hit per pick that matches a row, in the model's order. Picks that
+    match nothing are no longer just dropped: see _unresolved_leads."""
     if not picks:
         return []
     names = [p["name"] for p in picks]
@@ -2342,8 +2344,16 @@ async def _resolve_picks(picks: List[dict], about: Optional[str],
         h["dist_m"] = (round(_meters(lat, lng, h["lat"], h["lng"]), 1)
                        if lat is not None and lng is not None and h["lat"] is not None else None)
         h["pick"] = True
+        h["_pick_name"] = picks[ord_ - 1]["name"]
         out.append(h)
     return out
+
+
+def _unresolved_leads(raw: List[dict], resolved: List[dict]) -> List[dict]:
+    """The model's picks that matched none of our rows: [{name, hood, note}]."""
+    found = {(h.get("_pick_name") or "").lower() for h in resolved}
+    return [{"name": p["name"], "hood": p.get("hood") or "", "note": p.get("note") or ""}
+            for p in raw if p["name"].lower() not in found]
 
 
 async def _log_query(q: str, intent: str, latency_ms: float, result_ids: List[str]) -> None:
@@ -2434,6 +2444,72 @@ def _result_cache_put(key: tuple, resp: Dict[str, Any]) -> None:
     _result_cache.move_to_end(key)
     while len(_result_cache) > _RESULT_CACHE_MAX:
         _result_cache.popitem(last=False)
+
+
+# ---------------------------------------------------------------------------
+# Research: the last resort for a search that found nothing.
+#
+# The app calls this only when its whole answer came up empty of anything
+# named for the query: our rows, the model's picks and Apple Maps. Same rules
+# as building lore research (services/lore_generator): a fixed number of web
+# queries we choose, and the model names places from those results only, with
+# no tools. A name the results do not literally contain is dropped, so the
+# model cannot slip one in from memory. Answers are cached per query for a day.
+# ---------------------------------------------------------------------------
+
+_RESEARCH_SYSTEM = """Someone searched a New York City app and nothing matched. You get their search and web search results.
+
+Name up to 3 specific New York places (a business, venue or building) that the RESULTS show answer the search. Use ONLY the results; never add a place from memory. Each name must appear in the results exactly as you write it.
+
+Reply with JSON only: {"places": [{"name": "...", "hood": "...", "note": "..."}]}
+name: the place's exact name as the results give it. hood: its neighborhood if the results say, else "". note: 3 to 8 plain words on why it answers the search, from the results.
+{"places": []} when the results do not clearly name a place that answers it."""
+
+_research_cache: "OrderedDict[str, tuple]" = OrderedDict()
+_RESEARCH_TTL_S = 24 * 3600
+
+
+@router.get("/research")
+@limiter.limit(LIMIT_SEARCH)
+async def research(request: Request, q: str = Query(..., min_length=3, max_length=200)):
+    from services import brave_search
+    q = " ".join(q.split())
+    key = q.lower()
+    hit = _research_cache.get(key)
+    if hit and time.monotonic() - hit[0] < _RESEARCH_TTL_S:
+        return hit[1]
+    empty = {"leads": [], "sources": []}
+    if not brave_search.is_configured():
+        return empty
+    results = await brave_search.search([f"{q} New York", f"{q} NYC"])
+    src = brave_search.as_source_text(results, max_chars=4000)
+    if not src:
+        return empty
+    raw = await openai_text(system=_RESEARCH_SYSTEM, user=f"Search: {q}\n\nResults:\n{src}",
+                            max_tokens=700, timeout_s=20, cache_key="jink-search-research-v1")
+    import json as _json
+    try:
+        txt = (raw or "").strip().strip("`")
+        places = _json.loads(txt[txt.find("{"):txt.rfind("}") + 1]).get("places") or []
+    except Exception:
+        places = []
+    hay = src.lower()
+    leads = []
+    for p in places[:3]:
+        if not isinstance(p, dict) or not isinstance(p.get("name"), str):
+            continue
+        name = " ".join(p["name"].split())
+        # Grounding: the name must be in the results verbatim.
+        if not (2 < len(name) <= 80) or name.lower() not in hay:
+            continue
+        leads.append({"name": name, "hood": str(p.get("hood") or "")[:60],
+                      "note": str(p.get("note") or "")[:80], "research": True})
+    out = {"leads": leads, "sources": [r["url"] for r in results[:4]]}
+    _research_cache[key] = (time.monotonic(), out)
+    while len(_research_cache) > 500:
+        _research_cache.popitem(last=False)
+    logger.info(f"[research] {q!r}: {[l['name'] for l in leads]}")
+    return out
 
 
 @router.get("/prefetch", status_code=202)
@@ -3079,6 +3155,7 @@ async def search_unified(
     # not find them (a direct match means the words did), so they are what
     # the query meant. Anything already in the list moves up, not in twice.
     picks: List[dict] = []
+    leads: List[dict] = []
     vibe_picks: List[dict] = []
     if vibe_task is not None:
         try:
@@ -3098,6 +3175,15 @@ async def search_unified(
     # stories, not by a building the model thinks of.
     elif interp and interp.get("picks") and interp.get("about") != "stories":
         picks = await _resolve_picks(interp["picks"], interp.get("about"), lat, lng)
+        # Picks we hold no row for. They used to vanish, so a place the model
+        # knew ("Moonstruck Diner") was never shown because we do not have it.
+        # The app looks each one up in Apple Maps and shows it with the
+        # model's note; a tap queues it into our venues (venue_requests).
+        # Not under "search this area": a lead has no coordinate to bound.
+        if not area_bound:
+            leads = _unresolved_leads(interp["picks"], picks)
+        for p in picks:
+            p.pop("_pick_name", None)
         # A venue pick must be the kind of place asked for: "art deco bar"
         # picked the Russian Tea Room, a restaurant. Sharing one category
         # word is enough ("Bar" covers "Cocktail Bar"). Buildings pass: a
@@ -3173,6 +3259,8 @@ async def search_unified(
         "facets": facets,
         "hits": hits,
     }
+    if leads:
+        resp["leads"] = leads
     # The query asks what is on. Events live client-side (Resident Advisor),
     # so the backend only says so, and which genres.
     if interp and interp.get("events"):
