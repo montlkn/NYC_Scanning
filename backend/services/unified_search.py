@@ -1571,7 +1571,7 @@ def build_facets(available: Dict[str, List[Any]]) -> List[Dict[str, Any]]:
 # candidates but cannot outrank what was literally asked for.
 # ---------------------------------------------------------------------------
 
-INTERP_VERSION = 10
+INTERP_VERSION = 11
 MAX_EXPANSION_QUERIES = 3
 W_EXPANSION_LEG = 1.0        # a rewrite leg counts as much as a corpus leg...
 # ...and the user's own legs are halved when rewrites run. Rewrites only run

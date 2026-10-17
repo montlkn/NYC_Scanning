@@ -29,7 +29,6 @@ import os
 import sys
 from typing import Optional
 
-import duckdb
 import psycopg
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -42,11 +41,49 @@ from services.text_embeddings import embed_texts  # noqa: E402
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("seed_venues")
 
-HF_RELEASE = "dt=2024-12-03"
-HF_BASE = (
-    "https://huggingface.co/datasets/foursquare/fsq-os-places/resolve/main/"
-    f"release/{HF_RELEASE}/places/parquet"
-)
+def _latest_release(default: str = "dt=2024-12-03") -> str:
+    """Newest FSQ OS Places release on Hugging Face ("dt=YYYY-MM-DD").
+
+    Was pinned to dt=2024-12-03, so a re-seed could never pick up places that
+    opened since. FSQ_RELEASE pins one explicitly; otherwise the dataset's
+    release folder is listed and the latest date wins. Falls back to the old
+    pin if the listing fails, so a network blip never breaks a seed.
+    """
+    pinned = os.environ.get("FSQ_RELEASE")
+    if pinned:
+        return pinned if pinned.startswith("dt=") else f"dt={pinned}"
+    try:
+        import json
+        import urllib.request
+        req = urllib.request.Request(
+            "https://huggingface.co/api/datasets/foursquare/fsq-os-places/tree/main/release",
+            headers={"Authorization": f"Bearer {os.environ.get('HF_TOKEN', '')}"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as r:
+            entries = json.load(r)
+        dates = sorted(e["path"].rsplit("/", 1)[-1] for e in entries
+                       if e.get("type") == "directory" and "dt=" in e.get("path", ""))
+        return dates[-1] if dates else default
+    except Exception as e:  # noqa: BLE001
+        logging.getLogger(__name__).warning(f"FSQ release listing failed ({e}); using {default}")
+        return default
+
+
+_HF_BASE = None
+
+
+def hf_base() -> str:
+    """Shard URL prefix for the newest release. Resolved on first use, not at
+    import: ingest_requested_venues imports this module for its join and
+    text helpers and never downloads a shard."""
+    global _HF_BASE
+    if _HF_BASE is None:
+        _HF_BASE = (
+            "https://huggingface.co/datasets/foursquare/fsq-os-places/resolve/main/"
+            f"release/{_latest_release()}/places/parquet"
+        )
+        logging.getLogger("seed_venues").info(f"FSQ shards from {_HF_BASE}")
+    return _HF_BASE
 
 # Geo-join radius: a venue maps to the nearest building within this many meters.
 # Building geocodes are centroids, venue coords are entrances → 60m absorbs the
@@ -72,7 +109,7 @@ KEEP_PREFIXES = (
 
 
 def _shard_urls(n: int) -> list:
-    return [f"{HF_BASE}/places-{i:05d}.zstd.parquet" for i in range(n)]
+    return [f"{hf_base()}/places-{i:05d}.zstd.parquet" for i in range(n)]
 
 
 def _download_shard(i: int, token: str, cache_dir: str) -> str:
@@ -84,7 +121,7 @@ def _download_shard(i: int, token: str, cache_dir: str) -> str:
     local = os.path.join(cache_dir, f"places-{i:05d}.parquet")
     if os.path.exists(local) and os.path.getsize(local) > 1_000_000:
         return local
-    url = f"{HF_BASE}/places-{i:05d}.zstd.parquet"
+    url = f"{hf_base()}/places-{i:05d}.zstd.parquet"
     logger.info(f"  downloading shard {i} ...")
     subprocess.run(
         ["curl", "-sL", "-m", "600", "-H", f"Authorization: Bearer {token}",
@@ -98,8 +135,11 @@ def _download_shard(i: int, token: str, cache_dir: str) -> str:
 
 def fetch_venues(bboxes: list, shards: int, token: str) -> list:
     """Download FSQ parquet shard(s), filter locally to bbox + category."""
-    cache_dir = os.path.join(os.path.dirname(__file__), "..", ".fsq_cache")
-    local_files = [_download_shard(i, token, cache_dir) for i in range(shards)]
+    import duckdb  # only the seed path needs it; not in the API image
+    # Cache per release: a new release must never be read from last month's files.
+    release = hf_base().split("/release/", 1)[1].split("/", 1)[0]
+    cache_dir = os.path.join(os.path.dirname(__file__), "..", ".fsq_cache", release)
+    keep_cache = os.environ.get("FSQ_KEEP_CACHE", "1") == "1"
 
     con = duckdb.connect()
     bbox_or = " OR ".join(
@@ -110,19 +150,26 @@ def fetch_venues(bboxes: list, shards: int, token: str) -> list:
         f"list_aggregate(list_transform(fsq_category_labels, x -> x LIKE '{p} >%' OR x = '{p}'), 'bool_or')"
         for p in KEEP_PREFIXES
     )
-    file_list = ", ".join(f"'{f}'" for f in local_files)
-    sql = f"""
-        SELECT fsq_place_id, name, latitude, longitude, address,
-               fsq_category_ids, fsq_category_labels,
-               instagram, website, tel
-        FROM read_parquet([{file_list}])
-        WHERE date_closed IS NULL
-          AND name IS NOT NULL
-          AND ({bbox_or})
-          AND ({cat_or})
-    """
+    # One shard at a time: the global dataset is ~100 shards, too much disk
+    # for a cron container to hold at once. FSQ_KEEP_CACHE=0 (the monthly
+    # cron) deletes each shard once read.
+    rows: list = []
     logger.info(f"reading {shards} shard(s), filtering to {len(bboxes)} bbox(es)...")
-    return con.execute(sql).fetchall()
+    for i in range(shards):
+        local = _download_shard(i, token, cache_dir)
+        rows += con.execute(f"""
+            SELECT fsq_place_id, name, latitude, longitude, address,
+                   fsq_category_ids, fsq_category_labels,
+                   instagram, website, tel
+            FROM read_parquet('{local}')
+            WHERE date_closed IS NULL
+              AND name IS NOT NULL
+              AND ({bbox_or})
+              AND ({cat_or})
+        """).fetchall()
+        if not keep_cache:
+            os.remove(local)
+    return rows
 
 
 def category_leaf(labels) -> str:
@@ -503,7 +550,7 @@ def main():
         for i in range(0, len(prepared), args.batch_size):
             chunk = prepared[i : i + args.batch_size]
             vectors = embed_texts([p["text"] for p in chunk])
-            # photo_url: FSQ Open Source Places (fsq-os-places, dt=2024-12-03) has
+            # photo_url: FSQ Open Source Places (fsq-os-places) has
             # NO photo/image field in its schema (verified against the parquet
             # columns actually read in fetch_venues()) — left NULL, not invented.
             batch = [

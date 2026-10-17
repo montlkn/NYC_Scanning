@@ -15,8 +15,27 @@ read-only on purpose. Anything that WRITES the index needs the owner login
 | Kit narratives (MAIN `narratives`) | `scripts.embed_grok_narratives` | as they grow |
 | Buildings whose generated lore changed | `scripts/embed_buildings.py --changed` | as lore is written |
 
-All of them embed only rows not yet indexed. `cron/reindex_search.sh` runs
-them all.
+| Places tapped on Apple Maps (MAIN `venue_requests`) | `scripts.ingest_requested_venues` | nightly, needs `MAIN_DB_URL` |
+| All venues, newest Foursquare release | `scripts/seed_venues.py --citywide --shards 100` | monthly, `REFRESH_VENUES=1` + `HF_TOKEN` |
+
+All of them embed only rows not yet indexed (the monthly venue re-seed
+upserts every row). `cron/reindex_search.sh` runs them all.
+
+Each new venue also gets a **card**: Kit (gpt-5.6-luna) writes 2-3 sentences
+from two Brave searches only, then `services/kit_judge` fact-checks it against
+those results; a card that fails keeps no text. Cards go to the search DB's
+`venue_cards` table (`migrations/20261016_venue_cards.sql`), which the API
+reloads every 30 minutes, so no redeploy. The card shows as the venue's
+description, and its `kind` ("chess shop") is added to the venue's searchable
+text by `enrich_venues`. Needs `BRAVE_API_KEY` and `OPENAI_API_KEY` on the
+cron service; without them venues are still added, uncarded. Area cards
+(`scripts/build_venue_cards.py`) write to the same table when
+`SEARCH_DB_WRITE_URL` is set; `--import-jsonl` moves the old JSONL in once.
+
+Venues added from Apple taps carry `source='apple_request'` and an id
+starting `apple:`, so `DELETE FROM venues WHERE source='apple_request'`
+reverts them. The app side: `ExploreViewModel.requestVenue` in Jink_Swift,
+table `supabase/migrations/20261016_venue_requests_MAIN.sql`.
 
 ## Automatic (recommended): a Railway cron service
 
