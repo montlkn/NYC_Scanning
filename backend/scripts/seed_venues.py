@@ -304,7 +304,16 @@ JOIN_CHUNK = 2000
 
 
 def join_buildings_via_footprints(fp_url: str, search_url: str, venues: list) -> dict:
-    """Nearest footprint within JOIN_RADIUS_M for each venue.
+    """The footprint each venue is IN, else the one whose wall is nearest,
+    within JOIN_RADIUS_M.
+
+    This used to be the nearest CENTROID, and a centroid is the middle of a
+    building, not its edge. A big corner building's middle sits closer to a
+    neighbour's shopfront than that neighbour's own middle does, so the corner
+    building claimed it: Brooklyn Diner (212 W 57th) joined to the Rodin
+    Studios (200 W 57th) and showed its photo, year and style. Distance to
+    the polygon is 0 inside it, and a pin dropped on the sidewalk goes to the
+    wall it faces.
 
     `venues` is the raw parquet row list; returns {index: (bin, bbl, year, style)}
     for the ones that joined. Indices absent from the dict didn't join.
@@ -332,16 +341,17 @@ def join_buildings_via_footprints(fp_url: str, search_url: str, venues: list) ->
                 SELECT v.idx, f.bin, f.bbl, f.construction_year
                 FROM v
                 CROSS JOIN LATERAL (
-                    SELECT bin, bbl, construction_year, centroid
+                    SELECT bin, bbl, construction_year, footprint
                     FROM building_footprints
-                    WHERE centroid IS NOT NULL
-                    -- <-> against the GiST index: index-assisted KNN, so this
-                    -- is a bounded lookup, not a scan of 1.08M rows.
-                    ORDER BY centroid <-> ST_SetSRID(ST_MakePoint(v.lng, v.lat), 4326)
+                    WHERE footprint IS NOT NULL
+                    -- <-> on the footprint GiST index: index-assisted KNN by
+                    -- true distance to the polygon (0 inside it), so this is
+                    -- a bounded lookup, not a scan of 1.08M rows.
+                    ORDER BY footprint <-> ST_SetSRID(ST_MakePoint(v.lng, v.lat), 4326)
                     LIMIT 1
                 ) f
                 WHERE ST_DWithin(
-                    f.centroid::geography,
+                    f.footprint::geography,
                     ST_SetSRID(ST_MakePoint(v.lng, v.lat), 4326)::geography,
                     %s
                 )
