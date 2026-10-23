@@ -3261,6 +3261,11 @@ async def search_unified(
     }
     if leads:
         resp["leads"] = leads
+    # The words alone did not find it and the model's reading was used
+    # ("twin peaks diner", "spooky spots"). The app lets Kit write its short
+    # take on exactly these, instead of guessing from word counts.
+    if interp is not None and not direct:
+        resp["semantic"] = True
     # The query asks what is on. Events live client-side (Resident Advisor),
     # so the backend only says so, and which genres.
     if interp and interp.get("events"):
