@@ -18,6 +18,8 @@ Env:
 
 Run:
   python -m scripts.rejoin_venue_buildings --dry-run     # counts + samples
+  python -m scripts.rejoin_venue_buildings --dry-run --show "brooklyn diner"
+      # expect the W 57th one (49ecebbaf964a520ae671fe3) to leave 1024896
   python -m scripts.rejoin_venue_buildings               # write
   python -m scripts.enrich_venues                        # then re-embed
 """
@@ -46,6 +48,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--show", default=None,
+                    help='print every move for venues whose name contains this, e.g. --show "brooklyn diner"')
     args = ap.parse_args()
 
     search_url = os.environ.get("SEARCH_DB_URL")
@@ -77,6 +81,12 @@ def main() -> None:
     logger.info(f"{len(changed)} venues move to a different building ({100 * len(changed) // max(1, len(venues))}%)")
     for c in changed[:15]:
         logger.info(f"  {c[1]}: bin {c[2]} -> {c[3]}")
+
+    if args.show:
+        want = args.show.lower()
+        for c in changed:
+            if want in (c[1] or "").lower():
+                logger.info(f"  [show] {c[1]} ({c[0]}): bin {c[2]} -> {c[3]}")
 
     if args.dry_run:
         logger.info("dry-run: no writes")
