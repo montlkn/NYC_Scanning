@@ -1963,6 +1963,14 @@ def tier_of(h: Dict[str, Any], q_toks: set, named_toks: set,
             interp: Optional[Dict[str, Any]], place_req: Optional[Dict[str, Any]],
             hood_vocab: Optional[set] = None, generic: Optional[set] = None) -> int:
     """0 = the actual thing, 1 = a real match, 2 = everything else."""
+    # A place whose own name IS the query is the thing, whatever else the
+    # words could mean. "brooklyn diner" read "brooklyn" as the borough, so
+    # the famous Brooklyn Diner on W 57th failed the place test and sank
+    # below every diner in Brooklyn (Kellogg's led).
+    # Two words at least: a cafe called "Coffee" is not what "coffee" means.
+    if (len(q_toks - _NAME_FILLER) >= 2 and h.get("type") in ("building", "venue", "place")
+            and _field_tokens(h.get("name")) - _NAME_FILLER == q_toks - _NAME_FILLER):
+        return 0
     # A place the query asked for is part of the match: a deco bar in Queens
     # is not a real match for "art deco bars in midtown".
     in_place = place_adjustment(place_req, h, hood_vocab) >= 0 if place_req else True

@@ -221,6 +221,16 @@ class TestTiers:
                "lex_text": "the bar cocktail bar seagram building east midtown-turtle bay manhattan"}
         assert self.t(bar, "seagram bar") == 0
 
+    def test_exact_name_beats_the_place_reading(self):
+        from services.unified_search import tier_of, query_content_tokens
+        # "brooklyn" also reads as the borough; the W 57th diner is still it.
+        diner = {"type": "venue", "name": "Brooklyn Diner", "category": "Diner",
+                 "neighborhood": "Midtown-Midtown South", "borough": "Manhattan"}
+        qt = query_content_tokens("brooklyn diner")
+        assert tier_of(diner, qt, set(), None, {"borough": "Brooklyn"}, None, self.G) == 0
+        cafe = {"type": "venue", "name": "Coffee", "category": "Coffee Shop"}
+        assert self.t(cafe, "coffee") != 0
+
     def test_a_tenant_is_not_the_building(self):
         deli = {"type": "venue", "name": "Vineyard", "category": "Deli",
                 "neighborhood": "Tribeca-Civic Center", "borough": "Manhattan",
